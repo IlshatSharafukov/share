@@ -1,0 +1,1 @@
+Данный плейбук ansible разворачивает на указанной ВМ стек мониторинга (node exporter, grafana, prometheus etc.) либо только node exporter для дальнейшего "зацепа" с помощью prometheus из другого места.

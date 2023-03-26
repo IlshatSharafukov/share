@@ -1,0 +1,5 @@
+[nodes:children]
+manager
+
+[manager]
+test ansible_host=62.84.115.214 ansible_port=22 ansible_user=ubuntu

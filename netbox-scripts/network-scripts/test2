@@ -1,0 +1,714 @@
+{% extends "layout.html" %}
+
+{% block content %}
+
+<div class="jumbotron text-center">
+    <h1 style="font-family: Verdana, sans-serif;">ATM mikrotik diagnostic</h1>
+    <p style="font-family: Verdana, sans-serif;">Укажите IP адрес банкомата, роутера или ID банкомата, который вы хотите проверить.</p>
+    <form action="{% url 'webapp:script' %}" method="post">
+        {% csrf_token %}
+        <div class="input-group" style="display: flex; justify-content: center;">
+            {{ form.mikrotik_name }}
+            <button type="submit" class="btn btn-danger" style="margin-left: 10px;">Search</button>
+        </div>
+    </form>
+</div>
+
+<div class="container-fluid text-center">
+  <div class="row content">
+    <div class="col-sm">
+      <h3>Base info about ATM mikrotik</h3>
+      <table class="table table-bordered table-custom">
+        <thead>
+          <tr>
+            <th>Mikrotik ID</th>
+            <th>Mikrotik IP</th>
+            <th>Active ISP</th>
+            <th>Mikrotik Version</th>
+            <th>Mikrotik Uptime</th>
+            <th>Mikrotik Revision</th>
+            <th>Mikrotik Model</th>
+            <th>Time update</th>
+            <th>Update status</th>
+            <th>Zabbix ICMP status</th>
+            <th><img src="static/image/grafana.png" /></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>{{ base_info.mikrotik_name }}</td>
+            <td>{{ base_info.mikrotik_ip_address }}</td>
+            <td>{{ mk_state_dynamic.current_default_gateway }}</td>
+            <td>{{ mk_state_dynamic.mikrotik_version }}</td>
+            <td>{{ mk_state_dynamic.mikrotik_uptime }}</td>
+            <td>{{ mk_state_static.mikrotik_revision }}</td>
+            <td>{{ mk_state_static.mikrotik_model }}</td>
+            <td class="bold">{{ mk_state_dynamic.updated }}</td>
+
+            <td class="{% if mk_state_dynamic.mikrotik_update_state == 'Success' %} success {% else %} failed {% endif %} bold">
+              {% if mk_state_dynamic.mikrotik_update_state == 'Success' %}
+                Успешно обновлено
+              {% else %}
+                Ошибка обновления
+              {% endif %}
+            </td>
+
+            <td style="text-align: center;">
+              <div class="indicator {% if icmp_ping_status == '1' %} indicator-green {% else %} indicator-red {% endif %}" style="display: inline-block;">
+                <div class="circle {% if icmp_ping_status == '1' %}circle-green {% else %}circle-red {% endif %}"></div>
+              </div>
+            </td>
+
+            <td><a href="https://grafana.raiffeisen.ru/d/9JZQmD2Sz/zagruzka-interfeisov-v-mikrotike-ustanovlennom-v-atm?orgId=337&var-ATM={{ base_info.mikrotik_name }}">Grafana</a></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+{% if atmdiag_write_permission %}
+<div class="container-fluid text-center">
+    <div class="row">
+        <div class="col-md-4">
+            <form id="refresh_with_permission" method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="refresh_info" value="True">
+                <button class="btn btn-primary preloading mb-3">Refresh info</button>
+            </form>
+        </div>
+
+        <div class="col-md-4">
+            <form method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="change_isp" value="True">
+                <button class="btn btn-primary mt-3 open-modal-btn">Change Active ISP</button>
+            </form>
+        </div>
+
+        <div class="col-md-4">
+            <form id="password-form" method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="reboot" value="True">
+                <button class="btn btn-danger mt-3" type="button" onclick="showPasswordModal()">Reboot Device</button>
+                <input id="password-input" type="hidden" name="password">
+            </form>
+        </div>
+    </div>
+</div>
+{% else %}
+<div class="container-fluid text-center">
+    <div class="row">
+        <div class="col-md text-center">
+            <form id="refresh_without_permission" method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="refresh_info" value="True">
+                <button class="btn btn-primary preloading">Refresh info</button>
+            </form>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<div class="container-fluid text-center">
+  <div class="row content">
+    <div class="col-sm">
+      <h3>Info about IP SLA</h3>
+      <table class="table table-bordered ip-sla-table">
+        <thead>
+          <tr>
+            <th>Operator</th>
+            <th>MSK70 RTT</th>
+            <th>MSK70 Jitter</th>
+            <th>MSK70 % of failure probes</th>
+            <th>MSKD8 RTT</th>
+            <th>MSKD8 Jitter</th>
+            <th>MSKD8 % of failure probes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>MTS {{ msk70_cards07.ip }}</td>
+            <td>{% if msk70_cards07.rtt == 'Not available' %}{{ msk70_cards07.rtt }}{% else %}{{ msk70_cards07.rtt }} мс{% endif %}</td>
+            <td>{{ msk70_cards07.jitter }} мс</td>
+            <td>{% if msk70_cards07.result == '' or msk70_cards07.result == None or msk70_cards07.result == 'Not available' %}Unknown{% else %}{{ msk70_cards07.result }}%{% endif %}</td>
+            <td>{% if mskd8_cards08.rtt == 'Not available' %}{{ mskd8_cards08.rtt }}{% else %}{{ mskd8_cards08.rtt }} мс{% endif %}</td>
+            <td>{{ mskd8_cards08.jitter }} мс</td>
+            <td>{% if mskd8_cards08.result == '' or mskd8_cards08.result == None or mskd8_cards08.result == 'Not available' %}Unknown{% else %}{{ mskd8_cards08.result }}%{% endif %}</td>
+          </tr>
+        </tbody>
+        <tbody>
+          <tr>
+            <td>BEELINE {{ msk70_cards08.ip }}</td>
+            <td>{% if msk70_cards08.rtt == 'Not available' %}{{ msk70_cards08.rtt }}{% else %}{{ msk70_cards08.rtt }} мс{% endif %}</td>
+            <td>{{ msk70_cards08.jitter }} мс</td>
+            <td>{% if msk70_cards08.result == '' or msk70_cards08.result == None or msk70_cards08.result == 'Not available' %}Unknown{% else %}{{ msk70_cards08.result }}%{% endif %}</td>
+            <td>{% if mskd8_cards07.rtt == 'Not available' %}{{ mskd8_cards07.rtt }}{% else %}{{ mskd8_cards07.rtt }} мс{% endif %}</td>
+            <td>{{ mskd8_cards07.jitter }} мс</td>
+            <td>{% if mskd8_cards07.result == '' or mskd8_cards07.result == None or mskd8_cards07.result == 'Not available' %}Unknown{% else %}{{ mskd8_cards07.result }}%{% endif %}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="container-fluid text-center">
+  <div class="row content">
+    <div class="col-sm">
+      <h3>Info about Route announcements</h3>
+      <table class="table table-bordered ip-sla-table">
+        <thead>
+          <tr>
+            <th>MSK70 MTS</th>
+            <th>MSKD8 MTS</th>
+            <th>MSK70 Beeline</th>
+            <th>MSKD8 Beeline</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="text-align: center;">
+              <div class="indicator {% if mikrotik_route_announcements.msk70_cards07 == 'true' %}indicator-green{% else %}indicator-red{% endif %}" style="display: inline-block;">
+                <div class="circle {% if mikrotik_route_announcements.msk70_cards07 == 'true' %}circle-green{% else %}circle-red{% endif %}"></div>
+              </div>
+            </td>
+            <td style="text-align: center;">
+              <div class="indicator {% if mikrotik_route_announcements.mskd8_cards08 == 'true' %}indicator-green{% else %}indicator-red{% endif %}" style="display: inline-block;">
+                <div class="circle {% if mikrotik_route_announcements.mskd8_cards08 == 'true' %}circle-green{% else %}circle-red{% endif %}"></div>
+              </div>
+            </td>
+            <td style="text-align: center;">
+              <div class="indicator {% if mikrotik_route_announcements.msk70_cards08 == 'true' %}indicator-green{% else %}indicator-red{% endif %}" style="display: inline-block;">
+                <div class="circle {% if mikrotik_route_announcements.msk70_cards08 == 'true' %}circle-green{% else %}circle-red{% endif %}"></div>
+              </div>
+            </td>
+            <td style="text-align: center;">
+              <div class="indicator {% if mikrotik_route_announcements.mskd8_cards07 == 'true' %}indicator-green{% else %}indicator-red{% endif %}" style="display: inline-block;">
+                <div class="circle {% if mikrotik_route_announcements.mskd8_cards07 == 'true' %}circle-green{% else %}circle-red{% endif %}"></div>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="container-fluid text-center">
+  <div class="row content justify-content-center">
+    <div class="col-sm-4">
+      <h3 class="interface-title">Interface LTE 0</h3>
+      <table class="table table-bordered lte-info">
+        <tbody>
+          <tr>
+            <td>Carrier: {{ mk_state_static.lte0_operator }}</td>
+          </tr>
+          <tr>
+            <td>Status:
+              {% if mk_state_dynamic.lte0_registration_status == 'not' %}
+                <strong>Interface not working</strong>
+              {% else %}
+                {{ mk_state_dynamic.lte0_registration_status }}
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
+            <td>Uptime: {{ mk_state_dynamic.lte0_session_uptime }}</td>
+          </tr>
+          <tr>
+            <td>Functionality: {{ mk_state_dynamic.lte0_functionality }}</td>
+          </tr>
+          <tr>
+            <td>Mode:
+              {% if mk_state_dynamic.lte0_access_technology == 'Evolved' %}
+                LTE
+              {% else %}
+                {{ mk_state_dynamic.lte0_access_technology }}
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
+            <td>Signal:
+              {% if mk_state_dynamic.lte0_rssi == Null or mk_state_dynamic.lte0_rssi == 'None' or mk_state_dynamic.lte0_rssi == '' %}
+                {{ mk_state_dynamic.lte0_rsrp }}
+              {% else %}
+                {{ mk_state_dynamic.lte0_rssi }}
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
+            <td>SNR:
+              {% if mk_state_dynamic.lte0_sinr == Null or mk_state_dynamic.lte0_sinr == '' %}
+                Unknown
+              {% else %}
+                {{ mk_state_dynamic.lte0_sinr }}
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
+            <td>IMSI: {{ mk_state_static.lte0_imsi }}</td>
+          </tr>
+          <tr>
+            <td>IMEI: {{ mk_state_static.lte0_imei }}</td>
+          </tr>
+          <tr>
+            <td>UICC: {{ mk_state_static.lte0_uicc }}</td>
+          </tr>
+          <tr>
+            <td>Network mode: {{ mk_state_dynamic.lte0_network_mode }}</td>
+          </tr>
+
+        </tbody>
+      </table>
+        {% if mk_state_dynamic.lte0_network_mode == '3g,lte' %}
+        <div class="text-center" style="margin-top: 20px;">
+            <form method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="change_net_mode_3g_lte0" value="True">
+                <button class="btn btn-primary preloading_arp_lease">Switch to network mode 3G</button>
+            </form>
+        </div>
+        {% elif mk_state_dynamic.lte0_network_mode == '3g' %}
+        <div class="text-center" style="margin-top: 20px;">
+            <form method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="change_net_mode_3g_lte_lte0" value="True">
+                <button class="btn btn-primary preloading_arp_lease">Switch to network mode 3G, LTE</button>
+            </form>
+        </div>
+        {% else %}
+        {% endif %}
+    </div>
+
+    <div class="col-sm-4">
+      <h3 class="interface-title">Interface LTE 1</h3>
+      <table class="table table-bordered lte-info">
+        <tbody>
+          <tr>
+            <td>Carrier: {{ mk_state_static.lte1_operator }}</td>
+          </tr>
+          <tr>
+            <td>Status:
+              {% if mk_state_dynamic.lte1_registration_status == 'not' %}
+                <strong>Interface not working</strong>
+              {% else %}
+                {{ mk_state_dynamic.lte1_registration_status }}
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
+            <td>Uptime: {{ mk_state_dynamic.lte1_session_uptime }}</td>
+          </tr>
+          <tr>
+            <td>Functionality: {{ mk_state_dynamic.lte1_functionality }}</td>
+          </tr>
+          <tr>
+            <td>Mode:
+              {% if mk_state_dynamic.lte1_access_technology == 'Evolved' %}
+                LTE
+              {% else %}
+                {{ mk_state_dynamic.lte1_access_technology }}
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
+            <td>Signal:
+              {% if mk_state_dynamic.lte1_rssi == Null or mk_state_dynamic.lte1_rssi == 'None' or mk_state_dynamic.lte1_rssi == '' %}
+                {{ mk_state_dynamic.lte1_rsrp }}
+              {% else %}
+                {{ mk_state_dynamic.lte1_rssi }}
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
+            <td>SNR:
+              {% if mk_state_dynamic.lte1_sinr == Null or mk_state_dynamic.lte1_sinr == '' %}
+                Unknown
+              {% else %}
+                {{ mk_state_dynamic.lte1_sinr }}
+              {% endif %}
+            </td>
+          </tr>
+          <tr>
+            <td>IMSI: {{ mk_state_static.lte1_imsi }}</td>
+          </tr>
+          <tr>
+            <td>IMEI: {{ mk_state_static.lte1_imei }}</td>
+          </tr>
+          <tr>
+            <td>UICC: {{ mk_state_static.lte1_uicc }}</td>
+          </tr>
+          <tr>
+            <td>Network mode: {{ mk_state_dynamic.lte1_network_mode }}</td>
+          </tr>
+        </tbody>
+      </table>
+        {% if mk_state_dynamic.lte1_network_mode == '3g,lte' %}
+        <div class="text-center" style="margin-top: 20px;">
+            <form method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="change_net_mode_3g_lte1" value="True">
+                <button class="btn btn-primary preloading_arp_lease">Switch to network mode 3G</button>
+            </form>
+        </div>
+        {% elif mk_state_dynamic.lte1_network_mode == '3g' %}
+        <div class="text-center" style="margin-top: 20px;">
+            <form method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="change_net_mode_3g_lte_lte1" value="True">
+                <button class="btn btn-primary preloading_arp_lease">Switch to network mode 3G, LTE</button>
+            </form>
+        </div>
+        {% else %}
+        {% endif %}
+    </div>
+  </div>
+</div>
+
+<hr class = 'centered-line'>
+
+<div class="container-fluid text-center">
+    <div class="row content">
+        <div class="col-sm-4">
+            <h3>Mikrotik Ethernet Interface</h3>
+            <table class="table table-bordered">
+                <thead>
+                    <tr>
+                        <th>Network Interface Name</th>
+                        <th>Link state</th>
+                        <th>Autonegotiation</th>
+                        <th>Speed</th>
+                        <th>Full Duplex</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for interface_list in mikrotik_ethernet_interface %}
+                        {% for interface in interface_list %}
+                            <tr>
+                                <td>{{ interface.name }}</td>
+                                <td>{{ interface.status }}</td>
+                                <td>{{ interface.auto_negotiation }}</td>
+                                <td>{{ interface.rate }}</td>
+                                <td>{{ interface.full_duplex }}</td>
+                            </tr>
+                        {% endfor %}
+                    {% endfor %}
+                </tbody>
+            </table>
+
+            <p></p>
+
+            <table class="table table-bordered">
+                <thead>
+                    <tr>
+                        <th>Ethernet Flap Count</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>
+                            {% if ethernet_flap_count_for_app == 'Missing data' %}
+                                За последнюю неделю не удалось обнаружить падений каких-либо ethernet интерфейсов
+                            {% else %}
+                                {% for ethernet_flap_count in ethernet_flap_count_for_app %}
+                                    {{ ethernet_flap_count }} <br>
+                                {% endfor %}
+                            {% endif %}
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+{% if atmdiag_write_permission %}
+<div class="container-fluid text-center">
+  <form method="post" action="{% url 'webapp:mikrotik_update' %}">
+    {% csrf_token %}
+    <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+    <input type="hidden" name="shutdown_port" value="True">
+    <button class="btn btn-primary preloading_arp_lease" button type="submit">Restart ethernet interface</button>
+  </form>
+  </div>
+{% endif %}
+
+<hr class = 'centered-line'>
+
+<div class="container-fluid text-center">
+    <div class="row content">
+        <div class="col-sm">
+            <h3>Mikrotik Bridge Host Table</h3>
+            <table class="table table-bordered bridge-host-table">
+                <thead>
+                    <tr>
+                        <th>Index</th>
+                        <th>Flags</th>
+                        <th>Mac address</th>
+                        <th>Interface</th>
+                        <th>Bridge</th>
+                        <th>On interface</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for mac_address in mikrotik_bridge_host %}
+                    <tr>
+                        <td>{{ mac_address.index }}</td>
+                        <td>{{ mac_address.flags }}</td>
+                        <td>{{ mac_address.mac_address }}</td>
+                        <td>{{ mac_address.interface }}</td>
+                        <td>{{ mac_address.bridge }}</td>
+                        <td>{{ mac_address.on_interface }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<hr class = 'centered-line'>
+
+<div class="container-fluid text-center">
+    <div class="row content">
+        <div class="col-sm">
+            <h3>DHCP Lease Table</h3>
+            <table class="table table-bordered dhcp-lease-table">
+                <thead>
+                    <tr>
+                        <th>Index</th>
+                        <th>Flags</th>
+                        <th>IP</th>
+                        <th>Mac</th>
+                        <th>Hostname</th>
+                        <th>Status</th>
+                        <th>Last Seen</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for dhcp in mikrotic_dhcp_lease %}
+                    <tr>
+                        <td>{{ dhcp.index }}</td>
+                        <td>{{ dhcp.flags }}</td>
+                        <td>{{ dhcp.ip_address }}</td>
+                        <td>{{ dhcp.mac_address }}</td>
+                        <td>{{ dhcp.hostname }}</td>
+                        <td>{{ dhcp.status }}</td>
+                        <td>{{ dhcp.last_seen }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+{% if atmdiag_write_permission %}
+<div class="container-fluid text-center">
+    <div class="row custom-button-row justify-content-center">
+        <div class="col-auto">
+            <form method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="clear_lease" value="True">
+                <button class="btn btn-primary preloading_arp_lease" type="submit">Clear DHCP Lease all</button>
+            </form>
+        </div>
+
+        <div class="col-auto">
+            <form method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="clear_lease_vtrec" value="True">
+                <button class="btn btn-primary preloading_arp_lease" type="submit">Clear DHCP Lease VTREC</button>
+            </form>
+        </div>
+
+        <div class="col-auto">
+            <form method="post" action="{% url 'webapp:mikrotik_update' %}">
+                {% csrf_token %}
+                <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+                <input type="hidden" name="clear_lease_atm" value="True">
+                <button class="btn btn-primary preloading_arp_lease" type="submit">Clear DHCP Lease ATM</button>
+            </form>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<hr class = 'centered-line'>
+
+<div class="container-fluid text-center">
+    <div class="row content">
+        <div class="col-sm-4">
+            <h3>BGP state</h3>
+            <table class="table table-bordered">
+                <thead>
+                    <tr>
+                        <th>Peer State</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>{{ mk_state_dynamic.mikrotic_bgp_peer_state | linebreaksbr }}</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p></p>
+
+            <table class="table table-bordered">
+                <thead>
+                    <tr>
+                        <th>BGP Flap Count</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>
+                            {% if bgp_flap_count_for_app == 'Missing data' %}
+                                За последнюю неделю не удалось обнаружить падений BGP сессий
+                            {% else %}
+                                {% for bgp_flap_count in bgp_flap_count_for_app %}
+                                    {{ bgp_flap_count }} <br>
+                                {% endfor %}
+                            {% endif %}
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<hr class = 'centered-line'>
+
+<div class="container-fluid text-center">
+  <div class="row content">
+    <div class="col-sm">
+      <h3>Connections table</h3>
+      <table class="table table-bordered connections-table">
+        <thead>
+          <tr>
+            <th>Index</th>
+            <th>Flags</th>
+            <th>Protocol</th>
+            <th>SRC address</th>
+            <th>DST address</th>
+            <th>TCP state</th>
+            <th>Timeout</th>
+            <th>ORIG rate</th>
+            <th>REPL rate</th>
+            <th>ORIG packets</th>
+            <th>REPL packets</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for conn in mikrotic_connections %}
+          <tr>
+            <td>{{ conn.index }}</td>
+            <td>{{ conn.flags }}</td>
+            <td>{{ conn.protocol }}</td>
+            <td>{{ conn.srcadd }}</td>
+            <td>{{ conn.dstadd }}</td>
+            <td>{{ conn.tcpstate }}</td>
+            <td>{{ conn.timeout }}</td>
+            <td>{{ conn.origrate }}</td>
+            <td>{{ conn.replrate }}</td>
+            <td>{{ conn.origpackets }}</td>
+            <td>{{ conn.replpackets }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<hr class = 'centered-line'>
+
+<div class="container-fluid text-center">
+  <div class="row content">
+    <div class="col-sm-4">
+      <h3>ARP table</h3>
+      <table class="table table-bordered arp-table">
+        <thead>
+          <tr>
+            <th>Index</th>
+            <th>Flags</th>
+            <th>IP</th>
+            <th>Mac</th>
+            <th>Interface</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for arp in mikrotic_arp_table %}
+          <tr>
+            <td>{{ arp.index }}</td>
+            <td>{{ arp.flags }}</td>
+            <td>{{ arp.ip_address }}</td>
+            <td>{{ arp.mac_address }}</td>
+            <td>{{ arp.interface }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+{% if atmdiag_write_permission %}
+
+<div class="text-center" style="margin-top: 20px;">
+<form method="post" action="{% url 'webapp:mikrotik_update' %}">
+  {% csrf_token %}
+  <input type="hidden" name="device_id" value="{{ base_info.mikrotik_name }}">
+  <input type="hidden" name="clear_arp" value="True">
+  <button class="btn btn-primary preloading_arp_lease" button type="submit">Clear ARP</button>
+</form>
+</div>
+
+{% endif %}
+
+<div class="modal fade" id="password-modal" tabindex="-1" role="dialog" aria-labelledby="password-modal-label" aria-hidden="true">
+  <div class="modal-dialog" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title font-weight-bold" id="password-modal-label"><strong>Для перезагрузки устройства введите пароль от вашей УЗ вида rua***</strong></h5>
+      </div>
+      <div class="modal-body">
+        <input type="password" id="modal-password-input" class="form-control">
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" onclick="submitPassword()">Submit</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="preloader" class="preloader preloader--hide">
+    <div class="preloader__loader"></div>
+    <span class="preloader__percents">
+        <span id="percents">0</span>%
+    </span>
+</div>
+
+<div id="myModal" class="modal-new">
+    <div class="modal-content-new">
+        <p>Запрос на изменение Active ISP создан. Ожидайте выполнения.</p>
+        <button id="okButton" class="btn btn-primary mt-3">Ок</button>
+    </div>
+</div>
+
+{% endblock %}
+

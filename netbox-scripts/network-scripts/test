@@ -89,8 +89,60 @@ def get_dns_name(ip_address):
 
 def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
     """
-    Получает IP-адреса в VRF через префиксы.
-    Использует обходной метод из-за бага в API filter(vrf=vrf_id).
+    Получает IP-адреса в VRF через GraphQL.
+    Обходит проблемы с pynautobot REST API фильтрами.
+    """
+    try:
+        # GraphQL запрос для получения всех IP-адресов в VRF
+        query = """
+        query GetIPsInVRF($vrfId: ID!) {
+            prefixes(vrfs: [$vrfId]) {
+                id
+                prefix
+                ipAddresses {
+                    address
+                }
+            }
+        }
+        """
+        
+        variables = {"vrfId": vrf_id}
+        
+        logger.debug(f"VRF {vrf_name}: executing GraphQL query")
+        result = nautobot_api.graphql.query(query=query, variables=variables)
+        
+        if not result or not hasattr(result, 'data') or not result.data:
+            logger.warning(f"VRF {vrf_name}: empty GraphQL response")
+            return []
+        
+        # Собираем все IP-адреса из всех префиксов VRF
+        vrf_ips = []
+        prefix_count = 0
+        
+        for prefix in result.data.prefixes:
+            prefix_count += 1
+            if hasattr(prefix, 'ip_addresses') and prefix.ip_addresses:
+                for ip in prefix.ip_addresses:
+                    if hasattr(ip, 'address') and ip.address:
+                        vrf_ips.append(ip.address)
+        
+        # Дедупликация IP-адресов
+        vrf_ips = list(set(vrf_ips))
+        
+        logger.debug(f"VRF {vrf_name}: found {prefix_count} prefixes, {len(vrf_ips)} IP addresses via GraphQL")
+        return vrf_ips
+        
+    except Exception as error:
+        logger.error(f"GraphQL error for VRF {vrf_name}: {error}")
+        logger.info(f"Falling back to REST API for VRF {vrf_name}")
+        
+        # Fallback к оригинальному методу при ошибке GraphQL
+        return get_ips_in_vrf_fallback(nautobot_api, vrf_id, vrf_name)
+
+
+def get_ips_in_vrf_fallback(nautobot_api, vrf_id, vrf_name):
+    """
+    Fallback метод через REST API для случаев, когда GraphQL не работает.
     """
     try:
         # Получаем ВСЕ assignments и фильтруем вручную (обходной путь для бага API)
@@ -100,7 +152,7 @@ def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
         # Дедупликация префиксов (убираем дублированные assignments)
         prefix_ids = list(set([a.prefix.id for a in vrf_assignments]))
         
-        logger.debug(f"VRF {vrf_name}: found {len(prefix_ids)} prefixes")
+        logger.debug(f"VRF {vrf_name}: found {len(prefix_ids)} prefixes via REST fallback")
         
         # Собираем все IP сначала, дедуплицируем в конце
         vrf_ips = []
@@ -114,11 +166,11 @@ def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
         # Дедупликация IP-адресов один раз в конце
         vrf_ips = list(set(vrf_ips))
         
-        logger.debug(f"VRF {vrf_name}: total {len(vrf_ips)} IP addresses")
+        logger.debug(f"VRF {vrf_name}: total {len(vrf_ips)} IP addresses via REST fallback")
         return vrf_ips
         
     except Exception as error:
-        logger.error(f"Error getting IPs for VRF {vrf_name}: {error}")
+        logger.error(f"REST fallback error for VRF {vrf_name}: {error}")
         return []
 
 

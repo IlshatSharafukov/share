@@ -88,65 +88,60 @@ def get_dns_name(ip_address):
 
 
 def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
-    """
-    Получает IP-адреса в VRF через оптимизированный GraphQL или REST fallback.
-    """
+    """Получает IP-адреса в VRF через GraphQL."""
     try:
-        # Попробуем GraphQL с ограничением результатов
-        query = """
-        query GetVRFPrefixes($vrfId: ID!) {
-            vrf(id: $vrfId) {
+        query = f"""
+        query GetVRFPrefixes {{
+            vrf(id: "{vrf_id}") {{
                 id
                 name
-                prefixes {
+                prefixes {{
                     id
                     prefix
-                    ip_addresses {
+                    ip_addresses {{
                         address
-                    }
-                }
-            }
-        }
+                    }}
+                }}
+            }}
+        }}
         """
-        
-        variables = {"vrfId": vrf_id}
-        
-        logger.debug(f"VRF {vrf_name}: executing optimized GraphQL query")
-        result = nautobot_api.graphql.query(query=query, variables=variables)
-        
-        if not result or not hasattr(result, 'data') or not result.data:
-            logger.warning(f"VRF {vrf_name}: empty GraphQL response, trying alternative")
-            raise Exception("Empty GraphQL response")
-        
-        # Проверяем наличие VRF в результате
-        if not hasattr(result.data, 'vrf') or not result.data.vrf:
-            logger.warning(f"VRF {vrf_name}: VRF not found in GraphQL response")
-            raise Exception("VRF not found")
-        
+
+        #logger.info(f"VRF {vrf_name}: executing GraphQL query")
+        result = nautobot_api.graphql.query(query=query)
+
+        # Используем json атрибут GraphQLRecord
+        if not hasattr(result, 'json') or not result.json:
+            logger.warning(f"VRF {vrf_name}: no json in GraphQL result")
+            raise Exception("No JSON in GraphQL result")
+
+        data = result.json.get('data', {})
+        vrf_data = data.get('vrf', {})
+        prefixes = vrf_data.get('prefixes', [])
+
+        if not prefixes:
+            #logger.warning(f"VRF {vrf_name}: no prefixes found")
+            raise Exception("No prefixes found")
+
         # Собираем IP-адреса из префиксов VRF
         vrf_ips = []
         prefix_count = 0
-        
-        vrf_data = result.data.vrf
-        if hasattr(vrf_data, 'prefixes') and vrf_data.prefixes:
-            for prefix in vrf_data.prefixes:
-                prefix_count += 1
-                if hasattr(prefix, 'ip_addresses') and prefix.ip_addresses:
-                    for ip in prefix.ip_addresses:
-                        if hasattr(ip, 'address') and ip.address:
-                            vrf_ips.append(ip.address)
-        
+
+        for prefix in prefixes:
+            prefix_count += 1
+            ip_addresses = prefix.get('ip_addresses', [])
+            for ip in ip_addresses:
+                address = ip.get('address')
+                if address:
+                    vrf_ips.append(address)
+
         # Дедупликация IP-адресов
         vrf_ips = list(set(vrf_ips))
-        
-        logger.debug(f"VRF {vrf_name}: found {prefix_count} prefixes, {len(vrf_ips)} IP addresses via GraphQL")
+
+        #logger.info(f"VRF {vrf_name}: found {prefix_count} prefixes, {len(vrf_ips)} IP addresses via GraphQL")
         return vrf_ips
-        
+
     except Exception as error:
-        logger.warning(f"GraphQL failed for VRF {vrf_name}: {error}")
-        logger.info(f"Using REST API for VRF {vrf_name}")
-        
-        # Fallback к REST API
+        #logger.warning(f"GraphQL failed for VRF {vrf_name}: {error}")
         return get_ips_in_vrf_fallback(nautobot_api, vrf_id, vrf_name)
 
 
@@ -158,12 +153,12 @@ def get_ips_in_vrf_fallback(nautobot_api, vrf_id, vrf_name):
         # Получаем ВСЕ assignments и фильтруем вручную (обходной путь для бага API)
         all_assignments = nautobot_api.ipam.vrf_prefix_assignments.all()
         vrf_assignments = [a for a in all_assignments if a.vrf.id == vrf_id]
-        
+
         # Дедупликация префиксов (убираем дублированные assignments)
         prefix_ids = list(set([a.prefix.id for a in vrf_assignments]))
-        
+
         logger.debug(f"VRF {vrf_name}: found {len(prefix_ids)} prefixes via REST fallback")
-        
+
         # Собираем все IP сначала, дедуплицируем в конце
         vrf_ips = []
         for prefix_id in prefix_ids:
@@ -172,13 +167,13 @@ def get_ips_in_vrf_fallback(nautobot_api, vrf_id, vrf_name):
                 vrf_ips.extend([ip.address for ip in ip_addresses])
             except Exception as prefix_error:
                 logger.error(f"Error processing prefix {prefix_id}: {prefix_error}")
-        
+
         # Дедупликация IP-адресов один раз в конце
         vrf_ips = list(set(vrf_ips))
-        
+
         logger.debug(f"VRF {vrf_name}: total {len(vrf_ips)} IP addresses via REST fallback")
         return vrf_ips
-        
+
     except Exception as error:
         logger.error(f"REST fallback error for VRF {vrf_name}: {error}")
         return []
@@ -195,17 +190,17 @@ def handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
         if not existing_ip:
             logger.error(f"Cannot find existing IP {ip_address}")
             return False
-            
+
         if not existing_ip.parent:
             logger.error(f"IP {ip_address} has no parent prefix")
             return False
-            
+
         prefix_id = existing_ip.parent.id
-        
+
         # Проверяем, есть ли уже нужный VRF у префикса
         existing_vrf_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(prefix=prefix_id)
         existing_vrf_ids = [assignment.vrf.id for assignment in existing_vrf_assignments]
-        
+
         if vrf_id not in existing_vrf_ids:
             # Добавляем VRF к префиксу
             nautobot_api.ipam.vrf_prefix_assignments.create(
@@ -215,9 +210,9 @@ def handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
             logger.info(f"Added VRF {vrf_id} to prefix {existing_ip.parent.prefix}")
         else:
             logger.info(f"VRF {vrf_id} already assigned to prefix {existing_ip.parent.prefix}")
-        
+
         return True
-        
+
     except Exception as error:
         logger.error(f"Error handling existing IP {ip_address}: {error}")
         return False
@@ -226,19 +221,20 @@ def handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
 def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, device_name):
     """Создает IP-адрес в Nautobot с обработкой конфликтов."""
     ip_address = f"{arp_entry['address']}/32"
-    
+
     # Дополнительная проверка существования IP перед созданием
     try:
         existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_address)
         if existing_ip:
-            logger.warning(f"IP {ip_address} already exists but wasn't found in VRF {vrf_name} check for device {device_name}")
+            logger.warning(
+                f"IP {ip_address} already exists but wasn't found in VRF {vrf_name} check for device {device_name}")
             # Пытаемся исправить VRF assignment
             handle_existing_ip_error(nautobot_api, ip_address, vrf_id)
             return
     except Exception:
         # IP не существует, можно создавать
         pass
-    
+
     try:
         nautobot_api.ipam.ip_addresses.create([{
             "address": ip_address,
@@ -250,10 +246,10 @@ def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf
             "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
         }])
         logger.debug(f"Created IP address {ip_address} for device {device_name}")
-        
+
     except Exception as error:
         logger.warning(f"Failed to create IP {ip_address} for device {device_name}: {error}")
-        
+
         # Пытаемся обработать конфликт VRF
         if "already exists" in str(error).lower():
             if handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
@@ -277,10 +273,10 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
 
         for vrf_name, vrf_id in existing_vrf_in_device.items():
             logger.info(f"Processing VRF {vrf_name} for device {nautobot_device.name}")
-            
+
             # Получаем IP-адреса в VRF
             nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
-            
+
             # Получаем ARP-таблицу с устройства
             output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
             device_arp = parse_output(platform='cisco_ios', command='show ip arp', data=output)
@@ -311,11 +307,12 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
                 # Создаем IP-адрес, если его нет в VRF
                 ip_with_mask = f"{arp_entry['address']}/32"
                 if ip_with_mask not in nautobot_device_arp:
-                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, nautobot_device.name)
+                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name,
+                                                  nautobot_device.name)
 
         net_connect.disconnect()
         logger.info(f'Completed processing device {nautobot_device.name}')
-        
+
     except Exception as error:
         logger.error(f'Error processing device {nautobot_device.name}: {error}')
 
@@ -333,7 +330,7 @@ def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
 
         for vrf_name, vrf_id in existing_vrf_in_device.items():
             logger.info(f"Processing VRF {vrf_name} for device {nautobot_device.name}")
-            
+
             # Получаем IP-адреса в VRF
             nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
 
@@ -357,11 +354,12 @@ def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
                 # Создаем IP-адрес, если его нет в VRF
                 ip_with_mask = f"{arp_entry['address']}/32"
                 if ip_with_mask not in nautobot_device_arp:
-                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, nautobot_device.name)
+                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name,
+                                                  nautobot_device.name)
 
         net_connect.disconnect()
         logger.info(f'Completed processing device {nautobot_device.name}')
-        
+
     except Exception as error:
         logger.error(f'Error processing device {nautobot_device.name}: {error}')
 
@@ -378,7 +376,7 @@ def add_arp_entry_to_nautobot():
     # Фильтруем нужные устройства
     devices = list(api.dcim.devices.all())
     target_devices = []
-    
+
     for device in devices:
         tag_names = [tag_map.get(tag.id) for tag in (device.tags or [])]
         if 'raif_scripts' in tag_names:
@@ -387,7 +385,7 @@ def add_arp_entry_to_nautobot():
     logger.info(f"Found {len(target_devices)} target devices")
 
     # Многопоточная обработка устройств
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
         for nautobot_device in target_devices:
             if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
                 executor.submit(

@@ -89,38 +89,30 @@ def get_dns_name(ip_address):
 
 def get_ips_in_vrf_safe(nautobot_api, vrf_id):
     """
-    Безопасно получает все IP-адреса в VRF.
-    Использует прямой обход вместо present_in_vrf_id из-за возможных проблем с фильтром.
+    Получает IP-адреса в VRF через префиксы (без использования present_in_vrf_id).
+    Это надежный метод, который работает через связь IP → Parent Prefix → VRF.
     """
     try:
-        # Сначала пробуем стандартный фильтр
-        ip_addresses = nautobot_api.ipam.ip_addresses.filter(present_in_vrf_id=vrf_id)
-        vrf_ips = [ip.address for ip in ip_addresses]
+        # Получаем все префиксы, привязанные к VRF
+        vrf_prefix_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(vrf=vrf_id)
+        prefix_ids = [assignment.prefix.id for assignment in vrf_prefix_assignments]
         
-        logger.debug(f"Found {len(vrf_ips)} IP addresses in VRF {vrf_id} using filter")
+        if not prefix_ids:
+            logger.debug(f"No prefixes found for VRF {vrf_id}")
+            return []
+        
+        # Получаем все IP-адреса из этих префиксов
+        vrf_ips = []
+        for prefix_id in prefix_ids:
+            ip_addresses = nautobot_api.ipam.ip_addresses.filter(parent=prefix_id)
+            vrf_ips.extend([ip.address for ip in ip_addresses])
+        
+        logger.debug(f"Found {len(vrf_ips)} IP addresses in VRF {vrf_id} via {len(prefix_ids)} prefixes")
         return vrf_ips
         
     except Exception as error:
-        logger.warning(f"Filter by present_in_vrf_id failed: {error}, using fallback method")
-        
-        # Fallback: проверяем все IP-адреса вручную
-        try:
-            all_ips = nautobot_api.ipam.ip_addresses.all()
-            vrf_ips = []
-            
-            for ip in all_ips:
-                if hasattr(ip, 'vrfs') and ip.vrfs:
-                    for vrf in ip.vrfs:
-                        if vrf.id == vrf_id:
-                            vrf_ips.append(ip.address)
-                            break
-            
-            logger.debug(f"Found {len(vrf_ips)} IP addresses in VRF {vrf_id} using fallback")
-            return vrf_ips
-            
-        except Exception as fallback_error:
-            logger.error(f"Fallback method also failed: {fallback_error}")
-            return []
+        logger.error(f"Error getting IPs for VRF {vrf_id}: {error}")
+        return []
 
 
 def handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
@@ -170,7 +162,16 @@ def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, dev
     try:
         existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_address)
         if existing_ip:
-            logger.warning(f"IP {ip_address} already exists but wasn't found in VRF filter for device {device_name}")
+            logger.warning(f"IP {ip_address} already exists but wasn't found in VRF check for device {device_name}")
+            
+            # Диагностическая информация
+            logger.debug(f"Existing IP parent: {existing_ip.parent}")
+            if existing_ip.parent:
+                parent_vrf_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(prefix=existing_ip.parent.id)
+                parent_vrfs = [assignment.vrf.id for assignment in parent_vrf_assignments]
+                logger.debug(f"Parent prefix VRFs: {parent_vrfs}")
+                logger.debug(f"Looking for VRF: {vrf_id}")
+            
             # Пытаемся исправить VRF assignment
             handle_existing_ip_error(nautobot_api, ip_address, vrf_id)
             return

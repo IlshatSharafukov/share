@@ -93,38 +93,48 @@ def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
     Обходит проблемы с pynautobot REST API фильтрами.
     """
     try:
-        # GraphQL запрос для получения всех IP-адресов в VRF
+        # GraphQL запрос для получения всех префиксов с их VRF и IP-адресами
         query = """
-        query GetIPsInVRF($vrfId: ID!) {
-            prefixes(vrfs: [$vrfId]) {
+        query GetAllPrefixesWithVRFs {
+            prefixes {
                 id
                 prefix
-                ipAddresses {
+                vrfs {
+                    id
+                    name
+                }
+                ip_addresses {
                     address
                 }
             }
         }
         """
         
-        variables = {"vrfId": vrf_id}
-        
-        logger.debug(f"VRF {vrf_name}: executing GraphQL query")
-        result = nautobot_api.graphql.query(query=query, variables=variables)
+        logger.debug(f"VRF {vrf_name}: executing GraphQL query for all prefixes")
+        result = nautobot_api.graphql.query(query=query)
         
         if not result or not hasattr(result, 'data') or not result.data:
             logger.warning(f"VRF {vrf_name}: empty GraphQL response")
             return []
         
-        # Собираем все IP-адреса из всех префиксов VRF
+        # Фильтруем префиксы, которые принадлежат нужному VRF
         vrf_ips = []
         prefix_count = 0
         
         for prefix in result.data.prefixes:
-            prefix_count += 1
-            if hasattr(prefix, 'ip_addresses') and prefix.ip_addresses:
-                for ip in prefix.ip_addresses:
-                    if hasattr(ip, 'address') and ip.address:
-                        vrf_ips.append(ip.address)
+            # Проверяем, принадлежит ли префикс нужному VRF
+            prefix_vrf_ids = []
+            if hasattr(prefix, 'vrfs') and prefix.vrfs:
+                prefix_vrf_ids = [vrf.id for vrf in prefix.vrfs if hasattr(vrf, 'id')]
+            
+            # Если префикс принадлежит нужному VRF
+            if vrf_id in prefix_vrf_ids:
+                prefix_count += 1
+                # Собираем IP-адреса из этого префикса
+                if hasattr(prefix, 'ip_addresses') and prefix.ip_addresses:
+                    for ip in prefix.ip_addresses:
+                        if hasattr(ip, 'address') and ip.address:
+                            vrf_ips.append(ip.address)
         
         # Дедупликация IP-адресов
         vrf_ips = list(set(vrf_ips))

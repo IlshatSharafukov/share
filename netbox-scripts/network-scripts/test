@@ -164,19 +164,37 @@ def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, dev
         if existing_ip:
             logger.warning(f"IP {ip_address} already exists but wasn't found in VRF check for device {device_name}")
             
-            # Диагностическая информация
+            # Подробная диагностическая информация
             logger.debug(f"Existing IP parent: {existing_ip.parent}")
+            logger.debug(f"Existing IP parent prefix: {existing_ip.parent.prefix if existing_ip.parent else 'NO PARENT'}")
+            
             if existing_ip.parent:
-                parent_vrf_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(prefix=existing_ip.parent.id)
-                parent_vrfs = [assignment.vrf.id for assignment in parent_vrf_assignments]
+                logger.debug(f"Existing IP parent ID: {existing_ip.parent.id}")
+                
+                # Проверяем к каким VRF привязан родительский префикс
+                parent_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(prefix=existing_ip.parent.id)
+                parent_vrfs = [f"{a.vrf.name} ({a.vrf.id})" for a in parent_assignments]
                 logger.debug(f"Parent prefix VRFs: {parent_vrfs}")
-                logger.debug(f"Looking for VRF: {vrf_id}")
+                logger.debug(f"Looking for VRF ID: {vrf_id}")
+                
+                # Проверяем, есть ли этот parent среди префиксов текущего VRF
+                vrf_prefix_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(vrf=vrf_id)
+                vrf_prefix_ids = [a.prefix.id for a in vrf_prefix_assignments]
+                logger.debug(f"Current VRF prefix IDs: {vrf_prefix_ids}")
+                logger.debug(f"IP parent in current VRF prefixes: {existing_ip.parent.id in vrf_prefix_ids}")
+                
+                # Дополнительная проверка - получаем IP через фильтр parent
+                test_ips = nautobot_api.ipam.ip_addresses.filter(parent=existing_ip.parent.id)
+                test_ip_addresses = [ip.address for ip in test_ips]
+                logger.debug(f"IPs found by parent filter: {test_ip_addresses}")
+                logger.debug(f"Our IP in parent filter results: {ip_address in test_ip_addresses}")
             
             # Пытаемся исправить VRF assignment
             handle_existing_ip_error(nautobot_api, ip_address, vrf_id)
             return
-    except Exception:
+    except Exception as e:
         # IP не существует, можно создавать
+        logger.debug(f"IP {ip_address} does not exist, will create: {e}")
         pass
     
     try:

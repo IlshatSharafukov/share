@@ -1,463 +1,291 @@
-import ast
-import ipaddress
-import re
-import uuid
-import tempfile
 import time
-from enum import Enum
-from pathlib import Path
-from typing import Callable, Optional, Union
-
-from atmsrv import settings
-from .scripts.backup_script import backup_script
-from .scripts.backup_f5.backup_f5 import run_backup_f5
+import logging
+import concurrent.futures
 
 import urllib3
+import requests
 from decouple import config
-from django.contrib.auth import login, logout
-from django.db.models import Model
-from django.http import HttpRequest, HttpResponse
-from django.shortcuts import redirect, reverse
-from django.utils import timezone
-from django.utils.encoding import smart_str
-from django_auth_ldap.backend import LDAPBackend
-from pyzabbix import ZabbixAPI
-from django.contrib.auth.decorators import login_required
-from django.utils.decorators import method_decorator
+from ntc_templates.parse import parse_output
+from netmiko import ConnectHandler
+import pynautobot
+import socket
+import re
 
-from .forms import LoginForm, MikrotikSelectionForm
-from .models import (
-    WebappConsolePort,
-    WebappMikrotikBaseInfo,
-    WebappMikrotikDynamicInfo,
-    WebappMikrotikHistory,
-    WebappMikrotikRebootHistory,
-    WebappMikrotikStaticInfo,
-    WebappMikrotikUpdate,
-    WebappSla,
-    WebappSlaHistory,
-    WebappRoutes
-)
-
-import os
-import json
-import threading
-from django.shortcuts import render
-from django.http import JsonResponse
-from django.views import View
-from channels.layers import get_channel_layer
-from asgiref.sync import async_to_sync
-import logging
-
-from .scripts.ssh_commands import run_commands_normal_mode, run_commands_config_mode
-
-logger = logging.getLogger(__name__)
-
+# Отключаем предупреждения InsecureRequestWarning
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-FILE_DIR = "/var/backup/"
-FILE_NAME = "config_backup.zip"
-FILE_PATH = Path(FILE_DIR) / (FILE_NAME)
-SCRIPT_PATH = "/var/backup/backup_script/main.py"
-submitted = True
-data_found = True
-mikrotik_id_max = 2047
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger()
-MIN_LENGTH_2 = 2
-MIN_LENGTH_3 = 3
-MIN_LENGTH_4 = 4
-context = {}
+# Константы из окружения
+HPNA_LOGIN = config('HPNA_LOGIN')
+HPNA_PASSWORD = config('HPNA_PASSWORD')
+NAUTOBOT_URL = config('NAUTOBOT_URL')
+NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
+
+# Логгер
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-class ATMResult(Enum):
-    ATM_NAME_FROM_ID = "atm_name_from_id"
-    INVALID_ATM_ID = "invalid_atm_id"
-    ATM_NAME_FROM_IP = "atm_name_from_ip"
-    INVALID_IP = "invalid_ip"
-    UNKNOWN = "unknown"
-
-
-def initialize_zabbix_connection() -> ZabbixAPI:
-    zabbix_api = ZabbixAPI("https://s-msk-p-z-snmp.raiffeisen.ru/")
-    zabbix_api.session.verify = False
-    zabbix_api.login(api_token=config("ZB_TOKEN"))
-    return zabbix_api
-
-
-# zabbix_api = initialize_zabbix_connection()
-zabbix_api = None
-
-
-def fetch_mikrotik_icmp_status(zabbix_api: ZabbixAPI, mikrotik_identifier: str) -> Optional[str]:
-    try:
-        icmp_status = zabbix_api.item.get(host=mikrotik_identifier, search={"key_": "icmpping"})[0]["lastvalue"]
-    except KeyError:
-        logger.info("KeyError when trying to get mk icmp status from zabbix")
-        return None
-    except ValueError:
-        logger.info("ValueError when trying to get mk icmp status from zabbix")
-        return None
-    except IndexError:
-        logger.info("IndexError when trying to get mk icmp status from zabbix")
-        return None
-
-    return icmp_status
-
-
-def convert_text_string_to_python_list(object_name: Model, attribute_name: str) -> Optional[list]:
-    try:
-        text_string = getattr(object_name, attribute_name)
-        python_list_type_data = ast.literal_eval(text_string)
-    except ValueError:
-        logger.info(f"Convert text string DB entry to list ValueError. DB table {attribute_name}")
-        return None
-    except AttributeError:
-        logger.info(f"Convert text string DB entry to list AttributeError. DB table {attribute_name}")
-        return None
-    except Exception as error:
-        logger.info(f"Convert text string DB entry to list UnknownError. DB table {attribute_name} - {error}")
-        return None
-
-    return python_list_type_data
-
-
-def convert_text_string_to_json_type(object_name: Model, attribute_name: str) -> Optional[list]:
-    try:
-        text_string = getattr(object_name, attribute_name)
-        if text_string is None:
-            logger.info(f"Field '{attribute_name}' is None or doesn't exist in the DB entry")
-            return None
-        fixed_data = text_string.replace("'", '"')
-        json_type = json.loads(fixed_data)
-    except (json.JSONDecodeError, AttributeError) as error:
-        logger.info(f"Error when trying to convert text from field '{attribute_name}': {error}")
-        return None
-    except Exception as error:
-        logger.info(f"Unexpected error when processing field '{attribute_name}': {error}")
-        return None
-
-    return json_type
-
-
-def check_ip_in_atm_network_range(ip_address: str) -> bool:
-    ip_network = ipaddress.ip_network("10.255.0.0/16")
-    ip_to_check = ipaddress.ip_address(ip_address)
-
-    return ip_to_check in ip_network
-
-
-def convert_ip_to_mikrotik_atm_name(user_form_entered_data: str) -> str:
-    (first_oktet, second_oktet, third_oktet, fourth_oktet) = user_form_entered_data.split(".")
-    # Вычисляем номер ATM, округляя адрес до ближайшего кратного 8
-    atm_number = str(((int(third_oktet) * 256 + int(fourth_oktet)) // 8) + 1)
-
-    # Заполняем нулями до нужной длины
-    atm_number = atm_number.zfill(4)
-
-    return "ID" + atm_number
-
-
-def convert_atm_number_to_mikrotik_atm_name(user_form_entered_data: str) -> str:
-    atm_number = str(user_form_entered_data)
-    atm_number = "0" + atm_number if len(atm_number) < MIN_LENGTH_2 else atm_number
-    atm_number = "0" + atm_number if len(atm_number) < MIN_LENGTH_3 else atm_number
-    atm_number = "0" + atm_number if len(atm_number) < MIN_LENGTH_4 else atm_number
-
-    return "ID" + atm_number
-
-
-def processing_bgp_flap_counts(bgp_flap_count: list) -> list:
-    bgp_flap_mapping = {
-        "172.16.31.42": "MSK70-BEELINE",
-        "172.16.31.46": "MSK34-BEELINE",
-        "172.16.31.90": "MSK70-MTS",
-        "172.16.31.94": "MSK34-MTS",
-    }
-    bgp_flap_count_for_app = []
-    for peer_ip_address, peer_down_number in bgp_flap_count.items():
-        if peer_ip_address in bgp_flap_mapping:
-            peer_ip = bgp_flap_mapping[peer_ip_address]
-            peer_down_count = (
-                f"{peer_ip} BGP PEER = {peer_ip_address} went down {peer_down_number} times in the last week."
-            )
-            bgp_flap_count_for_app.append(peer_down_count)
-
-    if not bgp_flap_count_for_app:
-        bgp_flap_count_for_app.append("No BGP peers experienced downtime over the past week.")
-
-    return bgp_flap_count_for_app
-
-
-def processing_ethernet_flap_counts(ethernet_flap_count: list) -> list:
-    ethernet_flap_mapping = {"ether1": "Interface ether1", "ether2": "Interface ether2", "ether3": "Interface ether3"}
-
-    ethernet_flap_count_for_app = []
-
-    if len(ethernet_flap_count) != 0:
-        for eth_interface_name, eth_down_number in ethernet_flap_count.items():
-            if eth_interface_name in ethernet_flap_mapping:
-                count = f"{ethernet_flap_mapping[eth_interface_name]} dropped {eth_down_number} times in the last week"
-                ethernet_flap_count_for_app.append(count)
-    else:
-        count = "Over the past week, it was not possible to detect any downfalls of any ethernet interfaces"
-        ethernet_flap_count_for_app.append(count)
-
-    return ethernet_flap_count_for_app
-
-
-def main(request: HttpRequest) -> HttpResponse:
-    return render(request, "index.html")
-
-
-def process_user_data(user_form_entered_data: str) -> ATMResult:
-    re_atm_id_number = re.compile(r"^\d{1,4}$")
-    re_atm_id_number_with_letters = re.compile(r"^ID\d{4}$")
-    re_atm_ip_address = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
-    re_atm_id_identifier = re.compile(r"\d+")
-
-    atm_id_number_match = re_atm_id_number.search(user_form_entered_data)
-    atm_id_with_letters_match = re_atm_id_number_with_letters.search(user_form_entered_data)
-    atm_ip_address_match = re_atm_ip_address.search(user_form_entered_data)
-
-    atm_id_numbers = re_atm_id_identifier.findall(user_form_entered_data)
-    if atm_id_numbers:
-        try:
-            atm_id_identifier = int(atm_id_numbers[0])
-        except (ValueError, KeyError):
-            atm_id_identifier = None
-    else:
-        atm_id_identifier = None
-
-    if (atm_id_number_match or atm_id_with_letters_match) and not atm_ip_address_match:
-        if atm_id_identifier is None or atm_id_identifier > mikrotik_id_max:
-            return ATMResult.INVALID_ATM_ID
-        return ATMResult.ATM_NAME_FROM_ID
-
-    if atm_ip_address_match:
-        if not check_ip_in_atm_network_range(user_form_entered_data):
-            return ATMResult.INVALID_IP
-        if atm_id_identifier is None or atm_id_identifier > mikrotik_id_max:
-            return ATMResult.INVALID_ATM_ID
-        return ATMResult.ATM_NAME_FROM_IP
-
-    return ATMResult.UNKNOWN
-
-
-def handle_flap_count(flaps: list, processing_func: Callable, error_msg: str) -> Union[list, str]:
-    if flaps:
-        return processing_func(flaps)
-    return error_msg
-
-
-def get_mikrotik_atm_name(result_user_data: ATMResult, user_form_entered_data: str) -> Optional[str]:
-    if result_user_data == ATMResult.ATM_NAME_FROM_ID:
-        try:
-            atm_id_identifier = int(re.findall(r"\d+", user_form_entered_data)[0])
-            print(atm_id_identifier)
-            return convert_atm_number_to_mikrotik_atm_name(str(atm_id_identifier))
-        except (ValueError, KeyError):
-            return None
-    elif result_user_data == ATMResult.ATM_NAME_FROM_IP:
-        return convert_ip_to_mikrotik_atm_name(user_form_entered_data)
-
-    return None
-
-
-def get_mikrotik_data(mikrotik_id: int) -> dict:
-    return {
-        "static": WebappMikrotikStaticInfo.objects.filter(id=mikrotik_id).first(),
-        "dynamic": WebappMikrotikDynamicInfo.objects.filter(id=mikrotik_id).first(),
-        "base": WebappMikrotikBaseInfo.objects.filter(id=mikrotik_id).first(),
+def netmiko_connect(netbox_device, device_type):
+    netmiko_device = {
+        'device_type': device_type,
+        'host': str(netbox_device.primary_ip4)[:-3:],
+        'username': config('HPNA_LOGIN'),
+        'password': config('HPNA_PASSWORD'),
+        'timeout': 200,
+        'port': 22,
+        "global_delay_factor": 2,
+        'conn_timeout': 200
     }
 
-
-@login_required
-def receiving_network_device_status(request: HttpRequest) -> HttpResponse:
-    user_form = MikrotikSelectionForm(request.POST)
-
-    if request.method != "POST" or not user_form.is_valid():
-        return render(request, "script_info.html", {"form": user_form})
-
-    user_form_entered_data = user_form.cleaned_data["mikrotik_name"]
-
-    result_user_data = process_user_data(user_form_entered_data)
-    if result_user_data in (ATMResult.INVALID_ATM_ID, ATMResult.INVALID_IP):
-        return render(request, "error_page.html", {"form": user_form})
-
-    mikrotik_atm_name = get_mikrotik_atm_name(result_user_data, user_form_entered_data)
-    if not mikrotik_atm_name:
-        return render(request, "error_page.html", {"form": user_form})
-
     try:
-        icmp_ping_status = fetch_mikrotik_icmp_status(zabbix_api, mikrotik_atm_name)
-    except AttributeError:
-        icmp_ping_status = None
+        net_connect = ConnectHandler(**netmiko_device)
+    except Exception as error:
+        try:
+            net_connect = ConnectHandler(**netmiko_device)
+        except Exception as error:
+            logger.error(f"Connection error {netbox_device}")
+            return None
 
-    try:
-        mikrotik_id_in_database = WebappMikrotikBaseInfo.objects.get(mikrotik_name=mikrotik_atm_name).id
-    except WebappMikrotikBaseInfo.DoesNotExist:
-        return render(request, "error_page.html", {"form": user_form})
+    return net_connect
 
-    mikrotik_data = get_mikrotik_data(mikrotik_id_in_database)
-    mk_sla = WebappSla.objects.get(mikrotik_id=mikrotik_atm_name)
 
-    sla_attributes = ["msk70_cards07", "mskd8_cards08", "mskd8_cards07", "msk70_cards08"]
-    for attribute in sla_attributes:
-        context[attribute] = convert_text_string_to_python_list(mk_sla, attribute)
-
-    dynamic_attributes = ["mikrotic_arp_table", "mikrotic_dhcp_lease", "mikrotic_connections"]
-    for attribute in dynamic_attributes:
-        context[attribute] = convert_text_string_to_python_list(mikrotik_data["dynamic"], attribute)
-
-    context.update(
-        {
-            "mikrotik_ethernet_interface": convert_text_string_to_json_type(
-                mikrotik_data["dynamic"], "mikrotik_ethernet_interface"
-            ),
-            "mikrotik_bridge_host": convert_text_string_to_json_type(mikrotik_data["dynamic"], "mikrotik_bridge_host"),
-            "bgp_flap_count_for_app": handle_flap_count(
-                convert_text_string_to_json_type(mikrotik_data["dynamic"], "bgp_flap_count"),
-                processing_bgp_flap_counts,
-                "Missing data",
-            ),
-            "ethernet_flap_count_for_app": handle_flap_count(
-                convert_text_string_to_json_type(mikrotik_data["dynamic"], "mikrotik_ethernet_history"),
-                processing_ethernet_flap_counts,
-                "Missing data",
-            ),
-            "icmp_ping_status": icmp_ping_status,
-            "form": user_form,
-            "mk_state_static": mikrotik_data["static"],
-            "base_info": mikrotik_data["base"],
-            "mk_state_dynamic": mikrotik_data["dynamic"],
-            "mikrotik_route_announcements": WebappRoutes.objects.get(mikrotik_ip=mikrotik_atm_name)
-        }
+def netbox_connection():
+    """
+    Возвращает клиент pynautobot с увеличенным пулом соединений.
+    """
+    api = pynautobot.api(
+        NAUTOBOT_URL,
+        token=NAUTOBOT_TOKEN,
+        verify=False,
     )
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=1000,
+        pool_maxsize=1000
+    )
+    api.http_session.mount('http://', adapter)
+    api.http_session.mount('https://', adapter)
+    api.http_session.verify = False
+    return api
 
-    return render(request, "script_result.html", context)
 
+def create_arp_netbox_on_cisco_ios(netbox_device, netbox_api):
+    net_connect = netmiko_connect(netbox_device, 'cisco_ios')
 
-def logout_user_view(request: HttpRequest) -> HttpResponse:
-    logout(request)
-    return redirect("webapp:login")
-
-
-@login_required
-def history(request: HttpRequest) -> HttpResponse:
-    user_form = MikrotikSelectionForm(request.POST)
-
-    if request.method != "POST" or not user_form.is_valid():
-        return render(request, "history_info.html", {"form": user_form})
-
-    user_form_entered_data = user_form.cleaned_data["mikrotik_name"]
-    result_user_data = process_user_data(user_form_entered_data)
-
-    if result_user_data in {ATMResult.INVALID_ATM_ID, ATMResult.INVALID_IP}:
-        return render(request, "error_page.html", {"form": user_form, "history_page": True})
-
-    mikrotik_atm_name = get_mikrotik_atm_name(result_user_data, user_form_entered_data)
-    if not mikrotik_atm_name:
-        return render(request, "error_page.html", {"form": user_form, "history_page": True})
+    if not net_connect:
+        return
 
     try:
-        mk_id = WebappMikrotikBaseInfo.objects.get(mikrotik_name=mikrotik_atm_name).id
-    except WebappMikrotikBaseInfo.DoesNotExist:
-        return render(request, "error_page.html", {"form": user_form, "history_page": True})
+        device_vrfs = netbox_api.ipam.vrfs.filter(device=netbox_device.id)
 
-    mk_history = WebappMikrotikHistory.objects.filter(mikrotik_name=mk_id).order_by("-created")[:20]
-    mk_sla_history = WebappSlaHistory.objects.filter(mikrotik_name=mk_id).order_by("-created")[:20]
+        existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
 
-    sla_keys = {
-        "msk70_mts_list": "msk70_cards07",
-        "mskd8_mts_list": "mskd8_cards08",
-        "msk70_beeline_list": "msk70_cards08",
-        "mskd8_beeline_list": "mskd8_cards07",
-    }
+        for vrf_name, vrf_id in existing_vrf_in_device.items():
+            # if vrf_name == 'vtrec':
+            netbox_ip_addresses = netbox_api.ipam.ip_addresses.filter(present_in_vrf_id=vrf_id)
+            netbox_device_arp = [netbox_arp.address for netbox_arp in netbox_ip_addresses]
+            set_device_arp = set()
+            output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
+            device_arp = parse_output(platform='cisco_ios', command='show ip arp', data=output)
 
-    sla_lists = {key: [] for key in sla_keys}
+            for mac_nice in device_arp:
+                mac_nice['mac'] = mac_nice['mac'].split('.')
+                mac_nice['mac'] = ''.join(mac_nice['mac'])
+                blocks = [mac_nice['mac'][x:x + 2] for x in range(0, len(mac_nice['mac']), 2)]
+                mac_nice['mac'] = '-'.join(blocks)
 
-    for sla in mk_sla_history:
-        for list_name, attr in sla_keys.items():
-            sla_data = ast.literal_eval(getattr(sla, attr))
-            sla_data["created"] = sla.created
-            sla_lists[list_name].append(sla_data)
+            for arp_entry in device_arp:
+                skip_list = ['192.168.0.0', '192.168.0.1', '192.168.0.2',
+                             '192.168.0.3', '192.168.0.4', '192.168.0.5',
+                             '192.168.0.6']
 
-    mts_ip = sla_lists["msk70_mts_list"][0]["ip"] if sla_lists["msk70_mts_list"] else None
-    beeline_ip = sla_lists["msk70_beeline_list"][0]["ip"] if sla_lists["msk70_beeline_list"] else None
+                if any(sub in arp_entry['address'] for sub in skip_list):
+                    continue
+                set_device_arp.add(str(arp_entry['address'] + '/32'))
 
-    context = {
-        "form": user_form,
-        "mk_history": mk_history,
-        **sla_lists,
-        "mts_ip": mts_ip,
-        "beeline_ip": beeline_ip,
-        "submitted": True,
-        "data_found": True,
-    }
+                if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
+                    continue
 
-    return render(request, "history_result.html", context)
+                try:
+                    dnsname, alias, addresslist = socket.gethostbyaddr(f'{arp_entry["address"]}')
+                    dnsname = re.sub(r'[#*\s\[\]\"]', '', dnsname)
+                except Exception as err:
+                    dnsname = ''
 
+                if str(arp_entry['address'] + '/32') not in netbox_device_arp:
+                    try:
+                        netbox_api.ipam.ip_addresses.create([{
+                            "address": f"{arp_entry['address']}/32",
+                            "custom_fields": {
+                                "mac_address": arp_entry['mac']
+                            },
+                            "dns_name": dnsname,
+                            "status": "Active",
+                            "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
+                        }])
+                    except Exception as error:
+                        print(arp_entry['address'], dnsname, error, vrf_name, netbox_device, arp_entry)
+                        # ip = netbox_api.ipam.ip_addresses.get(address=f"{arp_entry['address']}/32")
+                        # prefix_id = ip.parent.id
+                        # if len(ip.parent.vrfs) == 0:
+                        #     netbox_api.ipam.vrf_prefix_assignments.create(prefix=prefix_id,
+                        #                                                   vrf=vrf_id)
+                        # elif len(ip.parent.vrfs) == 1:
+                        #     vrfs_in_pref = netbox_api.ipam.vrf_prefix_assignments.get(prefix=prefix_id)
+                        #     vrfs_in_pref.delete()
+                        #     netbox_api.ipam.vrf_prefix_assignments.create(prefix=prefix_id,
+                        #                                                   vrf=vrf_id)
 
-def create_mikrotik_update(device_id: str, update_data: dict) -> None:
-    WebappMikrotikUpdate.objects.create(mikrotik_name=device_id, mikrotik_sla=1, **update_data)
-
-
-@login_required
-def mikrotik_update(request: HttpRequest) -> HttpResponse:
-    user_form = MikrotikSelectionForm(request.POST)
-
-    device_id = request.POST.get("device_id", "").strip()
-
-    if request.method != "POST" or not device_id:
-        return render(request, "error_page.html", {"form": user_form, "deny_action": True})
-
-    actions = {
-        "change_isp": {"mikrotik_default_gw_change": 1},
-        "clear_lease": {"mikrotik_dhcp_lease_clear": 1},
-        "clear_arp": {"mikrotik_arp_clear": 1},
-        "refresh_info": {"mikrotik_refresh_info": 1},
-        "shutdown_port": {"mikrotik_shutdown_port": 1},
-        "clear_lease_vtrec": {"mikrotik_dhcp_lease_clear_vtrec": 1},
-        "clear_lease_atm": {"mikrotik_dhcp_lease_clear_atm": 1},
-        "change_net_mode_3g_lte0": {"mikrotik_change_nm_3g_lte0": 1},
-        "change_net_mode_3g_lte_lte0": {"mikrotik_change_nm_3g_lte_lte0": 1},
-        "change_net_mode_3g_lte1": {"mikrotik_change_nm_3g_lte1": 1},
-        "change_net_mode_3g_lte_lte1": {"mikrotik_change_nm_3g_lte_lte1": 1},
-    }
-
-    for action, update_data in actions.items():
-        if request.POST.get(action) == "True":
-            create_mikrotik_update(device_id, update_data)
-
-    if request.POST.get("reboot") == "True":
-        password = request.POST.get("password")
-        username = request.user.username
-        auth = LDAPBackend()
-        user = auth.authenticate(request, username=username, password=password)
-        if user is not None and user.is_active:
-            WebappMikrotikRebootHistory.objects.create(
-                mikrotik_name=device_id, username=username, created=timezone.now()
-            )
-            create_mikrotik_update(device_id, {"mikrotik_reboot": 1})
-            return render(request, "error_page.html", {"form": user_form, "reboot": True})
-        return render(request, "error_page.html", {"form": user_form, "deny_action": True})
-    return render(request, "script_result.html", {"form": user_form})
+                        # t = netbox_api.ipam.vrf_prefix_assignments.get(prefix=ip.parent.prefix)
+                        # try:
+                        #     t.delete()
+                        # except:
+                        #     print(ip, ip.parent.prefix)
+                        # netbox_api.ipam.vrf_prefix_assignments.create(prefix=prefix_id,
+                        #                                               vrf=vrf_id)
+                        # netbox_api.ipam.ip_addresses.create([{
+                        #     "address": f"{arp_entry['address']}/32",
+                        #     "custom_fields": {
+                        #         "mac_address": arp_entry['mac']
+                        #     },
+                        #     "dns_name": dnsname,
+                        #     "status": "Active",
+                        #     "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
+                        # }])
+        net_connect.disconnect()
+        logger.info(f'END SCRIPT {netbox_device}')
+    except Exception as error:
+        logger.error(F'ERROR SCRIPT {netbox_device} - {error}')
 
 
-def login_user_view(request: HttpRequest) -> HttpResponse:
-    form = LoginForm(request.POST or None)
+def create_arp_netbox_on_cisco_nxos(netbox_device, netbox_api):
+    net_connect = netmiko_connect(netbox_device, 'cisco_nxos')
 
-    if request.method == "POST" and form.is_valid():
-        username = form.cleaned_data["username"]
-        password = form.cleaned_data["password"]
-        auth = LDAPBackend()
-        user = auth.authenticate(request, username=username, password=password)
+    if not net_connect:
+        return
 
-        if user is not None and user.is_active:
-            login(request, user)
-            return redirect("webapp:main")
-        return HttpResponse("Disabled account, Invalid login, or Invalid password")
+    try:
+        device_vrfs = netbox_api.ipam.vrfs.filter(device=netbox_device.id)
 
-    context = {"form": form}
-    return render(request, "login.html", context)
+        existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
+
+        for vrf_name, vrf_id in existing_vrf_in_device.items():
+            netbox_ip_addresses = netbox_api.ipam.ip_addresses.filter(present_in_vrf_id=vrf_id)
+            netbox_device_arp = [netbox_arp.address for netbox_arp in netbox_ip_addresses]
+            set_device_arp = set()
+
+            output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
+            device_arp = parse_output(platform='cisco_nxos', command='show ip arp', data=output)
+
+            for mac_nice in device_arp:
+                mac_nice['mac'] = mac_nice['mac'].split('.')
+                mac_nice['mac'] = ''.join(mac_nice['mac'])
+                blocks = [mac_nice['mac'][x:x + 2] for x in range(0, len(mac_nice['mac']), 2)]
+                mac_nice['mac'] = '-'.join(blocks)
+
+            for arp_entry in device_arp:
+                set_device_arp.add(str(arp_entry['address'] + '/32'))
+
+                if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
+                    continue
+
+                try:
+                    dnsname, alias, addresslist = socket.gethostbyaddr(f'{arp_entry["address"]}')
+                    dns = dnsname.replace('#', '')
+                    dnsname = dns.replace('*', '')
+                except Exception as err:
+                    dnsname = ''
+
+                if str(arp_entry['address'] + '/32') not in netbox_device_arp:
+                    try:
+                        netbox_api.ipam.ip_addresses.create([{
+                            "address": f"{arp_entry['address']}/32",
+                            "custom_fields": {
+                                "mac_address": arp_entry['mac']
+                            },
+                            "dns_name": dnsname,
+                            "status": "Active",
+                            "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
+                        }])
+                    except Exception as error:
+                        print(arp_entry['address'], dnsname, error, vrf_name, netbox_device, arp_entry)
+                        # ip = netbox_api.ipam.ip_addresses.get(address=f"{arp_entry['address']}/32")
+                        # prefix_id = ip.parent.id
+                        # if len(ip.parent.vrfs) == 0:
+                        #     netbox_api.ipam.vrf_prefix_assignments.create(prefix=prefix_id,
+                        #                                                   vrf=vrf_id)
+                        # elif len(ip.parent.vrfs) == 1:
+                        #     vrfs_in_pref = netbox_api.ipam.vrf_prefix_assignments.get(prefix=prefix_id)
+                        #     vrfs_in_pref.delete()
+                        #     netbox_api.ipam.vrf_prefix_assignments.create(prefix=prefix_id,
+                        #                                                   vrf=vrf_id)
+
+                        # ip = netbox_api.ipam.ip_addresses.get(address=f"{arp_entry['address']}/32")
+                        # prefix_id = ip.parent.id
+                        # t = netbox_api.ipam.vrf_prefix_assignments.get(prefix=ip.parent.prefix)
+                        # try:
+                        #     t.delete()
+                        # except:
+                        #     print(ip, ip.parent.prefix)
+                        # netbox_api.ipam.vrf_prefix_assignments.create(prefix=prefix_id,
+                        #                                               vrf=vrf_id)
+                        # netbox_api.ipam.ip_addresses.create([{
+                        #     "address": f"{arp_entry['address']}/32",
+                        #     "custom_fields": {
+                        #         "mac_address": arp_entry['mac']
+                        #     },
+                        #     "dns_name": dnsname,
+                        #     "status": "Active",
+                        #     "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
+                        # }])
+        net_connect.disconnect()
+        logger.info(f'END SCRIPT {netbox_device}')
+    except Exception as error:
+        logger.error(F'ERROR SCRIPT {netbox_device} - {error}')
+
+
+def add_arp_entry_to_netbox():
+    start_time = time.time()
+    api = netbox_connection()
+
+    # Строим мапу тегов
+    all_tags = list(api.extras.tags.all())
+    tag_map = {t.id: t.name for t in all_tags}
+
+    # Фильтруем нужные устройства
+    devices = list(api.dcim.devices.all())
+    targets = []
+    for dev in devices:
+        names = [tag_map.get(t.id) for t in (dev.tags or [])]
+        if 'raif_scripts' in names:
+            # if 'scope_BRANCH' in names:
+            #     continue
+            # else:
+            targets.append(dev)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        for netbox_device in targets:
+            #if netbox_device.name == 'MS-VRN00-03':
+            # create_arp_netbox_on_cisco_ios(netbox_device, api)
+            if netbox_device.platform.name == 'Cisco NXOS':
+                #create_arp_netbox_on_cisco_nxos(netbox_device, api)
+                executor.submit(
+                    create_arp_netbox_on_cisco_nxos,
+                    netbox_device,
+                    api,
+                )
+                if netbox_device.platform.name == 'Cisco IOS':
+                   #create_arp_netbox_on_cisco_ios(netbox_device, api)
+                    executor.submit(
+                        create_arp_netbox_on_cisco_ios,
+                        netbox_device,
+                        api,
+                    )
+
+    print("--- %s seconds ---" % (time.time() - start_time))
+
+
+if __name__ == "__main__":
+    add_arp_entry_to_netbox()

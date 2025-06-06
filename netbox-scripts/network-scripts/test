@@ -20,12 +20,22 @@ HPNA_PASSWORD = config('HPNA_PASSWORD')
 NAUTOBOT_URL = config('NAUTOBOT_URL')
 NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
 
-# Логгер
+# Для тестирования - укажите проблемное устройство
+TEST_DEVICE = "MS-EKB00-01"  # Замените на ваше устройство
+
+# Основной логгер
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Отдельный debug logger для диагностики
+debug_logger = logging.getLogger('debug')
+debug_handler = logging.FileHandler('debug.log')
+debug_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+debug_logger.addHandler(debug_handler)
+debug_logger.setLevel(logging.DEBUG)
 
 
 def netmiko_connect(nautobot_device, device_type):
@@ -87,31 +97,36 @@ def get_dns_name(ip_address):
         return ''
 
 
-def get_ips_in_vrf_safe(nautobot_api, vrf_id):
+def get_ips_in_vrf_safe(nautobot_api, vrf_id, vrf_name):
     """
-    Получает IP-адреса в VRF через префиксы (без использования present_in_vrf_id).
-    Это надежный метод, который работает через связь IP → Parent Prefix → VRF.
+    Получает IP-адреса в VRF через префиксы с подробной диагностикой.
     """
     try:
-        # Получаем все префиксы, привязанные к VRF
+        debug_logger.info(f"\n=== GETTING IPs FOR VRF {vrf_name} ({vrf_id}) ===")
+        
         vrf_prefix_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(vrf=vrf_id)
         prefix_ids = [assignment.prefix.id for assignment in vrf_prefix_assignments]
         
-        if not prefix_ids:
-            logger.debug(f"No prefixes found for VRF {vrf_id}")
-            return []
+        debug_logger.info(f"VRF {vrf_name} has {len(prefix_ids)} prefixes")
         
-        # Получаем все IP-адреса из этих префиксов
         vrf_ips = []
-        for prefix_id in prefix_ids:
+        for i, prefix_id in enumerate(prefix_ids):
+            prefix_obj = nautobot_api.ipam.prefixes.get(prefix_id)
+            debug_logger.info(f"Prefix {i+1}: {prefix_obj.prefix} (ID: {prefix_id})")
+            
             ip_addresses = nautobot_api.ipam.ip_addresses.filter(parent=prefix_id)
-            vrf_ips.extend([ip.address for ip in ip_addresses])
+            found_ips = [ip.address for ip in ip_addresses]
+            
+            debug_logger.info(f"  Found {len(found_ips)} IPs: {found_ips}")
+            vrf_ips.extend(found_ips)
         
-        logger.debug(f"Found {len(vrf_ips)} IP addresses in VRF {vrf_id} via {len(prefix_ids)} prefixes")
+        debug_logger.info(f"TOTAL IPs in VRF {vrf_name}: {len(vrf_ips)}")
+        debug_logger.info(f"=== END VRF {vrf_name} ===\n")
+        
         return vrf_ips
         
     except Exception as error:
-        logger.error(f"Error getting IPs for VRF {vrf_id}: {error}")
+        debug_logger.error(f"Error getting IPs for VRF {vrf_id}: {error}")
         return []
 
 
@@ -154,47 +169,55 @@ def handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
         return False
 
 
-def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, device_name):
+def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, device_name):
     """Создает IP-адрес в Nautobot с обработкой конфликтов."""
     ip_address = f"{arp_entry['address']}/32"
+    
+    # Диагностика только для конкретных проблемных IP
+    is_debug_ip = arp_entry['address'] in ['172.27.53.1', '192.168.8.20']  # Добавьте свои проблемные IP
     
     # Дополнительная проверка существования IP перед созданием
     try:
         existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_address)
         if existing_ip:
-            logger.warning(f"IP {ip_address} already exists but wasn't found in VRF check for device {device_name}")
+            logger.warning(f"IP {ip_address} already exists but wasn't found in VRF {vrf_name} check for device {device_name}")
             
-            # Подробная диагностическая информация
-            logger.debug(f"Existing IP parent: {existing_ip.parent}")
-            logger.debug(f"Existing IP parent prefix: {existing_ip.parent.prefix if existing_ip.parent else 'NO PARENT'}")
-            
-            if existing_ip.parent:
-                logger.debug(f"Existing IP parent ID: {existing_ip.parent.id}")
+            if is_debug_ip:
+                debug_logger.info(f"\n=== DEBUGGING IP {ip_address} ===")
+                debug_logger.info(f"Device: {device_name}")
+                debug_logger.info(f"VRF: {vrf_name} ({vrf_id})")
+                debug_logger.info(f"Existing IP parent: {existing_ip.parent}")
+                debug_logger.info(f"Existing IP parent prefix: {existing_ip.parent.prefix if existing_ip.parent else 'NO PARENT'}")
                 
-                # Проверяем к каким VRF привязан родительский префикс
-                parent_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(prefix=existing_ip.parent.id)
-                parent_vrfs = [f"{a.vrf.name} ({a.vrf.id})" for a in parent_assignments]
-                logger.debug(f"Parent prefix VRFs: {parent_vrfs}")
-                logger.debug(f"Looking for VRF ID: {vrf_id}")
+                if existing_ip.parent:
+                    debug_logger.info(f"Existing IP parent ID: {existing_ip.parent.id}")
+                    
+                    # Проверяем к каким VRF привязан родительский префикс
+                    parent_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(prefix=existing_ip.parent.id)
+                    parent_vrfs = [f"{a.vrf.name} ({a.vrf.id})" for a in parent_assignments]
+                    debug_logger.info(f"Parent prefix VRFs: {parent_vrfs}")
+                    
+                    # Проверяем, есть ли этот parent среди префиксов текущего VRF
+                    vrf_prefix_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(vrf=vrf_id)
+                    vrf_prefix_ids = [a.prefix.id for a in vrf_prefix_assignments]
+                    debug_logger.info(f"Current VRF prefix IDs: {vrf_prefix_ids}")
+                    debug_logger.info(f"IP parent in current VRF prefixes: {existing_ip.parent.id in vrf_prefix_ids}")
+                    
+                    # Дополнительная проверка - получаем IP через фильтр parent
+                    test_ips = nautobot_api.ipam.ip_addresses.filter(parent=existing_ip.parent.id)
+                    test_ip_addresses = [ip.address for ip in test_ips]
+                    debug_logger.info(f"IPs found by parent filter: {test_ip_addresses}")
+                    debug_logger.info(f"Our IP in parent filter results: {ip_address in test_ip_addresses}")
                 
-                # Проверяем, есть ли этот parent среди префиксов текущего VRF
-                vrf_prefix_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(vrf=vrf_id)
-                vrf_prefix_ids = [a.prefix.id for a in vrf_prefix_assignments]
-                logger.debug(f"Current VRF prefix IDs: {vrf_prefix_ids}")
-                logger.debug(f"IP parent in current VRF prefixes: {existing_ip.parent.id in vrf_prefix_ids}")
-                
-                # Дополнительная проверка - получаем IP через фильтр parent
-                test_ips = nautobot_api.ipam.ip_addresses.filter(parent=existing_ip.parent.id)
-                test_ip_addresses = [ip.address for ip in test_ips]
-                logger.debug(f"IPs found by parent filter: {test_ip_addresses}")
-                logger.debug(f"Our IP in parent filter results: {ip_address in test_ip_addresses}")
+                debug_logger.info(f"=== END DEBUG ===\n")
             
             # Пытаемся исправить VRF assignment
             handle_existing_ip_error(nautobot_api, ip_address, vrf_id)
             return
     except Exception as e:
         # IP не существует, можно создавать
-        logger.debug(f"IP {ip_address} does not exist, will create: {e}")
+        if is_debug_ip:
+            debug_logger.info(f"IP {ip_address} does not exist, will create: {e}")
         pass
     
     try:
@@ -237,7 +260,7 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
             logger.info(f"Processing VRF {vrf_name} for device {nautobot_device.name}")
             
             # Безопасно получаем IP-адреса в VRF
-            nautobot_device_arp = get_ips_in_vrf_safe(nautobot_api, vrf_id)
+            nautobot_device_arp = get_ips_in_vrf_safe(nautobot_api, vrf_id, vrf_name)
             
             # Получаем ARP-таблицу с устройства
             output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
@@ -269,7 +292,7 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
                 # Создаем IP-адрес, если его нет в VRF
                 ip_with_mask = f"{arp_entry['address']}/32"
                 if ip_with_mask not in nautobot_device_arp:
-                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, nautobot_device.name)
+                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, nautobot_device.name)
 
         net_connect.disconnect()
         logger.info(f'Completed processing device {nautobot_device.name}')
@@ -293,7 +316,7 @@ def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
             logger.info(f"Processing VRF {vrf_name} for device {nautobot_device.name}")
             
             # Безопасно получаем IP-адреса в VRF
-            nautobot_device_arp = get_ips_in_vrf_safe(nautobot_api, vrf_id)
+            nautobot_device_arp = get_ips_in_vrf_safe(nautobot_api, vrf_id, vrf_name)
 
             # Получаем ARP-таблицу с устройства
             output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
@@ -315,7 +338,7 @@ def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
                 # Создаем IP-адрес, если его нет в VRF
                 ip_with_mask = f"{arp_entry['address']}/32"
                 if ip_with_mask not in nautobot_device_arp:
-                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, nautobot_device.name)
+                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, nautobot_device.name)
 
         net_connect.disconnect()
         logger.info(f'Completed processing device {nautobot_device.name}')
@@ -343,25 +366,22 @@ def add_arp_entry_to_nautobot():
             target_devices.append(device)
 
     logger.info(f"Found {len(target_devices)} target devices")
-
-    # Уменьшаем количество потоков для уменьшения race conditions
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        for nautobot_device in target_devices:
-            if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
-                executor.submit(
-                    create_arp_nautobot_on_cisco_nxos,
-                    nautobot_device,
-                    api,
-                )
-            elif nautobot_device.platform and nautobot_device.platform.name == 'Cisco IOS':
-                executor.submit(
-                    create_arp_nautobot_on_cisco_ios,
-                    nautobot_device,
-                    api,
-                )
+    
+    # Для тестирования - только одно устройство без многопоточности
+    for nautobot_device in target_devices:
+        if nautobot_device.name != TEST_DEVICE:
+            continue
+            
+        logger.info(f"Processing test device: {nautobot_device.name}")
+        
+        if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
+            create_arp_nautobot_on_cisco_nxos(nautobot_device, api)
+        elif nautobot_device.platform and nautobot_device.platform.name == 'Cisco IOS':
+            create_arp_nautobot_on_cisco_ios(nautobot_device, api)
 
     execution_time = time.time() - start_time
     logger.info(f"Script execution completed in {execution_time:.2f} seconds")
+    debug_logger.info(f"Debug log saved to debug.log")
 
 
 if __name__ == "__main__":

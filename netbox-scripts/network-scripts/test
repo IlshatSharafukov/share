@@ -1,264 +1,448 @@
-2025-06-06 12:35:14,336 
-=== GETTING IPs FOR VRF atm (ca9e5073-3f9e-4967-ad00-0ddae6a62ac1) ===
-2025-06-06 12:35:15,354 VRF atm has 157 prefixes
-2025-06-06 12:35:15,354 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:35:15,428 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:35:15,428 Looking for VRF: ca9e5073-3f9e-4967-ad00-0ddae6a62ac1
-2025-06-06 12:35:15,429 Match found: True
-2025-06-06 12:35:52,781 TOTAL IPs in VRF atm: 1036
-2025-06-06 12:35:52,781 === END VRF atm ===
+import time
+import logging
+import concurrent.futures
+import re
+import socket
 
-2025-06-06 12:35:54,228 
-=== DEBUGGING IP 172.27.53.1/32 ===
-2025-06-06 12:35:54,228 Device: MS-EKB00-01
-2025-06-06 12:35:54,228 VRF: atm (ca9e5073-3f9e-4967-ad00-0ddae6a62ac1)
-2025-06-06 12:35:54,299 Existing IP parent: 172.27.53.0/28: Global
-2025-06-06 12:35:54,299 Existing IP parent prefix: 172.27.53.0/28
-2025-06-06 12:35:54,299 Existing IP parent ID: 40433cfa-cc98-4879-b38e-ccb1303134e6
-2025-06-06 12:35:54,446 Parent prefix VRFs: ['atm (ca9e5073-3f9e-4967-ad00-0ddae6a62ac1)']
-2025-06-06 12:35:55,003 Current VRF has 157 prefixes
-2025-06-06 12:35:55,003 IP parent in current VRF prefixes: False
-2025-06-06 12:35:55,095 IPs found by parent filter: ['172.27.53.1/32']
-2025-06-06 12:35:55,096 Our IP in parent filter results: True
-2025-06-06 12:35:55,096 === CHECKING PREFIX ASSIGNMENT STATUS ===
-2025-06-06 12:35:55,135 All assignments for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6:
-2025-06-06 12:35:55,237   VRF: atm (ca9e5073-3f9e-4967-ad00-0ddae6a62ac1)
-2025-06-06 12:35:55,237 === END DEBUG ===
+import urllib3
+import requests
+from decouple import config
+from ntc_templates.parse import parse_output
+from netmiko import ConnectHandler
+import pynautobot
 
-2025-06-06 12:35:55,443 
-=== GETTING IPs FOR VRF atmbranch (b52a36a4-d4f5-47d3-986b-5108b435d46f) ===
-2025-06-06 12:35:55,727 VRF atmbranch has 78 prefixes
-2025-06-06 12:35:55,727 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:35:55,764 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:35:55,764 Looking for VRF: b52a36a4-d4f5-47d3-986b-5108b435d46f
-2025-06-06 12:35:55,764 Match found: False
-2025-06-06 12:36:10,488 TOTAL IPs in VRF atmbranch: 236
-2025-06-06 12:36:10,489 === END VRF atmbranch ===
+# Отключаем предупреждения InsecureRequestWarning
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-2025-06-06 12:36:11,443 
-=== GETTING IPs FOR VRF dot1x (3076f895-4a74-4e94-805f-6d13063566f6) ===
-2025-06-06 12:36:11,791 VRF dot1x has 94 prefixes
-2025-06-06 12:36:11,791 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:36:11,828 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:36:11,828 Looking for VRF: 3076f895-4a74-4e94-805f-6d13063566f6
-2025-06-06 12:36:11,829 Match found: False
-2025-06-06 12:36:12,121 Prefix 2: 10.254.21.96/27 (ID: d0f11023-dcca-443d-8965-a10934c0e345)
-2025-06-06 12:36:12,121   Found 0 IPs: []
-2025-06-06 12:36:13,423 Prefix 10: 10.254.3.128/27 (ID: 3b4f72d6-4786-480e-8704-659bc2e16d7e)
-2025-06-06 12:36:13,424   Found 0 IPs: []
-2025-06-06 12:36:14,391 Prefix 16: 10.254.23.0/27 (ID: 598b4b03-10af-48e0-afd4-f230b28cf8a0)
-2025-06-06 12:36:14,391   Found 0 IPs: []
-2025-06-06 12:36:17,192 Prefix 33: 10.254.23.64/27 (ID: 1e40833d-46d4-4d7f-ac86-2e968346dad6)
-2025-06-06 12:36:17,192   Found 0 IPs: []
-2025-06-06 12:36:18,026 Prefix 38: 10.254.24.192/26 (ID: 06922e26-bd02-46cc-9567-b0a00f508b98)
-2025-06-06 12:36:18,026   Found 0 IPs: []
-2025-06-06 12:36:19,985 Prefix 50: 10.254.22.224/27 (ID: 7246cf74-80c6-49a3-81fa-ecb2022a3de0)
-2025-06-06 12:36:19,985   Found 0 IPs: []
-2025-06-06 12:36:21,961 Prefix 62: 10.254.36.16/28 (ID: 9b51a724-cc15-4daf-8daa-250a01791cbc)
-2025-06-06 12:36:21,961   Found 0 IPs: []
-2025-06-06 12:36:22,083 Prefix 63: 10.254.22.0/27 (ID: 49f6d8f2-4389-40c0-a142-29741b01c93c)
-2025-06-06 12:36:22,083   Found 0 IPs: []
-2025-06-06 12:36:27,811 TOTAL IPs in VRF dot1x: 194
-2025-06-06 12:36:27,811 === END VRF dot1x ===
+# Константы из окружения
+HPNA_LOGIN = config('HPNA_LOGIN')
+HPNA_PASSWORD = config('HPNA_PASSWORD')
+NAUTOBOT_URL = config('NAUTOBOT_URL')
+NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
 
-2025-06-06 12:36:28,831 
-=== GETTING IPs FOR VRF EQ (465223dd-fedd-404b-b514-1b330b8182fb) ===
-2025-06-06 12:36:29,498 VRF EQ has 199 prefixes
-2025-06-06 12:36:29,499 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:36:29,547 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:36:29,547 Looking for VRF: 465223dd-fedd-404b-b514-1b330b8182fb
-2025-06-06 12:36:29,547 Match found: False
-2025-06-06 12:36:30,035 Prefix 3: 172.26.10.164/30 (ID: c76c6826-1ab4-4e84-a595-823f40a198ce)
-2025-06-06 12:36:30,035   Found 0 IPs: []
-2025-06-06 12:36:30,168 Prefix 4: 172.26.20.104/29 (ID: 17592266-91ce-4e4a-b219-2b448bd0cb17)
-2025-06-06 12:36:30,168   Found 0 IPs: []
-2025-06-06 12:36:30,936 Prefix 9: 172.26.5.0/29 (ID: 7d3821bc-d906-4677-acb0-734bad9db412)
-2025-06-06 12:36:30,936   Found 0 IPs: []
-2025-06-06 12:36:31,242 Prefix 11: 172.16.10.224/28 (ID: 9eecd60f-0836-4f4d-8c79-a137cf554d22)
-2025-06-06 12:36:31,243   Found 0 IPs: []
-2025-06-06 12:36:31,897 Prefix 15: 172.26.1.40/29 (ID: ff250d25-8a01-468e-a4dc-d5bcd21533c8)
-2025-06-06 12:36:31,897   Found 0 IPs: []
-2025-06-06 12:36:32,926 Prefix 19: 172.26.13.148/30 (ID: 9fc91f07-f1d1-4384-977e-4bc0387e0bfe)
-2025-06-06 12:36:32,926   Found 0 IPs: []
-2025-06-06 12:36:35,083 Prefix 32: 172.26.22.128/29 (ID: 6a85b7c5-3404-4505-afc5-fffe8a41c5f9)
-2025-06-06 12:36:35,084   Found 0 IPs: []
-2025-06-06 12:36:36,600 Prefix 41: 172.26.12.136/29 (ID: 6427be05-4e42-4599-a7f5-a400a9815a5b)
-2025-06-06 12:36:36,600   Found 0 IPs: []
-2025-06-06 12:36:37,537 Prefix 47: 172.26.1.184/29 (ID: 2a1a2edb-37f5-4622-8a07-7c0cd2b24f12)
-2025-06-06 12:36:37,537   Found 0 IPs: []
-2025-06-06 12:36:39,434 Prefix 55: 172.26.13.144/30 (ID: 4ca1a2e1-08c0-4a00-8539-ad3325131221)
-2025-06-06 12:36:39,435   Found 0 IPs: []
-2025-06-06 12:36:40,059 Prefix 59: 172.26.20.112/29 (ID: bd1f5421-3e46-453f-b3d3-5c6131c49335)
-2025-06-06 12:36:40,059   Found 0 IPs: []
-2025-06-06 12:36:40,673 Prefix 63: 172.26.13.152/29 (ID: 729aa1f6-74bf-4fb5-9d9d-da3cd85cc5a2)
-2025-06-06 12:36:40,673   Found 0 IPs: []
-2025-06-06 12:36:41,434 Prefix 68: 172.26.16.72/29 (ID: e1bb51df-bed5-4578-893f-67bf4aa3cccd)
-2025-06-06 12:36:41,435   Found 0 IPs: []
-2025-06-06 12:36:44,762 Prefix 85: 172.26.18.32/29 (ID: cb64ee5e-111a-4b20-936d-89e70c872261)
-2025-06-06 12:36:44,762   Found 0 IPs: []
-2025-06-06 12:36:46,065 Prefix 93: 172.26.10.160/30 (ID: 9ff951ac-0dcc-40d1-b849-6dbc58790809)
-2025-06-06 12:36:46,066   Found 0 IPs: []
-2025-06-06 12:36:47,171 Prefix 100: 172.26.16.88/29 (ID: 4ac91d23-5929-4ecc-a020-b1c86e405e07)
-2025-06-06 12:36:47,171   Found 0 IPs: []
-2025-06-06 12:36:47,642 Prefix 103: 172.26.13.184/29 (ID: 2f136d32-2b43-49f1-b060-3b28e9534ca3)
-2025-06-06 12:36:47,643   Found 0 IPs: []
-2025-06-06 12:36:48,592 Prefix 109: 172.26.1.40/29 (ID: ff250d25-8a01-468e-a4dc-d5bcd21533c8)
-2025-06-06 12:36:48,592   Found 0 IPs: []
-2025-06-06 12:36:48,892 Prefix 111: 172.26.7.216/29 (ID: 2040264f-edce-43f7-8cc8-f6544374ccb6)
-2025-06-06 12:36:48,892   Found 0 IPs: []
-2025-06-06 12:36:49,008 Prefix 112: 172.26.4.48/30 (ID: dcad4fbd-7378-45c7-89ce-f40b996d80a9)
-2025-06-06 12:36:49,009   Found 0 IPs: []
-2025-06-06 12:36:51,595 Prefix 128: 172.26.8.128/28 (ID: 1cc557df-ab15-4bcc-8f69-9945ee6d2b76)
-2025-06-06 12:36:51,595   Found 0 IPs: []
-2025-06-06 12:36:51,710 Prefix 129: 172.26.10.164/30 (ID: c76c6826-1ab4-4e84-a595-823f40a198ce)
-2025-06-06 12:36:51,710   Found 0 IPs: []
-2025-06-06 12:36:52,152 Prefix 132: 172.26.22.128/29 (ID: 6a85b7c5-3404-4505-afc5-fffe8a41c5f9)
-2025-06-06 12:36:52,152   Found 0 IPs: []
-2025-06-06 12:36:56,259 Prefix 152: 172.26.12.32/29 (ID: 1c0bb18a-3d4f-4b7b-9f5c-5d71e8467874)
-2025-06-06 12:36:56,260   Found 0 IPs: []
-2025-06-06 12:36:57,483 Prefix 159: 172.16.10.224/28 (ID: 9eecd60f-0836-4f4d-8c79-a137cf554d22)
-2025-06-06 12:36:57,484   Found 0 IPs: []
-2025-06-06 12:36:57,604 Prefix 160: 172.26.13.8/29 (ID: 7906fb6c-c3cd-44e4-b947-4a04a6d26f83)
-2025-06-06 12:36:57,604   Found 0 IPs: []
-2025-06-06 12:36:58,042 Prefix 163: 172.26.22.248/29 (ID: 862d497b-eee2-4568-8afe-1679fb2b081e)
-2025-06-06 12:36:58,042   Found 0 IPs: []
-2025-06-06 12:37:02,390 Prefix 186: 172.26.12.136/29 (ID: 6427be05-4e42-4599-a7f5-a400a9815a5b)
-2025-06-06 12:37:02,390   Found 0 IPs: []
-2025-06-06 12:37:03,681 Prefix 191: 172.26.1.176/30 (ID: 9ab2a554-a993-4ae9-b414-413aec43cdd6)
-2025-06-06 12:37:03,681   Found 0 IPs: []
-2025-06-06 12:37:04,628 Prefix 197: 172.26.20.120/29 (ID: 4300c58d-666b-47b8-8000-fb37ec6c8ef3)
-2025-06-06 12:37:04,628   Found 0 IPs: []
-2025-06-06 12:37:05,162 TOTAL IPs in VRF EQ: 772
-2025-06-06 12:37:05,162 === END VRF EQ ===
+# Для тестирования - укажите проблемное устройство
+TEST_DEVICE = "MS-EKB00-01"  # Замените на ваше устройство
 
-2025-06-06 12:37:06,104 
-=== GETTING IPs FOR VRF ITDev (36e70a7f-c15f-4342-aabc-6d8d95907b29) ===
-2025-06-06 12:37:06,182 VRF ITDev has 10 prefixes
-2025-06-06 12:37:06,182 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:37:06,239 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:37:06,239 Looking for VRF: 36e70a7f-c15f-4342-aabc-6d8d95907b29
-2025-06-06 12:37:06,239 Match found: False
-2025-06-06 12:37:07,957 TOTAL IPs in VRF ITDev: 63
-2025-06-06 12:37:07,957 === END VRF ITDev ===
+# Основной логгер
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-2025-06-06 12:37:08,924 
-=== GETTING IPs FOR VRF ithd (325d7c86-210f-4292-804d-5c126dd4f782) ===
-2025-06-06 12:37:08,974 VRF ithd has 6 prefixes
-2025-06-06 12:37:08,974 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:37:09,010 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:37:09,010 Looking for VRF: 325d7c86-210f-4292-804d-5c126dd4f782
-2025-06-06 12:37:09,010 Match found: False
-2025-06-06 12:37:10,052 TOTAL IPs in VRF ithd: 55
-2025-06-06 12:37:10,053 === END VRF ithd ===
+# Отдельный debug logger для диагностики
+debug_logger = logging.getLogger('debug')
+debug_handler = logging.FileHandler('debug.log')
+debug_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+debug_logger.addHandler(debug_handler)
+debug_logger.setLevel(logging.DEBUG)
 
-2025-06-06 12:37:11,001 
-=== GETTING IPs FOR VRF MDREGTRM (eb97f536-91dd-4dc7-97bf-4d254bef81ca) ===
-2025-06-06 12:37:11,045 VRF MDREGTRM has 3 prefixes
-2025-06-06 12:37:11,045 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:37:11,085 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:37:11,085 Looking for VRF: eb97f536-91dd-4dc7-97bf-4d254bef81ca
-2025-06-06 12:37:11,085 Match found: False
-2025-06-06 12:37:11,570 TOTAL IPs in VRF MDREGTRM: 5
-2025-06-06 12:37:11,570 === END VRF MDREGTRM ===
 
-2025-06-06 12:37:12,526 
-=== GETTING IPs FOR VRF rbru-desktop (388fc97e-f1df-4014-a74d-b7170b0ca5aa) ===
-2025-06-06 12:37:12,651 VRF rbru-desktop has 31 prefixes
-2025-06-06 12:37:12,651 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:37:12,688 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:37:12,688 Looking for VRF: 388fc97e-f1df-4014-a74d-b7170b0ca5aa
-2025-06-06 12:37:12,688 Match found: False
-2025-06-06 12:37:19,011 TOTAL IPs in VRF rbru-desktop: 344
-2025-06-06 12:37:19,011 === END VRF rbru-desktop ===
+def netmiko_connect(nautobot_device, device_type):
+    """Создает подключение к сетевому устройству через Netmiko."""
+    netmiko_device = {
+        'device_type': device_type,
+        'host': str(nautobot_device.primary_ip4)[:-3:],
+        'username': config('HPNA_LOGIN'),
+        'password': config('HPNA_PASSWORD'),
+        'timeout': 200,
+        'port': 22,
+        "global_delay_factor": 2,
+        'conn_timeout': 200
+    }
 
-2025-06-06 12:37:19,983 
-=== GETTING IPs FOR VRF rbru-mgmt (1a5a4461-24df-49bf-88bb-cf7278404673) ===
-2025-06-06 12:37:20,344 VRF rbru-mgmt has 97 prefixes
-2025-06-06 12:37:20,344 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:37:20,375 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:37:20,375 Looking for VRF: 1a5a4461-24df-49bf-88bb-cf7278404673
-2025-06-06 12:37:20,375 Match found: False
-2025-06-06 12:37:38,767 TOTAL IPs in VRF rbru-mgmt: 617
-2025-06-06 12:37:38,767 === END VRF rbru-mgmt ===
+    try:
+        net_connect = ConnectHandler(**netmiko_device)
+    except Exception as error:
+        try:
+            net_connect = ConnectHandler(**netmiko_device)
+        except Exception as error:
+            logger.error(f"Connection error {nautobot_device}")
+            return None
 
-2025-06-06 12:37:39,730 
-=== GETTING IPs FOR VRF rbru-p (93840237-6985-4b10-9ca9-01d113f021d8) ===
-2025-06-06 12:37:40,075 VRF rbru-p has 89 prefixes
-2025-06-06 12:37:40,075 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:37:40,113 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:37:40,114 Looking for VRF: 93840237-6985-4b10-9ca9-01d113f021d8
-2025-06-06 12:37:40,114 Match found: False
-2025-06-06 12:37:58,740 TOTAL IPs in VRF rbru-p: 1497
-2025-06-06 12:37:58,741 === END VRF rbru-p ===
+    return net_connect
 
-2025-06-06 12:37:59,777 
-=== GETTING IPs FOR VRF rbru-voip (f3a342df-bd19-471a-956f-c158204191c6) ===
-2025-06-06 12:38:00,457 VRF rbru-voip has 234 prefixes
-2025-06-06 12:38:00,457 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:38:00,493 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:38:00,493 Looking for VRF: f3a342df-bd19-471a-956f-c158204191c6
-2025-06-06 12:38:00,493 Match found: False
-2025-06-06 12:39:00,822 TOTAL IPs in VRF rbru-voip: 7674
-2025-06-06 12:39:00,822 === END VRF rbru-voip ===
 
-2025-06-06 12:39:12,792 
-=== GETTING IPs FOR VRF rbru-wifi (c0a8fd8f-9828-4cf3-ac92-5fd857b10a51) ===
-2025-06-06 12:39:12,911 VRF rbru-wifi has 31 prefixes
-2025-06-06 12:39:12,911 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:39:12,945 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:39:12,945 Looking for VRF: c0a8fd8f-9828-4cf3-ac92-5fd857b10a51
-2025-06-06 12:39:12,945 Match found: False
-2025-06-06 12:39:19,351 TOTAL IPs in VRF rbru-wifi: 764
-2025-06-06 12:39:19,353 === END VRF rbru-wifi ===
+def nautobot_connection():
+    """Возвращает клиент pynautobot с увеличенным пулом соединений."""
+    api = pynautobot.api(
+        NAUTOBOT_URL,
+        token=NAUTOBOT_TOKEN,
+        verify=False,
+    )
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=1000,
+        pool_maxsize=1000
+    )
+    api.http_session.mount('http://', adapter)
+    api.http_session.mount('https://', adapter)
+    api.http_session.verify = False
+    return api
 
-2025-06-06 12:39:20,317 
-=== GETTING IPs FOR VRF rbru-wyse (739f1c5c-e9b0-40a7-8c3f-b8278a7540e8) ===
-2025-06-06 12:39:21,293 VRF rbru-wyse has 225 prefixes
-2025-06-06 12:39:21,294 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:39:21,349 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:39:21,349 Looking for VRF: 739f1c5c-e9b0-40a7-8c3f-b8278a7540e8
-2025-06-06 12:39:21,350 Match found: False
-2025-06-06 12:40:17,662 TOTAL IPs in VRF rbru-wyse: 6949
-2025-06-06 12:40:17,662 === END VRF rbru-wyse ===
 
-2025-06-06 12:40:18,804 
-=== GETTING IPs FOR VRF RUAHQUARANTINE (25cda047-3530-49c7-afc0-99e4fa20ec2e) ===
-2025-06-06 12:40:19,094 VRF RUAHQUARANTINE has 77 prefixes
-2025-06-06 12:40:19,095 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:40:19,133 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:40:19,133 Looking for VRF: 25cda047-3530-49c7-afc0-99e4fa20ec2e
-2025-06-06 12:40:19,133 Match found: False
-2025-06-06 12:40:32,960 TOTAL IPs in VRF RUAHQUARANTINE: 90
-2025-06-06 12:40:32,961 === END VRF RUAHQUARANTINE ===
+def format_mac_address(mac_address):
+    """Преобразует MAC-адрес в формат aa-bb-cc-dd-ee-ff."""
+    mac_parts = mac_address.split('.')
+    mac_joined = ''.join(mac_parts)
+    blocks = [mac_joined[x:x + 2] for x in range(0, len(mac_joined), 2)]
+    return '-'.join(blocks)
 
-2025-06-06 12:40:33,952 
-=== GETTING IPs FOR VRF RUAHUSR (82c54585-8f67-41e5-8fc1-3461c1b56b6b) ===
-2025-06-06 12:40:34,119 VRF RUAHUSR has 39 prefixes
-2025-06-06 12:40:34,119 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:40:34,166 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:40:34,166 Looking for VRF: 82c54585-8f67-41e5-8fc1-3461c1b56b6b
-2025-06-06 12:40:34,166 Match found: False
-2025-06-06 12:40:50,754 TOTAL IPs in VRF RUAHUSR: 4454
-2025-06-06 12:40:50,754 === END VRF RUAHUSR ===
 
-2025-06-06 12:40:51,713 
-=== GETTING IPs FOR VRF SECPHY (7a51dc34-a43f-4263-ad0f-f49b4a923305) ===
-2025-06-06 12:40:52,009 VRF SECPHY has 82 prefixes
-2025-06-06 12:40:52,009 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:40:52,035 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:40:52,035 Looking for VRF: 7a51dc34-a43f-4263-ad0f-f49b4a923305
-2025-06-06 12:40:52,035 Match found: False
-2025-06-06 12:41:06,185 TOTAL IPs in VRF SECPHY: 150
-2025-06-06 12:41:06,185 === END VRF SECPHY ===
+def get_dns_name(ip_address):
+    """Получает DNS имя для IP-адреса."""
+    try:
+        dns_name, alias, address_list = socket.gethostbyaddr(ip_address)
+        return re.sub(r'[#*\s\[\]\"]', '', dns_name)
+    except Exception:
+        return ''
 
-2025-06-06 12:41:07,143 
-=== GETTING IPs FOR VRF vtrec (2230daf4-8feb-4721-82f4-536917c3d091) ===
-2025-06-06 12:41:07,846 VRF vtrec has 206 prefixes
-2025-06-06 12:41:07,846 MISSING PREFIX! 40433cfa-cc98-4879-b38e-ccb1303134e6 not found in VRF assignments
-2025-06-06 12:41:07,881 Direct check for prefix 40433cfa-cc98-4879-b38e-ccb1303134e6: VRFs = ['ca9e5073-3f9e-4967-ad00-0ddae6a62ac1']
-2025-06-06 12:41:07,882 Looking for VRF: 2230daf4-8feb-4721-82f4-536917c3d091
-2025-06-06 12:41:07,882 Match found: False
-2025-06-06 12:41:48,232 TOTAL IPs in VRF vtrec: 1930
-2025-06-06 12:41:48,232 === END VRF vtrec ===
 
-2025-06-06 12:41:49,261 Debug log saved to debug.log
+def get_ips_in_vrf_safe(nautobot_api, vrf_id, vrf_name):
+    """
+    Получает IP-адреса в VRF через префиксы с альтернативным подходом из-за бага API.
+    Обходит проблему с filter(vrf=vrf_id) используя all() и ручную фильтрацию.
+    """
+    try:
+        debug_logger.info(f"\n=== GETTING IPs FOR VRF {vrf_name} ({vrf_id}) ===")
+        
+        # ОБХОДНОЕ РЕШЕНИЕ: получаем ВСЕ assignments и фильтруем вручную
+        debug_logger.info("Using alternative approach due to API filter bug")
+        all_assignments = nautobot_api.ipam.vrf_prefix_assignments.all()
+        vrf_assignments = [a for a in all_assignments if a.vrf.id == vrf_id]
+        prefix_ids = [a.prefix.id for a in vrf_assignments]
+        
+        debug_logger.info(f"Alternative method found {len(prefix_ids)} prefixes for VRF {vrf_name}")
+        
+        # Сравнение с оригинальным методом для диагностики
+        try:
+            original_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(vrf=vrf_id)
+            original_prefix_ids = [a.prefix.id for a in original_assignments]
+            debug_logger.info(f"Original filter method found {len(original_prefix_ids)} prefixes")
+            
+            # Находим различия
+            missing_in_filter = set(prefix_ids) - set(original_prefix_ids)
+            if missing_in_filter:
+                debug_logger.error(f"BUG CONFIRMED: {len(missing_in_filter)} prefixes missing in filter method:")
+                for missing_id in missing_in_filter:
+                    try:
+                        prefix_obj = nautobot_api.ipam.prefixes.get(missing_id)
+                        debug_logger.error(f"  Missing prefix: {prefix_obj.prefix} (ID: {missing_id})")
+                    except:
+                        debug_logger.error(f"  Missing prefix ID: {missing_id}")
+            else:
+                debug_logger.info("No differences between alternative and filter methods")
+                
+        except Exception as compare_error:
+            debug_logger.error(f"Error comparing methods: {compare_error}")
+        
+        # Проверяем конкретный проблемный префикс
+        missing_prefix_id = "40433cfa-cc98-4879-b38e-ccb1303134e6"
+        if missing_prefix_id in prefix_ids:
+            debug_logger.info(f"SUCCESS: Prefix {missing_prefix_id} FOUND with alternative method")
+        else:
+            debug_logger.error(f"STILL MISSING: Prefix {missing_prefix_id} not found even with alternative method")
+        
+        vrf_ips = []
+        error_count = 0
+        processed_count = 0
+        
+        for i, prefix_id in enumerate(prefix_ids):
+            try:
+                prefix_obj = nautobot_api.ipam.prefixes.get(prefix_id)
+                ip_addresses = nautobot_api.ipam.ip_addresses.filter(parent=prefix_id)
+                found_ips = [ip.address for ip in ip_addresses]
+                
+                # Логируем только если есть проблемы или это проблемный префикс
+                if prefix_id == missing_prefix_id or len(found_ips) == 0:
+                    debug_logger.info(f"Prefix {i+1}: {prefix_obj.prefix} (ID: {prefix_id})")
+                    debug_logger.info(f"  Found {len(found_ips)} IPs: {found_ips}")
+                
+                vrf_ips.extend(found_ips)
+                processed_count += 1
+                
+            except Exception as prefix_error:
+                error_count += 1
+                debug_logger.error(f"Error processing prefix {prefix_id}: {prefix_error}")
+        
+        if error_count > 0:
+            debug_logger.error(f"VRF {vrf_name}: {error_count} prefix errors out of {len(prefix_ids)}")
+        
+        debug_logger.info(f"Processed {processed_count}/{len(prefix_ids)} prefixes successfully")
+        debug_logger.info(f"TOTAL IPs in VRF {vrf_name}: {len(vrf_ips)}")
+        debug_logger.info(f"=== END VRF {vrf_name} ===\n")
+        
+        return vrf_ips
+        
+    except Exception as error:
+        debug_logger.error(f"Error getting IPs for VRF {vrf_id}: {error}")
+        return []
+
+
+def handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
+    """
+    Обрабатывает ошибку существующего IP-адреса.
+    Добавляет VRF к префиксу, если его там нет.
+    """
+    try:
+        # Находим существующий IP-адрес
+        existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_address)
+        if not existing_ip:
+            logger.error(f"Cannot find existing IP {ip_address}")
+            return False
+            
+        if not existing_ip.parent:
+            logger.error(f"IP {ip_address} has no parent prefix")
+            return False
+            
+        prefix_id = existing_ip.parent.id
+        
+        # Проверяем, есть ли уже нужный VRF у префикса
+        existing_vrf_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(prefix=prefix_id)
+        existing_vrf_ids = [assignment.vrf.id for assignment in existing_vrf_assignments]
+        
+        if vrf_id not in existing_vrf_ids:
+            # Добавляем VRF к префиксу
+            nautobot_api.ipam.vrf_prefix_assignments.create(
+                prefix=prefix_id,
+                vrf=vrf_id
+            )
+            logger.info(f"Added VRF {vrf_id} to prefix {existing_ip.parent.prefix}")
+        else:
+            logger.info(f"VRF {vrf_id} already assigned to prefix {existing_ip.parent.prefix}")
+        
+        return True
+        
+    except Exception as error:
+        logger.error(f"Error handling existing IP {ip_address}: {error}")
+        return False
+
+
+def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, device_name):
+    """Создает IP-адрес в Nautobot с обработкой конфликтов."""
+    ip_address = f"{arp_entry['address']}/32"
+    
+    # Диагностика только для конкретных проблемных IP
+    is_debug_ip = arp_entry['address'] in ['172.27.53.1', '192.168.8.20']  # Добавьте свои проблемные IP
+    
+    # Дополнительная проверка существования IP перед созданием
+    try:
+        existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_address)
+        if existing_ip:
+            logger.warning(f"IP {ip_address} already exists but wasn't found in VRF {vrf_name} check for device {device_name}")
+            
+            if is_debug_ip:
+                debug_logger.info(f"\n=== DEBUGGING IP {ip_address} ===")
+                debug_logger.info(f"Device: {device_name}")
+                debug_logger.info(f"VRF: {vrf_name} ({vrf_id})")
+                debug_logger.info(f"Existing IP parent: {existing_ip.parent}")
+                debug_logger.info(f"Existing IP parent prefix: {existing_ip.parent.prefix if existing_ip.parent else 'NO PARENT'}")
+                
+                if existing_ip.parent:
+                    debug_logger.info(f"Existing IP parent ID: {existing_ip.parent.id}")
+                    
+                    # Проверяем к каким VRF привязан родительский префикс
+                    parent_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(prefix=existing_ip.parent.id)
+                    parent_vrfs = [f"{a.vrf.name} ({a.vrf.id})" for a in parent_assignments]
+                    debug_logger.info(f"Parent prefix VRFs: {parent_vrfs}")
+                    
+                    # Проверяем, есть ли этот parent среди префиксов текущего VRF
+                    vrf_prefix_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(vrf=vrf_id)
+                    vrf_prefix_ids = [a.prefix.id for a in vrf_prefix_assignments]
+                    debug_logger.info(f"Current VRF has {len(vrf_prefix_ids)} prefixes")
+                    debug_logger.info(f"IP parent in current VRF prefixes: {existing_ip.parent.id in vrf_prefix_ids}")
+                    
+                    # Дополнительная проверка - получаем IP через фильтр parent
+                    test_ips = nautobot_api.ipam.ip_addresses.filter(parent=existing_ip.parent.id)
+                    test_ip_addresses = [ip.address for ip in test_ips]
+                    debug_logger.info(f"IPs found by parent filter: {test_ip_addresses}")
+                    debug_logger.info(f"Our IP in parent filter results: {ip_address in test_ip_addresses}")
+                    
+                    # Проверяем статус prefix assignment
+                    debug_logger.info(f"=== CHECKING PREFIX ASSIGNMENT STATUS ===")
+                    try:
+                        all_assignments_for_prefix = nautobot_api.ipam.vrf_prefix_assignments.filter(prefix=existing_ip.parent.id)
+                        debug_logger.info(f"All assignments for prefix {existing_ip.parent.id}:")
+                        for assignment in all_assignments_for_prefix:
+                            debug_logger.info(f"  VRF: {assignment.vrf.name} ({assignment.vrf.id})")
+                    except Exception as e:
+                        debug_logger.error(f"Error checking prefix assignments: {e}")
+                
+                debug_logger.info(f"=== END DEBUG ===\n")
+            
+            # Пытаемся исправить VRF assignment
+            handle_existing_ip_error(nautobot_api, ip_address, vrf_id)
+            return
+    except Exception as e:
+        # IP не существует, можно создавать
+        if is_debug_ip:
+            debug_logger.info(f"IP {ip_address} does not exist, will create: {e}")
+        pass
+    
+    try:
+        nautobot_api.ipam.ip_addresses.create([{
+            "address": ip_address,
+            "custom_fields": {
+                "mac_address": arp_entry['mac']
+            },
+            "dns_name": dns_name,
+            "status": "Active",
+            "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
+        }])
+        # Логируем только если это debug IP
+        if is_debug_ip:
+            logger.info(f"Created IP address {ip_address} for device {device_name}")
+        
+    except Exception as error:
+        logger.warning(f"Failed to create IP {ip_address} for device {device_name}: {error}")
+        
+        # Пытаемся обработать конфликт VRF
+        if "already exists" in str(error).lower():
+            if handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
+                logger.info(f"VRF conflict resolved for IP {ip_address}, device {device_name}")
+            else:
+                logger.error(f"Could not resolve VRF conflict for IP {ip_address}, device {device_name}")
+        else:
+            logger.error(f"Unexpected error creating IP {ip_address} for device {device_name}: {error}")
+
+
+def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
+    """Обрабатывает ARP записи для устройств Cisco IOS."""
+    net_connect = netmiko_connect(nautobot_device, 'cisco_ios')
+
+    if not net_connect:
+        return
+
+    try:
+        device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
+        existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
+
+        for vrf_name, vrf_id in existing_vrf_in_device.items():
+            logger.info(f"Processing VRF {vrf_name} for device {nautobot_device.name}")
+            
+            # Безопасно получаем IP-адреса в VRF
+            nautobot_device_arp = get_ips_in_vrf_safe(nautobot_api, vrf_id, vrf_name)
+            
+            # Получаем ARP-таблицу с устройства
+            output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
+            device_arp = parse_output(platform='cisco_ios', command='show ip arp', data=output)
+
+            # Форматируем MAC-адреса
+            for arp_entry in device_arp:
+                arp_entry['mac'] = format_mac_address(arp_entry['mac'])
+
+            # Обрабатываем каждую ARP запись
+            for arp_entry in device_arp:
+                skip_list = [
+                    '192.168.0.0', '192.168.0.1', '192.168.0.2',
+                    '192.168.0.3', '192.168.0.4', '192.168.0.5',
+                    '192.168.0.6'
+                ]
+
+                # Пропускаем служебные IP-адреса
+                if any(sub in arp_entry['address'] for sub in skip_list):
+                    continue
+
+                # Пропускаем неполные MAC-адреса
+                if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
+                    continue
+
+                # Получаем DNS имя
+                dns_name = get_dns_name(arp_entry['address'])
+
+                # Создаем IP-адрес, если его нет в VRF
+                ip_with_mask = f"{arp_entry['address']}/32"
+                if ip_with_mask not in nautobot_device_arp:
+                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, nautobot_device.name)
+
+        net_connect.disconnect()
+        logger.info(f'Completed processing device {nautobot_device.name}')
+        
+    except Exception as error:
+        logger.error(f'Error processing device {nautobot_device.name}: {error}')
+
+
+def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
+    """Обрабатывает ARP записи для устройств Cisco NXOS."""
+    net_connect = netmiko_connect(nautobot_device, 'cisco_nxos')
+
+    if not net_connect:
+        return
+
+    try:
+        device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
+        existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
+
+        for vrf_name, vrf_id in existing_vrf_in_device.items():
+            logger.info(f"Processing VRF {vrf_name} for device {nautobot_device.name}")
+            
+            # Безопасно получаем IP-адреса в VRF
+            nautobot_device_arp = get_ips_in_vrf_safe(nautobot_api, vrf_id, vrf_name)
+
+            # Получаем ARP-таблицу с устройства
+            output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
+            device_arp = parse_output(platform='cisco_nxos', command='show ip arp', data=output)
+
+            # Форматируем MAC-адреса
+            for arp_entry in device_arp:
+                arp_entry['mac'] = format_mac_address(arp_entry['mac'])
+
+            # Обрабатываем каждую ARP запись
+            for arp_entry in device_arp:
+                # Пропускаем неполные MAC-адреса
+                if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
+                    continue
+
+                # Получаем DNS имя
+                dns_name = get_dns_name(arp_entry['address'])
+
+                # Создаем IP-адрес, если его нет в VRF
+                ip_with_mask = f"{arp_entry['address']}/32"
+                if ip_with_mask not in nautobot_device_arp:
+                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, nautobot_device.name)
+
+        net_connect.disconnect()
+        logger.info(f'Completed processing device {nautobot_device.name}')
+        
+    except Exception as error:
+        logger.error(f'Error processing device {nautobot_device.name}: {error}')
+
+
+def add_arp_entry_to_nautobot():
+    """Основная функция для добавления ARP записей в Nautobot."""
+    start_time = time.time()
+    api = nautobot_connection()
+
+    # Строим мапу тегов
+    all_tags = list(api.extras.tags.all())
+    tag_map = {tag.id: tag.name for tag in all_tags}
+
+    # Фильтруем нужные устройства
+    devices = list(api.dcim.devices.all())
+    target_devices = []
+    
+    for device in devices:
+        tag_names = [tag_map.get(tag.id) for tag in (device.tags or [])]
+        if 'raif_scripts' in tag_names:
+            target_devices.append(device)
+
+    logger.info(f"Found {len(target_devices)} target devices")
+    
+    # Для тестирования - только одно устройство без многопоточности
+    for nautobot_device in target_devices:
+        if nautobot_device.name != TEST_DEVICE:
+            continue
+            
+        logger.info(f"Processing test device: {nautobot_device.name}")
+        
+        if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
+            create_arp_nautobot_on_cisco_nxos(nautobot_device, api)
+        elif nautobot_device.platform and nautobot_device.platform.name == 'Cisco IOS':
+            create_arp_nautobot_on_cisco_ios(nautobot_device, api)
+
+    execution_time = time.time() - start_time
+    logger.info(f"Script execution completed in {execution_time:.2f} seconds")
+    debug_logger.info(f"Debug log saved to debug.log")
+
+
+if __name__ == "__main__":
+    add_arp_entry_to_nautobot()

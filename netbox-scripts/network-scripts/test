@@ -1,342 +1,431 @@
-import time
-import logging
-import concurrent.futures
-import re
-import socket
+2025-06-06 12:46:36,343 
+=== GETTING IPs FOR VRF atm (ca9e5073-3f9e-4967-ad00-0ddae6a62ac1) ===
+2025-06-06 12:46:36,344 Using alternative approach due to API filter bug
+2025-06-06 12:47:00,791 Alternative method found 166 prefixes for VRF atm
+2025-06-06 12:47:01,310 Original filter method found 157 prefixes
+2025-06-06 12:47:01,311 BUG CONFIRMED: 28 prefixes missing in filter method:
+2025-06-06 12:47:01,421   Missing prefix: 172.27.208.64/28 (ID: d5c1b36e-b795-46d0-a3c2-1e020fe5d031)
+2025-06-06 12:47:01,506   Missing prefix: 172.27.10.112/28 (ID: 35df8a0e-0984-4424-bef1-a584dbbcabae)
+2025-06-06 12:47:01,582   Missing prefix: 172.27.56.0/28 (ID: f03ab91f-9177-43c2-af60-4274f93de51f)
+2025-06-06 12:47:01,654   Missing prefix: 172.27.217.160/28 (ID: abad984f-bc73-4956-ac64-161c9b26564e)
+2025-06-06 12:47:01,732   Missing prefix: 172.27.57.0/28 (ID: 74d4d046-b92a-4217-9849-82526360e4d0)
+2025-06-06 12:47:01,808   Missing prefix: 172.27.121.0/28 (ID: 9c23983a-a733-4ede-a614-cdd304633b06)
+2025-06-06 12:47:01,884   Missing prefix: 172.27.152.128/28 (ID: 669ec5be-536f-4877-83f7-711f2db523b0)
+2025-06-06 12:47:01,955   Missing prefix: 10.66.0.48/28 (ID: 005c0cce-c4f9-4c67-a5ef-6d148412b613)
+2025-06-06 12:47:02,033   Missing prefix: 10.10.0.0/28 (ID: 044dae09-3fa2-42c3-99e3-4d6f98c03332)
+2025-06-06 12:47:02,105   Missing prefix: 10.78.0.176/28 (ID: 214cc08b-7daf-4a96-80c2-eb7308b71d48)
+2025-06-06 12:47:02,178   Missing prefix: 10.39.0.16/28 (ID: 3c2c009c-6892-45b2-b94e-4bdedba68f44)
+2025-06-06 12:47:02,253   Missing prefix: 172.27.54.0/28 (ID: 57ef8571-7a1b-450b-ac15-3269d3234b5a)
+2025-06-06 12:47:02,331   Missing prefix: 172.27.148.0/28 (ID: f206579a-f524-40a2-b865-0f0d9fe90111)
+2025-06-06 12:47:02,405   Missing prefix: 10.77.7.64/28 (ID: 2aa4f033-247c-4383-a539-34388a5e535b)
+2025-06-06 12:47:02,521   Missing prefix: 172.27.53.0/28 (ID: 40433cfa-cc98-4879-b38e-ccb1303134e6)
+2025-06-06 12:47:02,581   Missing prefix: 172.27.5.144/28 (ID: 9ad775d4-6ccf-4c53-ab8a-e63ba5be63f6)
+2025-06-06 12:47:02,673   Missing prefix: 10.77.1.208/28 (ID: 130e54b4-b36a-4d2b-9a70-0aa35e03e0d9)
+2025-06-06 12:47:02,754   Missing prefix: 172.27.7.0/28 (ID: 3725ebe5-6d20-4a67-9f04-6ff73d67522f)
+2025-06-06 12:47:02,830   Missing prefix: 172.27.204.128/28 (ID: 50c8d547-4ae6-49bc-b086-ae9a6cc9e1e3)
+2025-06-06 12:47:02,906   Missing prefix: 10.78.1.64/28 (ID: 2ca46e1a-a18a-417c-87ba-9480c7c3d49a)
+2025-06-06 12:47:02,987   Missing prefix: 172.27.140.0/28 (ID: 76ca9f21-dd6f-44bc-a0a9-1e4478cb25c0)
+2025-06-06 12:47:03,062   Missing prefix: 172.27.52.0/28 (ID: 4c142b27-f591-4a34-8ddf-01cea51e477b)
+2025-06-06 12:47:03,134   Missing prefix: 10.78.1.96/28 (ID: 8d44ebe9-76bd-47ac-b80e-3c0860468603)
+2025-06-06 12:47:03,217   Missing prefix: 172.27.159.64/28 (ID: 5d8b8cdf-8e7d-4268-958f-970ad3123274)
+2025-06-06 12:47:03,293   Missing prefix: 10.77.7.0/28 (ID: 31b209c6-b765-4f5a-be95-2325eb5b102c)
+2025-06-06 12:47:03,374   Missing prefix: 172.27.194.128/28 (ID: 28fb5bea-4922-43c1-a585-864c4185a6b5)
+2025-06-06 12:47:03,451   Missing prefix: 172.27.103.160/28 (ID: dd74c772-d1b4-454f-b63b-d2d01fca6c3a)
+2025-06-06 12:47:03,529   Missing prefix: 172.27.254.0/24 (ID: 8ad46907-4f64-401f-b2ba-2da8b76c252e)
+2025-06-06 12:47:03,529 SUCCESS: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 FOUND with alternative method
+2025-06-06 12:47:12,782 Prefix 51: 172.27.53.0/28 (ID: 40433cfa-cc98-4879-b38e-ccb1303134e6)
+2025-06-06 12:47:12,782   Found 1 IPs: ['172.27.53.1/32']
+2025-06-06 12:47:26,585 Prefix 118: 172.27.53.0/28 (ID: 40433cfa-cc98-4879-b38e-ccb1303134e6)
+2025-06-06 12:47:26,585   Found 1 IPs: ['172.27.53.1/32']
+2025-06-06 12:47:36,499 Processed 166/166 prefixes successfully
+2025-06-06 12:47:36,499 TOTAL IPs in VRF atm: 1407
+2025-06-06 12:47:36,499 === END VRF atm ===
 
-import urllib3
-import requests
-from decouple import config
-from ntc_templates.parse import parse_output
-from netmiko import ConnectHandler
-import pynautobot
+2025-06-06 12:47:38,171 
+=== GETTING IPs FOR VRF atmbranch (b52a36a4-d4f5-47d3-986b-5108b435d46f) ===
+2025-06-06 12:47:38,171 Using alternative approach due to API filter bug
+2025-06-06 12:47:57,965 Alternative method found 40 prefixes for VRF atmbranch
+2025-06-06 12:47:58,283 Original filter method found 78 prefixes
+2025-06-06 12:47:58,284 No differences between alternative and filter methods
+2025-06-06 12:47:58,284 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:48:05,782 Processed 40/40 prefixes successfully
+2025-06-06 12:48:05,782 TOTAL IPs in VRF atmbranch: 119
+2025-06-06 12:48:05,782 === END VRF atmbranch ===
 
-# Отключаем предупреждения InsecureRequestWarning
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+2025-06-06 12:48:07,642 
+=== GETTING IPs FOR VRF dot1x (3076f895-4a74-4e94-805f-6d13063566f6) ===
+2025-06-06 12:48:07,642 Using alternative approach due to API filter bug
+2025-06-06 12:48:26,764 Alternative method found 51 prefixes for VRF dot1x
+2025-06-06 12:48:27,104 Original filter method found 94 prefixes
+2025-06-06 12:48:27,104 No differences between alternative and filter methods
+2025-06-06 12:48:27,104 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:48:27,985 Prefix 5: 10.254.24.192/26 (ID: 06922e26-bd02-46cc-9567-b0a00f508b98)
+2025-06-06 12:48:27,985   Found 0 IPs: []
+2025-06-06 12:48:28,797 Prefix 10: 10.254.23.64/27 (ID: 1e40833d-46d4-4d7f-ac86-2e968346dad6)
+2025-06-06 12:48:28,797   Found 0 IPs: []
+2025-06-06 12:48:30,697 Prefix 21: 10.254.3.128/27 (ID: 3b4f72d6-4786-480e-8704-659bc2e16d7e)
+2025-06-06 12:48:30,698   Found 0 IPs: []
+2025-06-06 12:48:32,004 Prefix 29: 10.254.22.0/27 (ID: 49f6d8f2-4389-40c0-a142-29741b01c93c)
+2025-06-06 12:48:32,005   Found 0 IPs: []
+2025-06-06 12:48:34,148 Prefix 42: 10.254.3.128/27 (ID: 3b4f72d6-4786-480e-8704-659bc2e16d7e)
+2025-06-06 12:48:34,148   Found 0 IPs: []
+2025-06-06 12:48:34,274 Prefix 43: 10.254.24.192/26 (ID: 06922e26-bd02-46cc-9567-b0a00f508b98)
+2025-06-06 12:48:34,274   Found 0 IPs: []
+2025-06-06 12:48:35,192 Prefix 45: 10.254.22.224/27 (ID: 7246cf74-80c6-49a3-81fa-ecb2022a3de0)
+2025-06-06 12:48:35,192   Found 0 IPs: []
+2025-06-06 12:48:35,487 Prefix 47: 10.254.36.16/28 (ID: 9b51a724-cc15-4daf-8daa-250a01791cbc)
+2025-06-06 12:48:35,488   Found 0 IPs: []
+2025-06-06 12:48:35,623 Prefix 48: 10.254.23.0/27 (ID: 598b4b03-10af-48e0-afd4-f230b28cf8a0)
+2025-06-06 12:48:35,623   Found 0 IPs: []
+2025-06-06 12:48:35,757 Prefix 49: 10.254.22.0/27 (ID: 49f6d8f2-4389-40c0-a142-29741b01c93c)
+2025-06-06 12:48:35,758   Found 0 IPs: []
+2025-06-06 12:48:35,885 Prefix 50: 10.254.21.96/27 (ID: d0f11023-dcca-443d-8965-a10934c0e345)
+2025-06-06 12:48:35,885   Found 0 IPs: []
+2025-06-06 12:48:36,011 Prefix 51: 10.254.23.64/27 (ID: 1e40833d-46d4-4d7f-ac86-2e968346dad6)
+2025-06-06 12:48:36,011   Found 0 IPs: []
+2025-06-06 12:48:36,011 Processed 51/51 prefixes successfully
+2025-06-06 12:48:36,012 TOTAL IPs in VRF dot1x: 115
+2025-06-06 12:48:36,012 === END VRF dot1x ===
 
-# Константы из окружения
-HPNA_LOGIN = config('HPNA_LOGIN')
-HPNA_PASSWORD = config('HPNA_PASSWORD')
-NAUTOBOT_URL = config('NAUTOBOT_URL')
-NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
+2025-06-06 12:48:37,028 
+=== GETTING IPs FOR VRF EQ (465223dd-fedd-404b-b514-1b330b8182fb) ===
+2025-06-06 12:48:37,028 Using alternative approach due to API filter bug
+2025-06-06 12:48:55,571 Alternative method found 241 prefixes for VRF EQ
+2025-06-06 12:48:56,224 Original filter method found 199 prefixes
+2025-06-06 12:48:56,224 BUG CONFIRMED: 31 prefixes missing in filter method:
+2025-06-06 12:48:56,289   Missing prefix: 172.26.6.144/29 (ID: 8d045cc9-2a21-44d6-afbe-2c3a67a4ee51)
+2025-06-06 12:48:56,372   Missing prefix: 172.26.28.40/29 (ID: 918c348e-beac-4e77-ad0e-7431adf4a9da)
+2025-06-06 12:48:56,442   Missing prefix: 172.26.12.224/29 (ID: 7a270b9f-d783-4ec3-813b-2cd77eb151fa)
+2025-06-06 12:48:56,508   Missing prefix: 172.26.4.200/29 (ID: fff7732b-91a8-48e7-a140-7b048b600846)
+2025-06-06 12:48:56,588   Missing prefix: 172.26.20.8/29 (ID: 6575b1c1-d927-49cf-8cd5-a5fca2caa8c6)
+2025-06-06 12:48:56,660   Missing prefix: 172.26.4.72/29 (ID: 4e583715-c010-4fec-a912-961583e978b0)
+2025-06-06 12:48:56,734   Missing prefix: 172.26.2.24/29 (ID: 42bdd20d-cfde-4587-ac6c-516bae3e8995)
+2025-06-06 12:48:56,810   Missing prefix: 172.26.16.56/29 (ID: b5055124-b921-4657-9ab4-05914162ca20)
+2025-06-06 12:48:56,882   Missing prefix: 172.26.4.192/29 (ID: 2c4803b8-35bf-4c7f-bfef-da6a33e89a8f)
+2025-06-06 12:48:56,959   Missing prefix: 172.26.10.200/29 (ID: da95bec1-c1b8-4efa-b5ab-9385d785e5fa)
+2025-06-06 12:48:57,038   Missing prefix: 172.26.20.192/29 (ID: 2b3348b2-f216-4c81-a89b-42f57d3f90ad)
+2025-06-06 12:48:57,113   Missing prefix: 172.26.8.120/29 (ID: b1d9d945-ef5e-459f-bd47-c264f1949eca)
+2025-06-06 12:48:57,187   Missing prefix: 172.26.8.72/29 (ID: 973cc955-0462-4598-b855-9e5c166e4238)
+2025-06-06 12:48:57,270   Missing prefix: 172.26.10.80/29 (ID: c828bd5c-a195-499f-b39f-ec205779520f)
+2025-06-06 12:48:57,350   Missing prefix: 172.26.10.120/29 (ID: 2820ca7a-4f74-4504-b94f-ac8bad87ef4e)
+2025-06-06 12:48:57,424   Missing prefix: 172.26.21.128/29 (ID: 7c8cf337-f13b-4d01-b0bb-fb27dc468834)
+2025-06-06 12:48:57,498   Missing prefix: 172.26.19.88/29 (ID: c9ae965b-a32e-4d75-bf44-002716aba5e7)
+2025-06-06 12:48:57,578   Missing prefix: 172.26.23.216/29 (ID: b456c84d-1d66-4d00-aba1-dc17a1ad9d32)
+2025-06-06 12:48:57,654   Missing prefix: 172.26.21.144/29 (ID: c3e4293a-bfa6-49c9-8fb5-668771b4ef5f)
+2025-06-06 12:48:57,733   Missing prefix: 172.26.21.32/29 (ID: 81aebca0-3fb0-4a2a-a440-3ed8979e6c18)
+2025-06-06 12:48:57,815   Missing prefix: 172.26.2.248/29 (ID: 24f10715-7ff5-4b94-8e8c-d97cd20dd986)
+2025-06-06 12:48:57,895   Missing prefix: 172.26.29.160/27 (ID: a8238a64-4302-465e-9049-92e013aa3ae2)
+2025-06-06 12:48:57,970   Missing prefix: 172.26.15.216/29 (ID: 1ef4b1b0-caaf-4c98-967a-1a034c0d01ae)
+2025-06-06 12:48:58,044   Missing prefix: 172.26.29.192/28 (ID: 7c37366d-7ae7-4499-8f1b-4c3d40edf44f)
+2025-06-06 12:48:58,122   Missing prefix: 172.26.20.40/29 (ID: eb766721-d93e-4eff-8b3b-3f71221b6890)
+2025-06-06 12:48:58,197   Missing prefix: 172.26.22.232/29 (ID: 9c3e5e0e-3b86-4bf3-a2c0-ad69308cd55f)
+2025-06-06 12:48:58,274   Missing prefix: 172.26.10.104/29 (ID: 3495b18c-d171-476f-94bc-6beb8086a65c)
+2025-06-06 12:48:58,347   Missing prefix: 172.26.20.248/29 (ID: 0505727f-8777-4aea-99e6-9e35c71f5531)
+2025-06-06 12:48:58,423   Missing prefix: 172.26.23.208/29 (ID: 5f867fbf-292b-41fc-82e1-12692f952e8b)
+2025-06-06 12:48:59,186   Missing prefix: 172.26.8.104/29 (ID: b4e0969b-015b-4658-aca6-5b335f40896f)
+2025-06-06 12:48:59,267   Missing prefix: 172.26.13.168/29 (ID: ba26307d-d29b-479d-88a8-583c171bb1d0)
+2025-06-06 12:48:59,267 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:49:03,437 Prefix 24: 172.26.20.104/29 (ID: 17592266-91ce-4e4a-b219-2b448bd0cb17)
+2025-06-06 12:49:03,437   Found 0 IPs: []
+2025-06-06 12:49:04,114 Prefix 28: 172.26.12.32/29 (ID: 1c0bb18a-3d4f-4b7b-9f5c-5d71e8467874)
+2025-06-06 12:49:04,114   Found 0 IPs: []
+2025-06-06 12:49:04,243 Prefix 29: 172.26.8.128/28 (ID: 1cc557df-ab15-4bcc-8f69-9945ee6d2b76)
+2025-06-06 12:49:04,244   Found 0 IPs: []
+2025-06-06 12:49:04,531 Prefix 31: 172.26.7.216/29 (ID: 2040264f-edce-43f7-8cc8-f6544374ccb6)
+2025-06-06 12:49:04,532   Found 0 IPs: []
+2025-06-06 12:49:05,852 Prefix 39: 172.26.1.184/29 (ID: 2a1a2edb-37f5-4622-8a07-7c0cd2b24f12)
+2025-06-06 12:49:05,852   Found 0 IPs: []
+2025-06-06 12:49:07,043 Prefix 46: 172.26.13.184/29 (ID: 2f136d32-2b43-49f1-b060-3b28e9534ca3)
+2025-06-06 12:49:07,043   Found 0 IPs: []
+2025-06-06 12:49:08,913 Prefix 57: 172.26.20.120/29 (ID: 4300c58d-666b-47b8-8000-fb37ec6c8ef3)
+2025-06-06 12:49:08,913   Found 0 IPs: []
+2025-06-06 12:49:09,578 Prefix 61: 172.26.16.88/29 (ID: 4ac91d23-5929-4ecc-a020-b1c86e405e07)
+2025-06-06 12:49:09,578   Found 0 IPs: []
+2025-06-06 12:49:09,871 Prefix 63: 172.26.13.144/30 (ID: 4ca1a2e1-08c0-4a00-8539-ad3325131221)
+2025-06-06 12:49:09,871   Found 0 IPs: []
+2025-06-06 12:49:28,653 Prefix 160: 172.26.8.128/28 (ID: 1cc557df-ab15-4bcc-8f69-9945ee6d2b76)
+2025-06-06 12:49:28,653   Found 0 IPs: []
+2025-06-06 12:49:38,537 Prefix 206: 172.26.6.144/29 (ID: 8d045cc9-2a21-44d6-afbe-2c3a67a4ee51)
+2025-06-06 12:49:38,537   Found 0 IPs: []
+2025-06-06 12:49:39,038 Prefix 209: 172.26.1.176/30 (ID: 9ab2a554-a993-4ae9-b414-413aec43cdd6)
+2025-06-06 12:49:39,038   Found 0 IPs: []
+2025-06-06 12:49:39,161 Prefix 210: 172.26.16.72/29 (ID: e1bb51df-bed5-4578-893f-67bf4aa3cccd)
+2025-06-06 12:49:39,162   Found 0 IPs: []
+2025-06-06 12:49:39,461 Prefix 212: 172.26.13.152/29 (ID: 729aa1f6-74bf-4fb5-9d9d-da3cd85cc5a2)
+2025-06-06 12:49:39,461   Found 0 IPs: []
+2025-06-06 12:49:39,775 Prefix 214: 172.26.7.216/29 (ID: 2040264f-edce-43f7-8cc8-f6544374ccb6)
+2025-06-06 12:49:39,775   Found 0 IPs: []
+2025-06-06 12:49:39,901 Prefix 215: 172.26.18.32/29 (ID: cb64ee5e-111a-4b20-936d-89e70c872261)
+2025-06-06 12:49:39,902   Found 0 IPs: []
+2025-06-06 12:49:40,214 Prefix 217: 172.26.13.148/30 (ID: 9fc91f07-f1d1-4384-977e-4bc0387e0bfe)
+2025-06-06 12:49:40,214   Found 0 IPs: []
+2025-06-06 12:49:40,355 Prefix 218: 172.26.19.88/29 (ID: c9ae965b-a32e-4d75-bf44-002716aba5e7)
+2025-06-06 12:49:40,355   Found 0 IPs: []
+2025-06-06 12:49:40,486 Prefix 219: 172.26.1.184/29 (ID: 2a1a2edb-37f5-4622-8a07-7c0cd2b24f12)
+2025-06-06 12:49:40,486   Found 0 IPs: []
+2025-06-06 12:49:40,944 Prefix 222: 172.16.10.224/28 (ID: 9eecd60f-0836-4f4d-8c79-a137cf554d22)
+2025-06-06 12:49:40,944   Found 0 IPs: []
+2025-06-06 12:49:41,280 Prefix 224: 172.26.10.160/30 (ID: 9ff951ac-0dcc-40d1-b849-6dbc58790809)
+2025-06-06 12:49:41,280   Found 0 IPs: []
+2025-06-06 12:49:41,409 Prefix 225: 172.26.5.0/29 (ID: 7d3821bc-d906-4677-acb0-734bad9db412)
+2025-06-06 12:49:41,409   Found 0 IPs: []
+2025-06-06 12:49:41,723 Prefix 227: 172.26.4.48/30 (ID: dcad4fbd-7378-45c7-89ce-f40b996d80a9)
+2025-06-06 12:49:41,724   Found 0 IPs: []
+2025-06-06 12:49:41,851 Prefix 228: 172.26.13.144/30 (ID: 4ca1a2e1-08c0-4a00-8539-ad3325131221)
+2025-06-06 12:49:41,851   Found 0 IPs: []
+2025-06-06 12:49:42,154 Prefix 230: 172.26.12.136/29 (ID: 6427be05-4e42-4599-a7f5-a400a9815a5b)
+2025-06-06 12:49:42,154   Found 0 IPs: []
+2025-06-06 12:49:42,286 Prefix 231: 172.26.20.120/29 (ID: 4300c58d-666b-47b8-8000-fb37ec6c8ef3)
+2025-06-06 12:49:42,286   Found 0 IPs: []
+2025-06-06 12:49:42,606 Prefix 233: 172.26.10.164/30 (ID: c76c6826-1ab4-4e84-a595-823f40a198ce)
+2025-06-06 12:49:42,606   Found 0 IPs: []
+2025-06-06 12:49:43,579 Prefix 237: 172.26.20.104/29 (ID: 17592266-91ce-4e4a-b219-2b448bd0cb17)
+2025-06-06 12:49:43,579   Found 0 IPs: []
+2025-06-06 12:49:43,699 Prefix 238: 172.26.20.8/29 (ID: 6575b1c1-d927-49cf-8cd5-a5fca2caa8c6)
+2025-06-06 12:49:43,700   Found 0 IPs: []
+2025-06-06 12:49:43,826 Prefix 239: 172.26.16.88/29 (ID: 4ac91d23-5929-4ecc-a020-b1c86e405e07)
+2025-06-06 12:49:43,826   Found 0 IPs: []
+2025-06-06 12:49:43,951 Prefix 240: 172.26.12.32/29 (ID: 1c0bb18a-3d4f-4b7b-9f5c-5d71e8467874)
+2025-06-06 12:49:43,951   Found 0 IPs: []
+2025-06-06 12:49:44,075 Prefix 241: 172.26.20.112/29 (ID: bd1f5421-3e46-453f-b3d3-5c6131c49335)
+2025-06-06 12:49:44,076   Found 0 IPs: []
+2025-06-06 12:49:44,076 Processed 241/241 prefixes successfully
+2025-06-06 12:49:44,076 TOTAL IPs in VRF EQ: 937
+2025-06-06 12:49:44,076 === END VRF EQ ===
 
-# Логгер
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s'
-)
-logger = logging.getLogger(__name__)
+2025-06-06 12:49:45,053 
+=== GETTING IPs FOR VRF ITDev (36e70a7f-c15f-4342-aabc-6d8d95907b29) ===
+2025-06-06 12:49:45,053 Using alternative approach due to API filter bug
+2025-06-06 12:50:04,423 Alternative method found 4 prefixes for VRF ITDev
+2025-06-06 12:50:04,483 Original filter method found 10 prefixes
+2025-06-06 12:50:04,483 No differences between alternative and filter methods
+2025-06-06 12:50:04,484 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:50:05,205 Processed 4/4 prefixes successfully
+2025-06-06 12:50:05,205 TOTAL IPs in VRF ITDev: 20
+2025-06-06 12:50:05,205 === END VRF ITDev ===
 
+2025-06-06 12:50:07,124 
+=== GETTING IPs FOR VRF ithd (325d7c86-210f-4292-804d-5c126dd4f782) ===
+2025-06-06 12:50:07,124 Using alternative approach due to API filter bug
+2025-06-06 12:50:26,836 Alternative method found 5 prefixes for VRF ithd
+2025-06-06 12:50:26,892 Original filter method found 6 prefixes
+2025-06-06 12:50:26,892 No differences between alternative and filter methods
+2025-06-06 12:50:26,893 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:50:27,795 Processed 5/5 prefixes successfully
+2025-06-06 12:50:27,796 TOTAL IPs in VRF ithd: 49
+2025-06-06 12:50:27,796 === END VRF ithd ===
 
-def netmiko_connect(nautobot_device, device_type):
-    """Создает подключение к сетевому устройству через Netmiko."""
-    netmiko_device = {
-        'device_type': device_type,
-        'host': str(nautobot_device.primary_ip4)[:-3:],
-        'username': config('HPNA_LOGIN'),
-        'password': config('HPNA_PASSWORD'),
-        'timeout': 200,
-        'port': 22,
-        "global_delay_factor": 2,
-        'conn_timeout': 200
-    }
+2025-06-06 12:50:29,651 
+=== GETTING IPs FOR VRF MDREGTRM (eb97f536-91dd-4dc7-97bf-4d254bef81ca) ===
+2025-06-06 12:50:29,651 Using alternative approach due to API filter bug
+2025-06-06 12:50:48,975 Alternative method found 1 prefixes for VRF MDREGTRM
+2025-06-06 12:50:49,020 Original filter method found 3 prefixes
+2025-06-06 12:50:49,021 No differences between alternative and filter methods
+2025-06-06 12:50:49,021 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:50:49,190 Processed 1/1 prefixes successfully
+2025-06-06 12:50:49,190 TOTAL IPs in VRF MDREGTRM: 1
+2025-06-06 12:50:49,190 === END VRF MDREGTRM ===
 
-    try:
-        net_connect = ConnectHandler(**netmiko_device)
-    except Exception as error:
-        try:
-            net_connect = ConnectHandler(**netmiko_device)
-        except Exception as error:
-            logger.error(f"Connection error {nautobot_device}")
-            return None
+2025-06-06 12:50:51,397 
+=== GETTING IPs FOR VRF rbru-desktop (388fc97e-f1df-4014-a74d-b7170b0ca5aa) ===
+2025-06-06 12:50:51,397 Using alternative approach due to API filter bug
+2025-06-06 12:51:10,567 Alternative method found 23 prefixes for VRF rbru-desktop
+2025-06-06 12:51:10,698 Original filter method found 31 prefixes
+2025-06-06 12:51:10,699 No differences between alternative and filter methods
+2025-06-06 12:51:10,699 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:51:15,877 Processed 23/23 prefixes successfully
+2025-06-06 12:51:15,877 TOTAL IPs in VRF rbru-desktop: 296
+2025-06-06 12:51:15,877 === END VRF rbru-desktop ===
 
-    return net_connect
+2025-06-06 12:51:16,866 
+=== GETTING IPs FOR VRF rbru-mgmt (1a5a4461-24df-49bf-88bb-cf7278404673) ===
+2025-06-06 12:51:16,866 Using alternative approach due to API filter bug
+2025-06-06 12:51:36,729 Alternative method found 62 prefixes for VRF rbru-mgmt
+2025-06-06 12:51:37,150 Original filter method found 97 prefixes
+2025-06-06 12:51:37,150 No differences between alternative and filter methods
+2025-06-06 12:51:37,150 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:51:48,312 Processed 62/62 prefixes successfully
+2025-06-06 12:51:48,312 TOTAL IPs in VRF rbru-mgmt: 328
+2025-06-06 12:51:48,312 === END VRF rbru-mgmt ===
 
+2025-06-06 12:51:50,104 
+=== GETTING IPs FOR VRF rbru-p (93840237-6985-4b10-9ca9-01d113f021d8) ===
+2025-06-06 12:51:50,104 Using alternative approach due to API filter bug
+2025-06-06 12:52:09,599 Alternative method found 106 prefixes for VRF rbru-p
+2025-06-06 12:52:09,920 Original filter method found 89 prefixes
+2025-06-06 12:52:09,920 No differences between alternative and filter methods
+2025-06-06 12:52:09,920 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:52:32,175 Processed 106/106 prefixes successfully
+2025-06-06 12:52:32,175 TOTAL IPs in VRF rbru-p: 1803
+2025-06-06 12:52:32,175 === END VRF rbru-p ===
 
-def nautobot_connection():
-    """Возвращает клиент pynautobot с увеличенным пулом соединений."""
-    api = pynautobot.api(
-        NAUTOBOT_URL,
-        token=NAUTOBOT_TOKEN,
-        verify=False,
-    )
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=1000,
-        pool_maxsize=1000
-    )
-    api.http_session.mount('http://', adapter)
-    api.http_session.mount('https://', adapter)
-    api.http_session.verify = False
-    return api
+2025-06-06 12:52:33,194 
+=== GETTING IPs FOR VRF rbru-voip (f3a342df-bd19-471a-956f-c158204191c6) ===
+2025-06-06 12:52:33,194 Using alternative approach due to API filter bug
+2025-06-06 12:52:51,471 Alternative method found 189 prefixes for VRF rbru-voip
+2025-06-06 12:52:52,219 Original filter method found 234 prefixes
+2025-06-06 12:52:52,219 BUG CONFIRMED: 27 prefixes missing in filter method:
+2025-06-06 12:52:52,298   Missing prefix: 172.17.32.0/24 (ID: 1c05bad9-a0ea-4322-9f16-0aa3d4982048)
+2025-06-06 12:52:52,380   Missing prefix: 172.20.95.0/27 (ID: f5b424d8-65e5-4376-9f3f-f480a6ae680d)
+2025-06-06 12:52:52,455   Missing prefix: 172.20.85.32/27 (ID: 910b13aa-91fb-4c12-a040-a92a719b5739)
+2025-06-06 12:52:52,533   Missing prefix: 172.17.33.0/24 (ID: 5046c6fe-9790-40fd-9e63-31ca84786306)
+2025-06-06 12:52:52,605   Missing prefix: 172.17.46.0/26 (ID: 1bd91fc2-4c26-4a78-b73c-9dcf61ee67f7)
+2025-06-06 12:52:52,677   Missing prefix: 172.17.54.0/26 (ID: 10e64fe5-6531-4af9-a701-7e9464ec1fb5)
+2025-06-06 12:52:52,755   Missing prefix: 172.20.85.0/27 (ID: c70872e5-89d4-4685-b2a0-43e18cfea3e7)
+2025-06-06 12:52:52,827   Missing prefix: 172.17.74.192/26 (ID: fa9fa86e-79cb-4fda-9158-f1c6c3f93e65)
+2025-06-06 12:52:52,896   Missing prefix: 172.17.55.0/25 (ID: 1edd6b1e-4e38-4525-8442-7424807db1df)
+2025-06-06 12:52:52,969   Missing prefix: 172.17.87.0/25 (ID: 83f1d812-6d9a-4487-ab8c-0870e31671bc)
+2025-06-06 12:52:53,042   Missing prefix: 172.17.82.64/26 (ID: 4a4b7694-9a2d-4738-b68c-c80dc95bc3e5)
+2025-06-06 12:52:53,110   Missing prefix: 172.17.36.0/24 (ID: 519b1e70-9259-44ce-8d46-55237046a148)
+2025-06-06 12:52:53,179   Missing prefix: 172.16.194.160/29 (ID: 5d7b603d-2ee5-4d5b-a3bd-e6391d657af7)
+2025-06-06 12:52:53,253   Missing prefix: 172.20.50.0/26 (ID: e6aca465-cd74-4c95-bf8b-8b5d0c35e7ee)
+2025-06-06 12:52:53,326   Missing prefix: 172.17.54.128/26 (ID: 7c7c56a6-c1fa-4f81-8aa3-c5d7bf6fa97a)
+2025-06-06 12:52:53,399   Missing prefix: 172.20.136.0/27 (ID: be688022-3915-4c2a-9806-5279afcae8c2)
+2025-06-06 12:52:53,471   Missing prefix: 172.20.146.0/27 (ID: 0fc18f3c-75ff-44b6-aeb0-2a8088a8aed0)
+2025-06-06 12:52:53,547   Missing prefix: 172.20.159.0/27 (ID: bf1c546e-dacd-486f-8fd2-532250986b58)
+2025-06-06 12:52:53,623   Missing prefix: 172.20.129.32/27 (ID: da5ce93b-7e1f-4dc7-a7b2-8a8609a5497c)
+2025-06-06 12:52:53,699   Missing prefix: 172.20.188.32/27 (ID: 93a1c282-abd6-4f79-b049-a2432db707eb)
+2025-06-06 12:52:53,773   Missing prefix: 172.17.158.128/26 (ID: 3f84bb3a-8d83-487d-b393-1ae5190f66fb)
+2025-06-06 12:52:53,845   Missing prefix: 172.17.15.64/26 (ID: 2bab90fa-db32-444d-8c1e-6a1c20e3416d)
+2025-06-06 12:52:53,916   Missing prefix: 192.168.51.168/29 (ID: 168e6d84-7eb4-4c91-a1d6-efaa00745dfc)
+2025-06-06 12:52:53,989   Missing prefix: 172.20.139.32/27 (ID: fef097af-b880-4f2b-bd87-f08779a89494)
+2025-06-06 12:52:54,060   Missing prefix: 172.17.62.128/26 (ID: 0bb4a9fc-d361-4e14-a97c-4a75859af0a0)
+2025-06-06 12:52:54,130   Missing prefix: 172.17.65.64/26 (ID: 33b714ad-ef29-4300-9c79-e2a072c51adf)
+2025-06-06 12:52:54,790   Missing prefix: 172.20.150.32/27 (ID: ea48b60a-654b-4c0e-b0f9-956fd0b6d61a)
+2025-06-06 12:52:54,790 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:53:41,600 Processed 189/189 prefixes successfully
+2025-06-06 12:53:41,600 TOTAL IPs in VRF rbru-voip: 5387
+2025-06-06 12:53:41,601 === END VRF rbru-voip ===
 
+2025-06-06 12:53:51,317 
+=== GETTING IPs FOR VRF rbru-wifi (c0a8fd8f-9828-4cf3-ac92-5fd857b10a51) ===
+2025-06-06 12:53:51,317 Using alternative approach due to API filter bug
+2025-06-06 12:54:10,746 Alternative method found 35 prefixes for VRF rbru-wifi
+2025-06-06 12:54:10,884 Original filter method found 31 prefixes
+2025-06-06 12:54:10,884 No differences between alternative and filter methods
+2025-06-06 12:54:10,884 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:54:18,008 Processed 35/35 prefixes successfully
+2025-06-06 12:54:18,009 TOTAL IPs in VRF rbru-wifi: 380
+2025-06-06 12:54:18,009 === END VRF rbru-wifi ===
 
-def format_mac_address(mac_address):
-    """Преобразует MAC-адрес в формат aa-bb-cc-dd-ee-ff."""
-    mac_parts = mac_address.split('.')
-    mac_joined = ''.join(mac_parts)
-    blocks = [mac_joined[x:x + 2] for x in range(0, len(mac_joined), 2)]
-    return '-'.join(blocks)
+2025-06-06 12:54:18,992 
+=== GETTING IPs FOR VRF rbru-wyse (739f1c5c-e9b0-40a7-8c3f-b8278a7540e8) ===
+2025-06-06 12:54:18,992 Using alternative approach due to API filter bug
+2025-06-06 12:54:38,106 Alternative method found 284 prefixes for VRF rbru-wyse
+2025-06-06 12:54:38,806 Original filter method found 225 prefixes
+2025-06-06 12:54:38,807 BUG CONFIRMED: 34 prefixes missing in filter method:
+2025-06-06 12:54:38,886   Missing prefix: 172.24.207.192/27 (ID: ea91c7f1-cbc1-4ced-922f-5180cb892499)
+2025-06-06 12:54:38,965   Missing prefix: 172.24.2.96/28 (ID: f87e5756-0af3-4d8e-93a3-2d24037de833)
+2025-06-06 12:54:39,042   Missing prefix: 172.24.81.128/27 (ID: 8cc1fa8f-25c6-47ba-a890-34c51ee396b0)
+2025-06-06 12:54:39,117   Missing prefix: 172.24.236.0/23 (ID: cc341c08-d629-41d7-8680-8067950fbb49)
+2025-06-06 12:54:39,195   Missing prefix: 172.24.166.0/27 (ID: 5f8df16d-10e8-4ede-af33-0ffce08c898c)
+2025-06-06 12:54:39,270   Missing prefix: 172.24.212.192/27 (ID: 9e69f0ab-57d4-4dc2-a00c-24623d7b2bc4)
+2025-06-06 12:54:39,344   Missing prefix: 172.24.6.64/26 (ID: df9facdd-79c6-4aa7-abe1-3b1ae4775c2a)
+2025-06-06 12:54:39,417   Missing prefix: 172.24.152.128/28 (ID: 0dcb4ab2-d796-4af4-8945-05f1e3aac816)
+2025-06-06 12:54:39,499   Missing prefix: 172.24.22.0/24 (ID: af6a5db8-282e-4457-bd5c-9f34cd74dcb0)
+2025-06-06 12:54:39,577   Missing prefix: 172.24.234.0/23 (ID: 6b2fbd24-8fe8-4b22-83a6-06c36f08b8aa)
+2025-06-06 12:54:39,656   Missing prefix: 172.24.244.0/28 (ID: 071b8b82-dea7-4502-b426-a7426f946174)
+2025-06-06 12:54:39,731   Missing prefix: 172.24.4.192/26 (ID: 39400242-f689-467e-b6cb-a7680ea31666)
+2025-06-06 12:54:39,811   Missing prefix: 172.24.139.0/26 (ID: 4c502f29-f042-46e5-8e27-8e71845f4d2a)
+2025-06-06 12:54:39,889   Missing prefix: 172.24.54.192/26 (ID: 236cbd58-2bcb-4769-8f59-21525eb4fd9e)
+2025-06-06 12:54:39,962   Missing prefix: 172.24.93.0/26 (ID: 74fdd699-1ac2-441e-b915-728612ed5da0)
+2025-06-06 12:54:40,042   Missing prefix: 172.24.242.128/27 (ID: 04ef9999-c6d1-445f-af5b-1bb8323e6724)
+2025-06-06 12:54:40,123   Missing prefix: 172.24.154.64/26 (ID: 68d8a583-e088-4664-a481-f344cb17e9e6)
+2025-06-06 12:54:40,210   Missing prefix: 172.24.64.192/27 (ID: 70354539-de4c-4516-a8f2-5a91dba1d964)
+2025-06-06 12:54:40,291   Missing prefix: 172.24.49.192/26 (ID: 769db0ea-a3d9-4ef1-8e85-c0559b0a10b4)
+2025-06-06 12:54:40,370   Missing prefix: 172.24.154.0/26 (ID: 3c0c3806-a9ec-444f-badf-fc9cefb20a6a)
+2025-06-06 12:54:40,443   Missing prefix: 172.24.148.128/26 (ID: dbf17104-ab22-4a7d-ae46-4f66e02a9813)
+2025-06-06 12:54:40,533   Missing prefix: 172.24.21.0/24 (ID: 8ef90c68-e7cb-411c-b770-6c4efc238699)
+2025-06-06 12:54:40,613   Missing prefix: 172.24.11.0/24 (ID: 2a9de5a1-ad1b-4fd2-98ab-ca3f43f71472)
+2025-06-06 12:54:40,692   Missing prefix: 172.24.54.0/26 (ID: d729adc9-8302-463b-bcca-3a4dc3f77c31)
+2025-06-06 12:54:40,768   Missing prefix: 172.24.46.0/26 (ID: c6b185e5-2a07-48a1-9291-8aff2acff1d7)
+2025-06-06 12:54:40,842   Missing prefix: 172.24.65.64/27 (ID: 9b38ee0a-b476-4599-ad71-a6d028aab1a7)
+2025-06-06 12:54:40,916   Missing prefix: 172.24.46.192/26 (ID: 2f30088b-82d1-47ac-9d43-059634e0bc61)
+2025-06-06 12:54:40,991   Missing prefix: 172.24.226.0/23 (ID: c6a4d871-5170-4aa8-8015-4a4eb7590f1f)
+2025-06-06 12:54:41,069   Missing prefix: 172.24.49.128/26 (ID: ee168277-a7d3-49f3-bcc8-399760521af2)
+2025-06-06 12:54:41,147   Missing prefix: 172.24.206.128/28 (ID: 85367321-da52-4640-97e6-3934bee3ddcb)
+2025-06-06 12:54:41,227   Missing prefix: 172.24.208.64/27 (ID: def37d7e-445f-4c55-ac3c-59d26501be1d)
+2025-06-06 12:54:41,309   Missing prefix: 172.24.182.192/27 (ID: 2f295063-4845-4d3a-acd9-a10e49babb94)
+2025-06-06 12:54:41,393   Missing prefix: 172.24.9.0/26 (ID: 7987e9a7-e8de-4969-b46a-0e91d752f492)
+2025-06-06 12:54:41,476   Missing prefix: 172.24.88.64/26 (ID: 6aa5a9eb-ba29-4cab-b331-13535810aa1e)
+2025-06-06 12:54:41,477 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:55:54,718 Processed 284/284 prefixes successfully
+2025-06-06 12:55:54,719 TOTAL IPs in VRF rbru-wyse: 9293
+2025-06-06 12:55:54,719 === END VRF rbru-wyse ===
 
+2025-06-06 12:55:55,851 
+=== GETTING IPs FOR VRF RUAHQUARANTINE (25cda047-3530-49c7-afc0-99e4fa20ec2e) ===
+2025-06-06 12:55:55,851 Using alternative approach due to API filter bug
+2025-06-06 12:56:15,759 Alternative method found 94 prefixes for VRF RUAHQUARANTINE
+2025-06-06 12:56:16,159 Original filter method found 77 prefixes
+2025-06-06 12:56:16,160 No differences between alternative and filter methods
+2025-06-06 12:56:16,160 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:56:33,942 Processed 94/94 prefixes successfully
+2025-06-06 12:56:33,942 TOTAL IPs in VRF RUAHQUARANTINE: 107
+2025-06-06 12:56:33,942 === END VRF RUAHQUARANTINE ===
 
-def get_dns_name(ip_address):
-    """Получает DNS имя для IP-адреса."""
-    try:
-        dns_name, alias, address_list = socket.gethostbyaddr(ip_address)
-        return re.sub(r'[#*\s\[\]\"]', '', dns_name)
-    except Exception:
-        return ''
+2025-06-06 12:56:35,244 
+=== GETTING IPs FOR VRF RUAHUSR (82c54585-8f67-41e5-8fc1-3461c1b56b6b) ===
+2025-06-06 12:56:35,244 Using alternative approach due to API filter bug
+2025-06-06 12:56:54,515 Alternative method found 25 prefixes for VRF RUAHUSR
+2025-06-06 12:56:54,667 Original filter method found 39 prefixes
+2025-06-06 12:56:54,667 No differences between alternative and filter methods
+2025-06-06 12:56:54,667 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:57:04,748 Processed 25/25 prefixes successfully
+2025-06-06 12:57:04,748 TOTAL IPs in VRF RUAHUSR: 2595
+2025-06-06 12:57:04,748 === END VRF RUAHUSR ===
 
+2025-06-06 12:57:05,731 
+=== GETTING IPs FOR VRF SECPHY (7a51dc34-a43f-4263-ad0f-f49b4a923305) ===
+2025-06-06 12:57:05,731 Using alternative approach due to API filter bug
+2025-06-06 12:57:24,602 Alternative method found 109 prefixes for VRF SECPHY
+2025-06-06 12:57:24,902 Original filter method found 82 prefixes
+2025-06-06 12:57:24,903 No differences between alternative and filter methods
+2025-06-06 12:57:24,903 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:57:46,027 Processed 109/109 prefixes successfully
+2025-06-06 12:57:46,027 TOTAL IPs in VRF SECPHY: 201
+2025-06-06 12:57:46,027 === END VRF SECPHY ===
 
-def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
-    """
-    Получает IP-адреса в VRF через префиксы.
-    Использует обходной метод из-за бага в API filter(vrf=vrf_id).
-    """
-    try:
-        # Получаем ВСЕ assignments и фильтруем вручную (обходной путь для бага API)
-        all_assignments = nautobot_api.ipam.vrf_prefix_assignments.all()
-        vrf_assignments = [a for a in all_assignments if a.vrf.id == vrf_id]
-        prefix_ids = [a.prefix.id for a in vrf_assignments]
-        
-        logger.debug(f"VRF {vrf_name}: found {len(prefix_ids)} prefixes")
-        
-        vrf_ips = []
-        for prefix_id in prefix_ids:
-            try:
-                ip_addresses = nautobot_api.ipam.ip_addresses.filter(parent=prefix_id)
-                vrf_ips.extend([ip.address for ip in ip_addresses])
-            except Exception as prefix_error:
-                logger.error(f"Error processing prefix {prefix_id}: {prefix_error}")
-        
-        logger.debug(f"VRF {vrf_name}: total {len(vrf_ips)} IP addresses")
-        return vrf_ips
-        
-    except Exception as error:
-        logger.error(f"Error getting IPs for VRF {vrf_name}: {error}")
-        return []
+2025-06-06 12:57:47,017 
+=== GETTING IPs FOR VRF vtrec (2230daf4-8feb-4721-82f4-536917c3d091) ===
+2025-06-06 12:57:47,017 Using alternative approach due to API filter bug
+2025-06-06 12:58:05,282 Alternative method found 265 prefixes for VRF vtrec
+2025-06-06 12:58:05,971 Original filter method found 206 prefixes
+2025-06-06 12:58:05,972 BUG CONFIRMED: 31 prefixes missing in filter method:
+2025-06-06 12:58:06,044   Missing prefix: 172.21.65.80/28 (ID: d594818c-0da5-46e1-80c5-6b3898c48d2b)
+2025-06-06 12:58:06,117   Missing prefix: 172.21.57.0/28 (ID: be06a044-3c5c-4dd8-85d3-e3c82a54e10a)
+2025-06-06 12:58:06,190   Missing prefix: 172.21.121.0/28 (ID: da565b17-24db-4c9b-8ca2-836e4656f00b)
+2025-06-06 12:58:06,261   Missing prefix: 172.21.45.96/28 (ID: 08feb818-4968-4f17-b02d-6bc720a14c95)
+2025-06-06 12:58:06,336   Missing prefix: 172.21.104.16/28 (ID: b0907858-3b6d-4937-88d8-588274cb870d)
+2025-06-06 12:58:06,415   Missing prefix: 172.21.188.16/28 (ID: 9afe22a0-d8d7-45f6-80a3-4c88df066336)
+2025-06-06 12:58:06,486   Missing prefix: 172.21.80.144/28 (ID: 0031cbac-0ae4-4198-ba6e-e6240ce3c695)
+2025-06-06 12:58:06,559   Missing prefix: 172.21.75.192/28 (ID: ac1a4eb1-2da4-47d1-8c31-1e177e0f6714)
+2025-06-06 12:58:06,630   Missing prefix: 172.21.217.176/28 (ID: 824aeaeb-618e-4b78-b762-3a7931c0a92e)
+2025-06-06 12:58:06,701   Missing prefix: 172.21.206.128/28 (ID: 667217ff-2a24-4e70-b37b-06ad5de9dca2)
+2025-06-06 12:58:06,772   Missing prefix: 172.21.93.0/28 (ID: f6f4ee74-af0e-42bf-bd0a-eea8c1b32e96)
+2025-06-06 12:58:06,848   Missing prefix: 172.21.129.0/28 (ID: 8ff3c3c4-3956-4068-ae96-865475145795)
+2025-06-06 12:58:06,924   Missing prefix: 172.21.7.48/28 (ID: 63c2274f-4b45-4acf-8871-59dfd4a3053a)
+2025-06-06 12:58:07,002   Missing prefix: 172.21.209.0/28 (ID: 0ed05c86-328d-4d35-b721-2bdb5f16a72e)
+2025-06-06 12:58:07,076   Missing prefix: 172.21.64.208/28 (ID: 89a863e7-3ebe-400d-b0a9-a879dbe5fd6c)
+2025-06-06 12:58:07,151   Missing prefix: 172.21.63.176/28 (ID: c8f17894-fe57-4d9c-8286-661095132675)
+2025-06-06 12:58:07,225   Missing prefix: 172.21.97.16/28 (ID: a30f3764-76a0-4835-adf0-745118ed4664)
+2025-06-06 12:58:07,293   Missing prefix: 172.21.65.224/28 (ID: 7f9902b3-7755-4bb9-960c-4201102a6753)
+2025-06-06 12:58:07,367   Missing prefix: 172.21.45.64/28 (ID: f48353bd-5b0e-435c-9ff1-858da5cf0b60)
+2025-06-06 12:58:07,434   Missing prefix: 172.21.3.16/28 (ID: 552a63a9-4c0f-4a59-bb1a-5f307ee95659)
+2025-06-06 12:58:07,502   Missing prefix: 172.21.44.64/28 (ID: 06d8f8a0-d986-4923-b968-b8b43aeda9be)
+2025-06-06 12:58:07,568   Missing prefix: 172.21.173.16/28 (ID: ae155e9c-5e69-43cd-9d36-4dcba9127845)
+2025-06-06 12:58:07,639   Missing prefix: 172.21.7.16/28 (ID: 524da75a-cbb9-4ceb-992c-1be53ed5a346)
+2025-06-06 12:58:07,711   Missing prefix: 172.21.88.16/28 (ID: e33eafce-5c45-478f-8a6a-ebf801f7b206)
+2025-06-06 12:58:07,784   Missing prefix: 172.21.254.128/28 (ID: 287594e3-eddf-48a4-aaef-10e4fe0a07ef)
+2025-06-06 12:58:07,855   Missing prefix: 172.21.150.0/28 (ID: 72c2c7d3-6b7a-442a-9548-a11c1dd32bca)
+2025-06-06 12:58:07,923   Missing prefix: 172.21.194.128/28 (ID: 821604df-fd42-4c94-9a6b-74d1af9817b5)
+2025-06-06 12:58:07,996   Missing prefix: 172.21.208.80/28 (ID: 551becfd-787c-4d1e-a9b4-80e4f2e86333)
+2025-06-06 12:58:08,068   Missing prefix: 172.21.192.64/28 (ID: 2f29ac29-e5ca-498f-ad0f-20bce61ec732)
+2025-06-06 12:58:08,140   Missing prefix: 172.21.204.144/28 (ID: 228a78f9-4d05-475f-8d0c-b6709e9b8229)
+2025-06-06 12:58:08,215   Missing prefix: 172.21.47.16/28 (ID: 3287da62-5eb0-48c5-8669-3950068b20da)
+2025-06-06 12:58:08,215 STILL MISSING: Prefix 40433cfa-cc98-4879-b38e-ccb1303134e6 not found even with alternative method
+2025-06-06 12:59:01,851 Processed 265/265 prefixes successfully
+2025-06-06 12:59:01,852 TOTAL IPs in VRF vtrec: 2514
+2025-06-06 12:59:01,852 === END VRF vtrec ===
 
-
-def handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
-    """
-    Обрабатывает ошибку существующего IP-адреса.
-    Добавляет VRF к префиксу, если его там нет.
-    """
-    try:
-        # Находим существующий IP-адрес
-        existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_address)
-        if not existing_ip:
-            logger.error(f"Cannot find existing IP {ip_address}")
-            return False
-            
-        if not existing_ip.parent:
-            logger.error(f"IP {ip_address} has no parent prefix")
-            return False
-            
-        prefix_id = existing_ip.parent.id
-        
-        # Проверяем, есть ли уже нужный VRF у префикса
-        existing_vrf_assignments = nautobot_api.ipam.vrf_prefix_assignments.filter(prefix=prefix_id)
-        existing_vrf_ids = [assignment.vrf.id for assignment in existing_vrf_assignments]
-        
-        if vrf_id not in existing_vrf_ids:
-            # Добавляем VRF к префиксу
-            nautobot_api.ipam.vrf_prefix_assignments.create(
-                prefix=prefix_id,
-                vrf=vrf_id
-            )
-            logger.info(f"Added VRF {vrf_id} to prefix {existing_ip.parent.prefix}")
-        else:
-            logger.info(f"VRF {vrf_id} already assigned to prefix {existing_ip.parent.prefix}")
-        
-        return True
-        
-    except Exception as error:
-        logger.error(f"Error handling existing IP {ip_address}: {error}")
-        return False
-
-
-def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, device_name):
-    """Создает IP-адрес в Nautobot с обработкой конфликтов."""
-    ip_address = f"{arp_entry['address']}/32"
-    
-    # Дополнительная проверка существования IP перед созданием
-    try:
-        existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_address)
-        if existing_ip:
-            logger.warning(f"IP {ip_address} already exists but wasn't found in VRF {vrf_name} check for device {device_name}")
-            # Пытаемся исправить VRF assignment
-            handle_existing_ip_error(nautobot_api, ip_address, vrf_id)
-            return
-    except Exception:
-        # IP не существует, можно создавать
-        pass
-    
-    try:
-        nautobot_api.ipam.ip_addresses.create([{
-            "address": ip_address,
-            "custom_fields": {
-                "mac_address": arp_entry['mac']
-            },
-            "dns_name": dns_name,
-            "status": "Active",
-            "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
-        }])
-        logger.debug(f"Created IP address {ip_address} for device {device_name}")
-        
-    except Exception as error:
-        logger.warning(f"Failed to create IP {ip_address} for device {device_name}: {error}")
-        
-        # Пытаемся обработать конфликт VRF
-        if "already exists" in str(error).lower():
-            if handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
-                logger.info(f"VRF conflict resolved for IP {ip_address}, device {device_name}")
-            else:
-                logger.error(f"Could not resolve VRF conflict for IP {ip_address}, device {device_name}")
-        else:
-            logger.error(f"Unexpected error creating IP {ip_address} for device {device_name}: {error}")
-
-
-def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
-    """Обрабатывает ARP записи для устройств Cisco IOS."""
-    net_connect = netmiko_connect(nautobot_device, 'cisco_ios')
-
-    if not net_connect:
-        return
-
-    try:
-        device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
-        existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
-
-        for vrf_name, vrf_id in existing_vrf_in_device.items():
-            logger.info(f"Processing VRF {vrf_name} for device {nautobot_device.name}")
-            
-            # Получаем IP-адреса в VRF
-            nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
-            
-            # Получаем ARP-таблицу с устройства
-            output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
-            device_arp = parse_output(platform='cisco_ios', command='show ip arp', data=output)
-
-            # Форматируем MAC-адреса
-            for arp_entry in device_arp:
-                arp_entry['mac'] = format_mac_address(arp_entry['mac'])
-
-            # Обрабатываем каждую ARP запись
-            for arp_entry in device_arp:
-                skip_list = [
-                    '192.168.0.0', '192.168.0.1', '192.168.0.2',
-                    '192.168.0.3', '192.168.0.4', '192.168.0.5',
-                    '192.168.0.6'
-                ]
-
-                # Пропускаем служебные IP-адреса
-                if any(sub in arp_entry['address'] for sub in skip_list):
-                    continue
-
-                # Пропускаем неполные MAC-адреса
-                if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
-                    continue
-
-                # Получаем DNS имя
-                dns_name = get_dns_name(arp_entry['address'])
-
-                # Создаем IP-адрес, если его нет в VRF
-                ip_with_mask = f"{arp_entry['address']}/32"
-                if ip_with_mask not in nautobot_device_arp:
-                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, nautobot_device.name)
-
-        net_connect.disconnect()
-        logger.info(f'Completed processing device {nautobot_device.name}')
-        
-    except Exception as error:
-        logger.error(f'Error processing device {nautobot_device.name}: {error}')
-
-
-def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
-    """Обрабатывает ARP записи для устройств Cisco NXOS."""
-    net_connect = netmiko_connect(nautobot_device, 'cisco_nxos')
-
-    if not net_connect:
-        return
-
-    try:
-        device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
-        existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
-
-        for vrf_name, vrf_id in existing_vrf_in_device.items():
-            logger.info(f"Processing VRF {vrf_name} for device {nautobot_device.name}")
-            
-            # Получаем IP-адреса в VRF
-            nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
-
-            # Получаем ARP-таблицу с устройства
-            output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
-            device_arp = parse_output(platform='cisco_nxos', command='show ip arp', data=output)
-
-            # Форматируем MAC-адреса
-            for arp_entry in device_arp:
-                arp_entry['mac'] = format_mac_address(arp_entry['mac'])
-
-            # Обрабатываем каждую ARP запись
-            for arp_entry in device_arp:
-                # Пропускаем неполные MAC-адреса
-                if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
-                    continue
-
-                # Получаем DNS имя
-                dns_name = get_dns_name(arp_entry['address'])
-
-                # Создаем IP-адрес, если его нет в VRF
-                ip_with_mask = f"{arp_entry['address']}/32"
-                if ip_with_mask not in nautobot_device_arp:
-                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name, nautobot_device.name)
-
-        net_connect.disconnect()
-        logger.info(f'Completed processing device {nautobot_device.name}')
-        
-    except Exception as error:
-        logger.error(f'Error processing device {nautobot_device.name}: {error}')
-
-
-def add_arp_entry_to_nautobot():
-    """Основная функция для добавления ARP записей в Nautobot."""
-    start_time = time.time()
-    api = nautobot_connection()
-
-    # Строим мапу тегов
-    all_tags = list(api.extras.tags.all())
-    tag_map = {tag.id: tag.name for tag in all_tags}
-
-    # Фильтруем нужные устройства
-    devices = list(api.dcim.devices.all())
-    target_devices = []
-    
-    for device in devices:
-        tag_names = [tag_map.get(tag.id) for tag in (device.tags or [])]
-        if 'raif_scripts' in tag_names:
-            target_devices.append(device)
-
-    logger.info(f"Found {len(target_devices)} target devices")
-
-    # Многопоточная обработка устройств
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        for nautobot_device in target_devices:
-            if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
-                executor.submit(
-                    create_arp_nautobot_on_cisco_nxos,
-                    nautobot_device,
-                    api,
-                )
-            elif nautobot_device.platform and nautobot_device.platform.name == 'Cisco IOS':
-                executor.submit(
-                    create_arp_nautobot_on_cisco_ios,
-                    nautobot_device,
-                    api,
-                )
-
-    execution_time = time.time() - start_time
-    logger.info(f"Script execution completed in {execution_time:.2f} seconds")
-
-
-if __name__ == "__main__":
-    add_arp_entry_to_nautobot()
+2025-06-06 12:59:02,894 Debug log saved to debug.log

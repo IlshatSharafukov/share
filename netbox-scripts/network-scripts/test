@@ -89,48 +89,48 @@ def get_dns_name(ip_address):
 
 def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
     """
-    Получает IP-адреса в VRF через GraphQL.
-    Обходит проблемы с pynautobot REST API фильтрами.
+    Получает IP-адреса в VRF через оптимизированный GraphQL или REST fallback.
     """
     try:
-        # GraphQL запрос для получения всех префиксов с их VRF и IP-адресами
+        # Попробуем GraphQL с ограничением результатов
         query = """
-        query GetAllPrefixesWithVRFs {
-            prefixes {
+        query GetVRFPrefixes($vrfId: ID!) {
+            vrf(id: $vrfId) {
                 id
-                prefix
-                vrfs {
+                name
+                prefixes {
                     id
-                    name
-                }
-                ip_addresses {
-                    address
+                    prefix
+                    ip_addresses {
+                        address
+                    }
                 }
             }
         }
         """
         
-        logger.debug(f"VRF {vrf_name}: executing GraphQL query for all prefixes")
-        result = nautobot_api.graphql.query(query=query)
+        variables = {"vrfId": vrf_id}
+        
+        logger.debug(f"VRF {vrf_name}: executing optimized GraphQL query")
+        result = nautobot_api.graphql.query(query=query, variables=variables)
         
         if not result or not hasattr(result, 'data') or not result.data:
-            logger.warning(f"VRF {vrf_name}: empty GraphQL response")
-            return []
+            logger.warning(f"VRF {vrf_name}: empty GraphQL response, trying alternative")
+            raise Exception("Empty GraphQL response")
         
-        # Фильтруем префиксы, которые принадлежат нужному VRF
+        # Проверяем наличие VRF в результате
+        if not hasattr(result.data, 'vrf') or not result.data.vrf:
+            logger.warning(f"VRF {vrf_name}: VRF not found in GraphQL response")
+            raise Exception("VRF not found")
+        
+        # Собираем IP-адреса из префиксов VRF
         vrf_ips = []
         prefix_count = 0
         
-        for prefix in result.data.prefixes:
-            # Проверяем, принадлежит ли префикс нужному VRF
-            prefix_vrf_ids = []
-            if hasattr(prefix, 'vrfs') and prefix.vrfs:
-                prefix_vrf_ids = [vrf.id for vrf in prefix.vrfs if hasattr(vrf, 'id')]
-            
-            # Если префикс принадлежит нужному VRF
-            if vrf_id in prefix_vrf_ids:
+        vrf_data = result.data.vrf
+        if hasattr(vrf_data, 'prefixes') and vrf_data.prefixes:
+            for prefix in vrf_data.prefixes:
                 prefix_count += 1
-                # Собираем IP-адреса из этого префикса
                 if hasattr(prefix, 'ip_addresses') and prefix.ip_addresses:
                     for ip in prefix.ip_addresses:
                         if hasattr(ip, 'address') and ip.address:
@@ -143,10 +143,10 @@ def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
         return vrf_ips
         
     except Exception as error:
-        logger.error(f"GraphQL error for VRF {vrf_name}: {error}")
-        logger.info(f"Falling back to REST API for VRF {vrf_name}")
+        logger.warning(f"GraphQL failed for VRF {vrf_name}: {error}")
+        logger.info(f"Using REST API for VRF {vrf_name}")
         
-        # Fallback к оригинальному методу при ошибке GraphQL
+        # Fallback к REST API
         return get_ips_in_vrf_fallback(nautobot_api, vrf_id, vrf_name)
 
 

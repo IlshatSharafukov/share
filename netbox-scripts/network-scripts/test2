@@ -1,0 +1,635 @@
+import time
+import logging
+import concurrent.futures
+import re
+import socket
+from collections import defaultdict
+from typing import Dict, List, Set, Optional, Tuple
+import asyncio
+import aiodns
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import urllib3
+import requests
+from decouple import config
+from ntc_templates.parse import parse_output
+from netmiko import ConnectHandler
+import pynautobot
+
+# Отключаем предупреждения InsecureRequestWarning
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Константы из окружения
+HPNA_LOGIN = config('HPNA_LOGIN')
+HPNA_PASSWORD = config('HPNA_PASSWORD')
+NAUTOBOT_URL = config('NAUTOBOT_URL')
+NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
+
+# Настройка детального логгирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('arp_collector.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Глобальные кеши для оптимизации
+class DataCache:
+    def __init__(self):
+        self.existing_ips: Set[str] = set()
+        self.vrf_ips: Dict[str, Set[str]] = defaultdict(set)  # vrf_id -> set of IPs
+        self.vrf_assignments: Dict[str, List[str]] = defaultdict(list)  # prefix_id -> list of vrf_ids
+        self.dns_cache: Dict[str, str] = {}
+        self.device_vrfs: Dict[str, Dict[str, str]] = {}  # device_id -> {vrf_name: vrf_id}
+        
+cache = DataCache()
+
+
+def setup_detailed_logging():
+    """Настройка детального логгирования с метриками."""
+    # Добавляем handler для метрик
+    metrics_logger = logging.getLogger('metrics')
+    metrics_handler = logging.FileHandler('arp_metrics.log', encoding='utf-8')
+    metrics_handler.setFormatter(logging.Formatter('%(asctime)s: %(message)s'))
+    metrics_logger.addHandler(metrics_handler)
+    metrics_logger.setLevel(logging.INFO)
+    return metrics_logger
+
+
+def log_performance(func_name: str, start_time: float, **kwargs):
+    """Логирование производительности функций."""
+    duration = time.time() - start_time
+    metrics_logger = logging.getLogger('metrics')
+    extra_info = ', '.join([f"{k}={v}" for k, v in kwargs.items()])
+    metrics_logger.info(f"{func_name} completed in {duration:.2f}s ({extra_info})")
+
+
+def netmiko_connect_with_retry(nautobot_device, device_type, max_retries=2):
+    """Создает подключение к сетевому устройству через Netmiko с оптимизированными параметрами."""
+    logger.debug(f"Connecting to {nautobot_device.name} ({device_type})")
+    
+    for attempt in range(max_retries):
+        try:
+            netmiko_device = {
+                'device_type': device_type,
+                'host': str(nautobot_device.primary_ip4)[:-3:],
+                'username': HPNA_LOGIN,
+                'password': HPNA_PASSWORD,
+                'timeout': 120,  # Уменьшено с 300
+                'port': 22,
+                "global_delay_factor": 2,  # Уменьшено с 3
+                'conn_timeout': 60,  # Уменьшено с 300
+                'blocking_timeout': 15,  # Уменьшено с 20
+                'keepalive': 30
+            }
+
+            net_connect = ConnectHandler(**netmiko_device)
+            logger.debug(f"Successfully connected to {nautobot_device.name}")
+            return net_connect
+
+        except Exception as error:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"Connection attempt {attempt + 1} failed for {nautobot_device.name}, retrying in {wait_time}s: {error}")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f'Connection failed for {nautobot_device.name} after {max_retries} attempts: {error}')
+                return None
+
+    return None
+
+
+def send_command_safe(connection, command, timeout=120):
+    """Безопасная отправка команды с оптимизированными таймаутами."""
+    try:
+        return connection.send_command(command, read_timeout=timeout)
+    except Exception as error:
+        if "pattern not detected" in str(error).lower():
+            try:
+                logger.warning(f"Pattern not detected, retrying with increased timeout for command: {command}")
+                return connection.send_command(command, read_timeout=timeout * 2)
+            except Exception:
+                raise error
+        else:
+            raise error
+
+
+def nautobot_connection():
+    """Возвращает клиент pynautobot с оптимизированным пулом соединений."""
+    logger.info("Establishing Nautobot API connection")
+    api = pynautobot.api(
+        NAUTOBOT_URL,
+        token=NAUTOBOT_TOKEN,
+        verify=False,
+    )
+    
+    # Увеличиваем пул соединений для массовых операций
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=200,
+        pool_maxsize=200,
+        max_retries=3
+    )
+    api.http_session.mount('http://', adapter)
+    api.http_session.mount('https://', adapter)
+    api.http_session.verify = False
+    
+    # Устанавливаем разумные таймауты
+    api.http_session.timeout = (10, 30)
+    
+    logger.info("Nautobot API connection established")
+    return api
+
+
+def preload_nautobot_data(nautobot_api):
+    """Предварительная загрузка всех необходимых данных из Nautobot."""
+    logger.info("Starting bulk data preload from Nautobot...")
+    start_time = time.time()
+    
+    # Загружаем все IP адреса разом
+    logger.info("Loading all IP addresses...")
+    ip_start = time.time()
+    all_ips = list(nautobot_api.ipam.ip_addresses.all())
+    cache.existing_ips = {ip.address for ip in all_ips}
+    logger.info(f"Loaded {len(cache.existing_ips)} existing IP addresses in {time.time() - ip_start:.2f}s")
+    
+    # Загружаем все VRF assignments
+    logger.info("Loading VRF prefix assignments...")
+    vrf_start = time.time()
+    all_assignments = list(nautobot_api.ipam.vrf_prefix_assignments.all())
+    
+    # Группируем по VRF
+    vrf_prefixes = defaultdict(list)
+    for assignment in all_assignments:
+        vrf_prefixes[assignment.vrf.id].append(assignment.prefix.id)
+        cache.vrf_assignments[assignment.prefix.id].append(assignment.vrf.id)
+    
+    logger.info(f"Loaded {len(all_assignments)} VRF assignments in {time.time() - vrf_start:.2f}s")
+    
+    # Для каждого VRF загружаем его IP адреса
+    logger.info("Building VRF IP mappings...")
+    vrf_ip_start = time.time()
+    
+    for vrf_id, prefix_ids in vrf_prefixes.items():
+        vrf_ips = set()
+        for ip in all_ips:
+            if ip.parent and ip.parent.id in prefix_ids:
+                vrf_ips.add(ip.address)
+        cache.vrf_ips[vrf_id] = vrf_ips
+        logger.debug(f"VRF {vrf_id} has {len(vrf_ips)} IP addresses")
+    
+    logger.info(f"Built VRF IP mappings for {len(vrf_prefixes)} VRFs in {time.time() - vrf_ip_start:.2f}s")
+    
+    # Загружаем устройства и их VRF
+    logger.info("Loading device VRF mappings...")
+    device_start = time.time()
+    all_devices = list(nautobot_api.dcim.devices.all())
+    
+    for device in all_devices:
+        device_vrfs = nautobot_api.ipam.vrfs.filter(device=device.id)
+        cache.device_vrfs[device.id] = {vrf.name: vrf.id for vrf in device_vrfs}
+        if cache.device_vrfs[device.id]:
+            logger.debug(f"Device {device.name} has VRFs: {list(cache.device_vrfs[device.id].keys())}")
+    
+    logger.info(f"Loaded device VRF mappings in {time.time() - device_start:.2f}s")
+    
+    log_performance("preload_nautobot_data", start_time, 
+                   total_ips=len(cache.existing_ips),
+                   total_vrfs=len(vrf_prefixes),
+                   total_devices=len(all_devices))
+
+
+async def bulk_dns_resolve(ip_addresses: List[str]) -> Dict[str, str]:
+    """Асинхронное массовое разрешение DNS имен."""
+    logger.info(f"Starting bulk DNS resolution for {len(ip_addresses)} IP addresses")
+    start_time = time.time()
+    
+    # Фильтруем IP, которые уже есть в кеше
+    to_resolve = [ip for ip in ip_addresses if ip not in cache.dns_cache]
+    logger.info(f"Need to resolve {len(to_resolve)} new IP addresses")
+    
+    if not to_resolve:
+        return cache.dns_cache
+    
+    resolver = aiodns.DNSResolver(timeout=2.0, tries=1)
+    semaphore = asyncio.Semaphore(50)  # Ограничиваем параллелизм
+    
+    async def resolve_one(ip: str):
+        async with semaphore:
+            try:
+                result = await resolver.gethostbyaddr(ip)
+                dns_name = re.sub(r'[#*\s\[\]\"]', '', result.name)
+                cache.dns_cache[ip] = dns_name
+                return ip, dns_name
+            except Exception:
+                cache.dns_cache[ip] = ''
+                return ip, ''
+    
+    # Выполняем разрешение пакетами
+    batch_size = 100
+    resolved_count = 0
+    
+    for i in range(0, len(to_resolve), batch_size):
+        batch = to_resolve[i:i + batch_size]
+        tasks = [resolve_one(ip) for ip in batch]
+        
+        try:
+            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=30.0)
+            resolved_count += len(batch)
+            logger.debug(f"Resolved DNS for batch {i//batch_size + 1}, total: {resolved_count}/{len(to_resolve)}")
+        except asyncio.TimeoutError:
+            logger.warning(f"DNS resolution timeout for batch {i//batch_size + 1}")
+            # Помечаем как пустые
+            for ip in batch:
+                cache.dns_cache[ip] = ''
+    
+    log_performance("bulk_dns_resolve", start_time, resolved_ips=len(to_resolve))
+    return cache.dns_cache
+
+
+def format_mac_address(mac_address: str) -> str:
+    """Преобразует MAC-адрес в формат aa-bb-cc-dd-ee-ff."""
+    if not mac_address or mac_address.upper() == 'INCOMPLETE':
+        return mac_address
+        
+    mac_clean = mac_address.replace('.', '').replace(':', '').replace('-', '')
+    if len(mac_clean) != 12:
+        return mac_address
+        
+    blocks = [mac_clean[x:x + 2] for x in range(0, 12, 2)]
+    return '-'.join(blocks).lower()
+
+
+def parse_ilo_arp_output(output: str) -> List[Dict]:
+    """Парсит ARP вывод для iLO и других нестандартных устройств."""
+    arp_entries = []
+    lines = output.strip().split('\n')
+
+    for line in lines:
+        if any(skip_word in line.lower() for skip_word in [
+            'protocol', 'address', 'age', 'hardware', 'type', 'interface',
+            'total number', 'static:', 'dynamic:', 'trust:', 'load for', 'time source'
+        ]):
+            continue
+
+        match = re.match(r'^(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+([0-9a-fA-F.]+)\s+(\S+)(?:\s+(.*))?', line.strip())
+
+        if match:
+            protocol, address, age, mac, type_field, interface = match.groups()
+            arp_entry = {
+                'protocol': protocol,
+                'address': address,
+                'age': age,
+                'mac': mac,
+                'type': type_field,
+                'interface': interface.strip() if interface else ''
+            }
+            arp_entries.append(arp_entry)
+
+    return arp_entries
+
+
+def is_empty_arp_table(output: str) -> bool:
+    """Проверяет, является ли ARP таблица пустой."""
+    if not output or len(output.strip()) < 10:
+        return True
+        
+    output_lower = output.lower()
+    empty_indicators = [
+        'total number of entries: 0',
+        'no entries found',
+        'arp table is empty',
+        'total entries: 0',
+        '0 entries',
+        'no arp entries'
+    ]
+    return any(indicator in output_lower for indicator in empty_indicators)
+
+
+def should_skip_ip(ip_address: str) -> bool:
+    """Проверяет, нужно ли пропустить IP адрес."""
+    skip_list = [
+        '192.168.0.0', '192.168.0.1', '192.168.0.2',
+        '192.168.0.3', '192.168.0.4', '192.168.0.5',
+        '192.168.0.6'
+    ]
+    return any(skip_ip in ip_address for skip_ip in skip_list)
+
+
+def batch_create_ip_addresses(nautobot_api, ip_data_list: List[Dict]):
+    """Массовое создание IP адресов в Nautobot."""
+    if not ip_data_list:
+        return
+        
+    logger.info(f"Creating batch of {len(ip_data_list)} IP addresses")
+    start_time = time.time()
+    
+    try:
+        nautobot_api.ipam.ip_addresses.create(ip_data_list)
+        logger.info(f"Successfully created {len(ip_data_list)} IP addresses")
+        
+        # Обновляем кеш
+        for ip_data in ip_data_list:
+            cache.existing_ips.add(ip_data['address'])
+            
+    except Exception as error:
+        logger.error(f"Batch create failed: {error}")
+        # Пытаемся создать по одному при ошибке batch операции
+        create_individually(nautobot_api, ip_data_list)
+    
+    log_performance("batch_create_ip_addresses", start_time, count=len(ip_data_list))
+
+
+def create_individually(nautobot_api, ip_data_list: List[Dict]):
+    """Индивидуальное создание IP адресов при ошибке batch операции."""
+    logger.warning(f"Falling back to individual creation for {len(ip_data_list)} IPs")
+    
+    success_count = 0
+    for ip_data in ip_data_list:
+        try:
+            nautobot_api.ipam.ip_addresses.create([ip_data])
+            cache.existing_ips.add(ip_data['address'])
+            success_count += 1
+        except Exception as error:
+            if "duplicate key value violates unique constraint" not in str(error):
+                logger.warning(f"Failed to create IP {ip_data['address']}: {error}")
+    
+    logger.info(f"Individual creation: {success_count}/{len(ip_data_list)} successful")
+
+
+def process_arp_entries(arp_entries: List[Dict], device_name: str, vrf_name: str = None, vrf_id: str = None) -> Tuple[List[Dict], List[str]]:
+    """Обрабатывает ARP записи и возвращает данные для создания и список IP для DNS."""
+    logger.debug(f"Processing {len(arp_entries)} ARP entries for {device_name}, VRF: {vrf_name or 'GLOBAL'}")
+    
+    ip_data_list = []
+    dns_ips = []
+    
+    # Определяем какие IP уже существуют
+    if vrf_id:
+        existing_in_context = cache.vrf_ips.get(vrf_id, set())
+    else:
+        existing_in_context = cache.existing_ips
+    
+    for arp_entry in arp_entries:
+        # Пропускаем служебные IP
+        if should_skip_ip(arp_entry['address']):
+            continue
+            
+        # Форматируем MAC адрес
+        formatted_mac = format_mac_address(arp_entry['mac'])
+        if formatted_mac.upper() == 'IN-CO-MP-LE-TE':
+            continue
+        
+        ip_with_mask = f"{arp_entry['address']}/32"
+        
+        # Проверяем существование в контексте (VRF или глобально)
+        if ip_with_mask not in existing_in_context:
+            ip_data = {
+                "address": ip_with_mask,
+                "custom_fields": {
+                    "mac_address": formatted_mac
+                },
+                "dns_name": "",  # Заполним позже
+                "status": "Active",
+                "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
+            }
+            
+            if not vrf_id:  # Глобальная таблица
+                ip_data["description"] = "VRF GLOBAL"
+            
+            ip_data_list.append(ip_data)
+            dns_ips.append(arp_entry['address'])
+    
+    logger.debug(f"Found {len(ip_data_list)} new IPs to create for {device_name}")
+    return ip_data_list, dns_ips
+
+
+async def process_device_arp_async(device_info: Tuple, nautobot_api):
+    """Асинхронная обработка ARP таблиц устройства."""
+    nautobot_device, device_type = device_info
+    logger.info(f"Processing device: {nautobot_device.name} ({device_type})")
+    device_start_time = time.time()
+    
+    # Подключаемся к устройству
+    net_connect = netmiko_connect_with_retry(nautobot_device, device_type)
+    if not net_connect:
+        logger.error(f"Failed to connect to {nautobot_device.name}")
+        return
+    
+    all_ip_data = []
+    all_dns_ips = []
+    
+    try:
+        # Обрабатываем глобальную ARP таблицу
+        logger.info(f"Processing global ARP table for {nautobot_device.name}")
+        global_start = time.time()
+        
+        try:
+            output = send_command_safe(net_connect, 'show ip arp')
+            
+            if not is_empty_arp_table(output):
+                # Пытаемся распарсить
+                device_arp = None
+                try:
+                    device_arp = parse_output(platform=device_type, command='show ip arp', data=output)
+                    if not device_arp:
+                        raise Exception("Standard parser returned empty result")
+                except Exception:
+                    try:
+                        device_arp = parse_ilo_arp_output(output)
+                    except Exception as parse_error:
+                        logger.error(f"Failed to parse global ARP for {nautobot_device.name}: {parse_error}")
+                        device_arp = []
+                
+                if device_arp:
+                    ip_data_list, dns_ips = process_arp_entries(device_arp, nautobot_device.name)
+                    all_ip_data.extend(ip_data_list)
+                    all_dns_ips.extend(dns_ips)
+                    logger.info(f"Global ARP: found {len(ip_data_list)} new IPs")
+        except Exception as error:
+            logger.error(f"Error processing global ARP for {nautobot_device.name}: {error}")
+        
+        log_performance("process_global_arp", global_start, device=nautobot_device.name)
+        
+        # Обрабатываем VRF
+        device_vrfs = cache.device_vrfs.get(nautobot_device.id, {})
+        logger.info(f"Processing {len(device_vrfs)} VRFs for {nautobot_device.name}")
+        
+        vrf_start = time.time()
+        for vrf_name, vrf_id in device_vrfs.items():
+            try:
+                logger.debug(f"Processing VRF {vrf_name} for {nautobot_device.name}")
+                output = send_command_safe(net_connect, f'show ip arp vrf {vrf_name}')
+                
+                if not is_empty_arp_table(output):
+                    device_arp = parse_output(platform=device_type, command='show ip arp', data=output)
+                    
+                    if device_arp:
+                        ip_data_list, dns_ips = process_arp_entries(
+                            device_arp, nautobot_device.name, vrf_name, vrf_id
+                        )
+                        all_ip_data.extend(ip_data_list)
+                        all_dns_ips.extend(dns_ips)
+                        logger.debug(f"VRF {vrf_name}: found {len(ip_data_list)} new IPs")
+                        
+            except Exception as vrf_error:
+                logger.error(f'Error processing VRF {vrf_name} for {nautobot_device.name}: {vrf_error}')
+        
+        log_performance("process_device_vrfs", vrf_start, 
+                       device=nautobot_device.name, vrf_count=len(device_vrfs))
+        
+        # Массовое DNS разрешение для всех IP устройства
+        if all_dns_ips:
+            logger.info(f"Resolving DNS for {len(all_dns_ips)} IPs from {nautobot_device.name}")
+            dns_results = await bulk_dns_resolve(all_dns_ips)
+            
+            # Обновляем DNS имена в данных IP
+            for ip_data in all_ip_data:
+                ip_without_mask = ip_data['address'].split('/')[0]
+                ip_data['dns_name'] = dns_results.get(ip_without_mask, '')
+        
+        # Массовое создание всех IP адресов устройства
+        if all_ip_data:
+            logger.info(f"Creating {len(all_ip_data)} IP addresses for {nautobot_device.name}")
+            batch_create_ip_addresses(nautobot_api, all_ip_data)
+        
+        net_connect.disconnect()
+        
+        log_performance("process_device_complete", device_start_time,
+                       device=nautobot_device.name,
+                       total_ips=len(all_ip_data),
+                       vrfs=len(device_vrfs))
+        
+        logger.info(f"Completed processing {nautobot_device.name}: created {len(all_ip_data)} IP addresses")
+        
+    except Exception as error:
+        logger.error(f'Critical error processing device {nautobot_device.name}: {error}')
+        try:
+            net_connect.disconnect()
+        except:
+            pass
+
+
+def get_target_devices(nautobot_api) -> List[Tuple]:
+    """Получает список целевых устройств для обработки."""
+    logger.info("Getting target devices...")
+    start_time = time.time()
+    
+    # Строим мапу тегов
+    all_tags = list(nautobot_api.extras.tags.all())
+    tag_map = {tag.id: tag.name for tag in all_tags}
+    logger.debug(f"Loaded {len(tag_map)} tags")
+    
+    # Фильтруем нужные устройства
+    devices = list(nautobot_api.dcim.devices.all())
+    target_devices = []
+    
+    for device in devices:
+        # Проверяем наличие тега raif_scripts
+        tag_names = [tag_map.get(tag.id) for tag in (device.tags or [])]
+        if 'raif_scripts' not in tag_names:
+            continue
+            
+        # Проверяем платформу и primary_ip
+        if not device.platform or not device.primary_ip4:
+            logger.warning(f"Skipping device {device.name}: missing platform or primary IP")
+            continue
+            
+        # Определяем тип устройства
+        device_type = None
+        if device.platform.name == 'Cisco NXOS':
+            device_type = 'cisco_nxos'
+        elif device.platform.name == 'Cisco IOS':
+            device_type = 'cisco_ios'
+        else:
+            logger.warning(f"Unsupported platform for device {device.name}: {device.platform.name}")
+            continue
+            
+        target_devices.append((device, device_type))
+    
+    log_performance("get_target_devices", start_time, 
+                   total_devices=len(devices), target_devices=len(target_devices))
+    
+    logger.info(f"Found {len(target_devices)} target devices from {len(devices)} total")
+    return target_devices
+
+
+async def process_devices_async(target_devices: List[Tuple], nautobot_api, max_concurrent: int = 20):
+    """Асинхронная обработка списка устройств."""
+    logger.info(f"Starting async processing of {len(target_devices)} devices with max {max_concurrent} concurrent")
+    
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def process_with_semaphore(device_info):
+        async with semaphore:
+            await process_device_arp_async(device_info, nautobot_api)
+    
+    # Создаем задачи
+    tasks = [process_with_semaphore(device_info) for device_info in target_devices]
+    
+    # Выполняем с отслеживанием прогресса
+    completed = 0
+    for coro in asyncio.as_completed(tasks):
+        try:
+            await coro
+            completed += 1
+            if completed % 10 == 0:
+                logger.info(f"Progress: {completed}/{len(target_devices)} devices completed")
+        except Exception as error:
+            logger.error(f"Error in device processing: {error}")
+            completed += 1
+    
+    logger.info(f"Async processing completed: {completed}/{len(target_devices)} devices processed")
+
+
+def add_arp_entry_to_nautobot():
+    """Основная оптимизированная функция для добавления ARP записей в Nautobot."""
+    logger.info("=== Starting optimized ARP collection script ===")
+    total_start_time = time.time()
+    
+    # Настраиваем детальное логгирование
+    metrics_logger = setup_detailed_logging()
+    
+    try:
+        # Подключаемся к Nautobot
+        api = nautobot_connection()
+        
+        # Предварительная загрузка данных
+        preload_nautobot_data(api)
+        
+        # Получаем целевые устройства
+        target_devices = get_target_devices(api)
+        
+        if not target_devices:
+            logger.warning("No target devices found!")
+            return
+        
+        # Запускаем асинхронную обработку
+        logger.info("Starting async device processing...")
+        asyncio.run(process_devices_async(target_devices, api, max_concurrent=15))
+        
+        # Финальная статистика
+        execution_time = time.time() - total_start_time
+        
+        logger.info("=== ARP Collection Completed ===")
+        logger.info(f"Total execution time: {execution_time:.2f} seconds")
+        logger.info(f"Processed devices: {len(target_devices)}")
+        logger.info(f"Cached IPs: {len(cache.existing_ips)}")
+        logger.info(f"DNS cache size: {len(cache.dns_cache)}")
+        logger.info(f"Average time per device: {execution_time/len(target_devices):.2f} seconds")
+        
+        # Записываем финальные метрики
+        metrics_logger.info(f"FINAL: Total execution: {execution_time:.2f}s, "
+                           f"Devices: {len(target_devices)}, "
+                           f"Avg per device: {execution_time/len(target_devices):.2f}s")
+        
+    except Exception as error:
+        logger.error(f"Critical error in main function: {error}", exc_info=True)
+        raise
+
+
+if __name__ == "__main__":
+    add_arp_entry_to_nautobot()

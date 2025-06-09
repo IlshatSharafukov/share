@@ -5,19 +5,24 @@ def parse_ilo_arp_output(output):
     arp_entries = []
     lines = output.strip().split('\n')
     
-    for line in lines:
+    print(f"DEBUG: Total lines to process: {len(lines)}")
+    
+    for i, line in enumerate(lines):
+        print(f"DEBUG: Line {i}: '{line}'")
+        
         # Пропускаем заголовки и служебные строки
         if any(skip_word in line.lower() for skip_word in [
             'protocol', 'address', 'age', 'hardware', 'type', 'interface',
             'total number', 'static:', 'dynamic:', 'trust:', 'load for', 'time source'
         ]):
+            print(f"DEBUG: Skipping header line {i}")
             continue
             
         # Ищем строки с IP адресами
-        # Изменено: (\S+) для age поддерживает тире, (.*) для длинных интерфейсов
         match = re.match(r'^(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+([0-9a-fA-F.]+)\s+(\S+)(?:\s+(.*))?', line.strip())
         
         if match:
+            print(f"DEBUG: Match found on line {i}: {match.groups()}")
             protocol, address, age, mac, type_field, interface = match.groups()
             
             arp_entry = {
@@ -29,5 +34,8 @@ def parse_ilo_arp_output(output):
                 'interface': interface.strip() if interface else ''
             }
             arp_entries.append(arp_entry)
+        else:
+            print(f"DEBUG: No match on line {i}: '{line.strip()}'")
     
+    print(f"DEBUG: Found {len(arp_entries)} entries")
     return arp_entries

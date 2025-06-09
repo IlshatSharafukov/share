@@ -3,6 +3,8 @@ import logging
 import concurrent.futures
 import re
 import socket
+from collections import defaultdict
+import threading
 
 import urllib3
 import requests
@@ -26,6 +28,16 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Глобальная структура для хранения метрик времени
+device_metrics = defaultdict(dict)
+metrics_lock = threading.Lock()
+
+
+def record_device_metric(device_name, metric_name, value):
+    """Записывает метрику для устройства в потокобезопасном режиме."""
+    with metrics_lock:
+        device_metrics[device_name][metric_name] = value
 
 
 def netmiko_connect_with_retry(nautobot_device, device_type, max_retries=3):
@@ -421,18 +433,28 @@ def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf
 
 def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
     """Обрабатывает ARP записи для устройств Cisco IOS."""
+    device_start_time = time.time()
+    device_name = nautobot_device.name
+    
     net_connect = netmiko_connect_with_retry(nautobot_device, 'cisco_ios')
 
     if not net_connect:
+        record_device_metric(device_name, 'total_time', time.time() - device_start_time)
+        record_device_metric(device_name, 'status', 'connection_failed')
         return
 
     try:
         # Обрабатываем глобальную ARP таблицу
+        global_arp_start = time.time()
         process_global_arp_table(net_connect, nautobot_device, nautobot_api, 'cisco_ios')
+        record_device_metric(device_name, 'global_arp_time', time.time() - global_arp_start)
 
         # Обрабатываем VRF
+        vrf_start_time = time.time()
         device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
         existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
+        vrf_count = len(existing_vrf_in_device)
+        record_device_metric(device_name, 'vrf_count', vrf_count)
 
         for vrf_name, vrf_id in existing_vrf_in_device.items():
             try:
@@ -474,26 +496,44 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
             except Exception as vrf_error:
                 logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
 
+        record_device_metric(device_name, 'vrf_processing_time', time.time() - vrf_start_time)
         net_connect.disconnect()
+        
+        total_time = time.time() - device_start_time
+        record_device_metric(device_name, 'total_time', total_time)
+        record_device_metric(device_name, 'status', 'success')
 
     except Exception as error:
+        total_time = time.time() - device_start_time
+        record_device_metric(device_name, 'total_time', total_time)
+        record_device_metric(device_name, 'status', 'error')
         logger.error(f'Error processing device {nautobot_device.name}: {error}')
 
 
 def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
     """Обрабатывает ARP записи для устройств Cisco NXOS."""
+    device_start_time = time.time()
+    device_name = nautobot_device.name
+    
     net_connect = netmiko_connect_with_retry(nautobot_device, 'cisco_nxos')
 
     if not net_connect:
+        record_device_metric(device_name, 'total_time', time.time() - device_start_time)
+        record_device_metric(device_name, 'status', 'connection_failed')
         return
 
     try:
         # Обрабатываем глобальную ARP таблицу
+        global_arp_start = time.time()
         process_global_arp_table(net_connect, nautobot_device, nautobot_api, 'cisco_nxos')
+        record_device_metric(device_name, 'global_arp_time', time.time() - global_arp_start)
 
         # Обрабатываем VRF
+        vrf_start_time = time.time()
         device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
         existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
+        vrf_count = len(existing_vrf_in_device)
+        record_device_metric(device_name, 'vrf_count', vrf_count)
 
         for vrf_name, vrf_id in existing_vrf_in_device.items():
             try:
@@ -525,10 +565,66 @@ def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
             except Exception as vrf_error:
                 logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
 
+        record_device_metric(device_name, 'vrf_processing_time', time.time() - vrf_start_time)
         net_connect.disconnect()
+        
+        total_time = time.time() - device_start_time
+        record_device_metric(device_name, 'total_time', total_time)
+        record_device_metric(device_name, 'status', 'success')
 
     except Exception as error:
+        total_time = time.time() - device_start_time
+        record_device_metric(device_name, 'total_time', total_time)
+        record_device_metric(device_name, 'status', 'error')
         logger.error(f'Error processing device {nautobot_device.name}: {error}')
+
+
+def print_device_metrics():
+    """Выводит топ 50 устройств по времени обработки."""
+    print("\n" + "="*80)
+    print("DEVICE PROCESSING METRICS - TOP 50 BY EXECUTION TIME")
+    print("="*80)
+    
+    # Сортируем устройства по общему времени выполнения
+    sorted_devices = sorted(
+        device_metrics.items(), 
+        key=lambda x: x[1].get('total_time', 0), 
+        reverse=True
+    )[:50]
+    
+    print(f"{'#':<3} {'Device Name':<30} {'Total Time':<12} {'Status':<15} {'VRF Count':<10} {'Global ARP':<12} {'VRF Time':<10}")
+    print("-" * 92)
+    
+    for i, (device_name, metrics) in enumerate(sorted_devices, 1):
+        total_time = metrics.get('total_time', 0)
+        status = metrics.get('status', 'unknown')
+        vrf_count = metrics.get('vrf_count', 'N/A')
+        global_arp_time = metrics.get('global_arp_time', 0)
+        vrf_time = metrics.get('vrf_processing_time', 0)
+        
+        print(f"{i:<3} {device_name:<30} {total_time:<12.2f} {status:<15} {vrf_count:<10} {global_arp_time:<12.2f} {vrf_time:<10.2f}")
+    
+    # Статистика
+    if device_metrics:
+        all_times = [metrics.get('total_time', 0) for metrics in device_metrics.values()]
+        avg_time = sum(all_times) / len(all_times)
+        max_time = max(all_times)
+        min_time = min(all_times)
+        
+        status_count = defaultdict(int)
+        for metrics in device_metrics.values():
+            status_count[metrics.get('status', 'unknown')] += 1
+        
+        print("\n" + "="*80)
+        print("SUMMARY STATISTICS")
+        print("="*80)
+        print(f"Total devices processed: {len(device_metrics)}")
+        print(f"Average processing time: {avg_time:.2f} seconds")
+        print(f"Maximum processing time: {max_time:.2f} seconds")
+        print(f"Minimum processing time: {min_time:.2f} seconds")
+        print("\nStatus distribution:")
+        for status, count in status_count.items():
+            print(f"  {status}: {count}")
 
 
 def add_arp_entry_to_nautobot():
@@ -553,23 +649,28 @@ def add_arp_entry_to_nautobot():
 
     # Многопоточная обработка устройств
     with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        futures = []
         for nautobot_device in target_devices:
-                if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
-                    executor.submit(
-                        create_arp_nautobot_on_cisco_nxos,
-                        nautobot_device,
-                        api,
-                    )
-                elif nautobot_device.platform and nautobot_device.platform.name == 'Cisco IOS':
-                    executor.submit(
-                        create_arp_nautobot_on_cisco_ios,
-                        nautobot_device,
-                        api,
-                    )
+            if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
+                future = executor.submit(
+                    create_arp_nautobot_on_cisco_nxos,
+                    nautobot_device,
+                    api,
+                )
+                futures.append(future)
+            elif nautobot_device.platform and nautobot_device.platform.name == 'Cisco IOS':
+                future = executor.submit(
+                    create_arp_nautobot_on_cisco_ios,
+                    nautobot_device,
+                    api,
+                )
+                futures.append(future)
+        
+        # Ждем завершения всех задач
+        concurrent.futures.wait(futures)
 
     execution_time = time.time() - start_time
     print(f"Script execution completed in {execution_time:.2f} seconds")
-
-
-if __name__ == "__main__":
-    add_arp_entry_to_nautobot()
+    
+    # Выводим метрики устройств
+    print_device_metrics()

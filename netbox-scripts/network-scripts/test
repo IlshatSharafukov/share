@@ -191,7 +191,8 @@ def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platfor
         # Получаем глобальную ARP-таблицу с устройства
         output = send_command_safe(net_connect, 'show ip arp')
         # Проверяем, не пустая ли ARP таблица
-        if is_empty_arp_table(output):
+
+        if is_empty_arp_table(output) or len(output) == 0:
             # Пустая таблица - это нормально, не логируем как ошибку
             return
 
@@ -553,18 +554,18 @@ def add_arp_entry_to_nautobot():
     # Многопоточная обработка устройств
     with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
         for nautobot_device in target_devices:
-            if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
-                executor.submit(
-                    create_arp_nautobot_on_cisco_nxos,
-                    nautobot_device,
-                    api,
-                )
-            elif nautobot_device.platform and nautobot_device.platform.name == 'Cisco IOS':
-                executor.submit(
-                    create_arp_nautobot_on_cisco_ios,
-                    nautobot_device,
-                    api,
-                )
+                if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
+                    executor.submit(
+                        create_arp_nautobot_on_cisco_nxos,
+                        nautobot_device,
+                        api,
+                    )
+                elif nautobot_device.platform and nautobot_device.platform.name == 'Cisco IOS':
+                    executor.submit(
+                        create_arp_nautobot_on_cisco_ios,
+                        nautobot_device,
+                        api,
+                    )
 
     execution_time = time.time() - start_time
     print(f"Script execution completed in {execution_time:.2f} seconds")

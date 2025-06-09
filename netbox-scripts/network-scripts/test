@@ -148,11 +148,33 @@ def create_ip_address_in_nautobot_global(nautobot_api, arp_entry, dns_name, devi
             logger.warning(f"Failed to create IP {ip_address} for device {device_name}: {error}")
 
 
+def is_empty_arp_table(output):
+    """Проверяет, является ли ARP таблица пустой."""
+    output_lower = output.lower()
+    
+    # Индикаторы пустой ARP таблицы
+    empty_indicators = [
+        'total number of entries: 0',
+        'no entries found',
+        'arp table is empty',
+        'total entries: 0',
+        '0 entries',
+        'no arp entries'
+    ]
+    
+    return any(indicator in output_lower for indicator in empty_indicators)
+
+
 def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platform):
     """Обрабатывает глобальную ARP таблицу устройства."""
     try:
         # Получаем глобальную ARP-таблицу с устройства
         output = net_connect.send_command('show ip arp', read_timeout=200)
+        
+        # Проверяем, не пустая ли ARP таблица
+        if is_empty_arp_table(output):
+            # Пустая таблица - это нормально, не логируем как ошибку
+            return
         
         # Пытаемся распарсить вывод стандартным шаблоном
         device_arp = None

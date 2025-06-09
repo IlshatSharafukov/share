@@ -178,11 +178,52 @@ def create_ip_address_in_nautobot_global(nautobot_api, arp_entry, dns_name, devi
                     }])
                     logger.info(f"Created IP address {ip_address} in global table after ensuring parent prefix exists for device {device_name}")
                 except Exception as retry_error:
-                    logger.error(f"Failed to create IP {ip_address} even after ensuring parent prefix exists for device {device_name}: {retry_error}")
+                    if "duplicate key value violates unique constraint" in str(retry_error):
+                        logger.info(f"IP {ip_address} was created by another thread, skipping for device {device_name}")
+                    else:
+                        logger.error(f"Failed to create IP {ip_address} even after ensuring parent prefix exists for device {device_name}: {retry_error}")
             else:
                 logger.error(f"Could not find or create parent prefix for IP {ip_address}, device {device_name}")
         else:
-            logger.warning(f"Failed to create IP {ip_address} in global table for device {device_name}: {error}")
+            if "duplicate key value violates unique constraint" in str(error):
+                logger.info(f"IP {ip_address} was created by another thread, skipping for device {device_name}")
+            else:
+                logger.warning(f"Failed to create IP {ip_address} in global table for device {device_name}: {error}")
+
+
+def parse_ilo_arp_output(output):
+    """Парсит ARP вывод для iLO и других нестандартных устройств."""
+    import re
+    
+    arp_entries = []
+    lines = output.strip().split('\n')
+    
+    for line in lines:
+        # Пропускаем заголовки и служебные строки
+        if any(skip_word in line.lower() for skip_word in [
+            'protocol', 'address', 'age', 'hardware', 'type', 'interface',
+            'total number', 'static:', 'dynamic:', 'trust:', 'load for', 'time source'
+        ]):
+            continue
+            
+        # Ищем строки с IP адресами
+        # Формат: Internet  172.29.34.17     --        001f.ce2b.6a95  arpa   VLAN250
+        match = re.match(r'^(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+([0-9a-fA-F.]+)\s+(\S+)(?:\s+(\S+))?', line.strip())
+        
+        if match:
+            protocol, address, age, mac, type_field, interface = match.groups()
+            
+            arp_entry = {
+                'protocol': protocol,
+                'address': address,
+                'age': age,
+                'mac': mac,
+                'type': type_field,
+                'interface': interface or ''
+            }
+            arp_entries.append(arp_entry)
+    
+    return arp_entries
 
 
 def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platform):
@@ -192,7 +233,23 @@ def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platfor
 
         # Получаем глобальную ARP-таблицу с устройства
         output = net_connect.send_command('show ip arp', read_timeout=200)
-        device_arp = parse_output(platform=platform, command='show ip arp', data=output)
+        
+        # Пытаемся распарсить вывод стандартным шаблоном
+        try:
+            device_arp = parse_output(platform=platform, command='show ip arp', data=output)
+            logger.debug(f"Successfully parsed ARP output using standard template for {nautobot_device.name}")
+        except Exception as parse_error:
+            logger.info(f"Standard parsing failed for device {nautobot_device.name}, trying custom parser: {parse_error}")
+            
+            # Пытаемся использовать кастомный парсер для iLO и других устройств
+            device_arp = parse_ilo_arp_output(output)
+            
+            if not device_arp:
+                logger.warning(f"Both standard and custom parsing failed for device {nautobot_device.name}")
+                logger.debug(f"Raw ARP output for {nautobot_device.name}:\n{output}")
+                return
+            else:
+                logger.info(f"Successfully parsed ARP output using custom parser for {nautobot_device.name}")
 
         logger.info(f"Found {len(device_arp)} ARP entries in global table for device {nautobot_device.name}")
 
@@ -226,7 +283,7 @@ def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platfor
             # Проверяем существование IP через индивидуальный GET запрос
             try:
                 existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_with_mask)
-                if existing_ip:
+                if existing_ip is not None:
                     logger.debug(f"IP {ip_with_mask} already exists in Nautobot, skipping")
                     continue
             except Exception:

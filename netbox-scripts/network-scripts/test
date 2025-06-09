@@ -22,7 +22,7 @@ NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
 
 # Логгер
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,  # Показываем только WARNING и ERROR
     format='%(asctime)s %(levelname)s %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -87,110 +87,6 @@ def get_dns_name(ip_address):
         return ''
 
 
-def find_or_create_parent_prefix(nautobot_api, ip_address):
-    """Находит или создает родительский префикс /24 для IP-адреса."""
-    import ipaddress
-    
-    # Определяем подсеть /24 для IP
-    ip_obj = ipaddress.IPv4Address(ip_address.split('/')[0])
-    network = ipaddress.IPv4Network(f"{ip_obj}/24", strict=False)
-    prefix_24 = str(network)
-    
-    logger.info(f"Looking for prefix {prefix_24} for IP {ip_address}")
-    
-    # Проверяем, есть ли префикс /24
-    try:
-        existing_prefix = nautobot_api.ipam.prefixes.get(prefix=prefix_24)
-        logger.info(f"get() returned: {existing_prefix}")
-        logger.info(f"get() returned type: {type(existing_prefix)}")
-        logger.info(f"get() returned bool: {bool(existing_prefix)}")
-        if hasattr(existing_prefix, 'id'):
-            logger.info(f"Found existing prefix {prefix_24} with ID: {existing_prefix.id}")
-        else:
-            logger.info(f"get() returned object without ID attribute")
-        return existing_prefix
-    except Exception as search_error:
-        logger.info(f"Prefix {prefix_24} not found, creating new one. Search error: {search_error}")
-        logger.info(f"Search error type: {type(search_error)}")
-        # Создаем префикс /24
-        try:
-            logger.info(f"Attempting to create prefix {prefix_24} with namespace ed1a3ab7-deea-4872-b111-b44513de94a8")
-            new_prefix = nautobot_api.ipam.prefixes.create({
-                "prefix": prefix_24,
-                "status": "Active",
-                "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
-            })
-            logger.info(f"Successfully created new prefix {prefix_24}")
-            return new_prefix
-        except Exception as create_error:
-            logger.error(f"Failed to create prefix {prefix_24}. Full error: {create_error}")
-            logger.error(f"Error type: {type(create_error)}")
-            # Попробуем создать без namespace
-            try:
-                logger.info(f"Trying to create prefix {prefix_24} without explicit namespace")
-                new_prefix_simple = nautobot_api.ipam.prefixes.create({
-                    "prefix": prefix_24,
-                    "status": "Active"
-                })
-                logger.info(f"Successfully created prefix {prefix_24} without explicit namespace")
-                return new_prefix_simple
-            except Exception as simple_error:
-                logger.error(f"Failed to create prefix {prefix_24} even without namespace: {simple_error}")
-                return None
-
-
-def create_ip_address_in_nautobot_global(nautobot_api, arp_entry, dns_name, device_name):
-    """Создает IP-адрес в глобальной таблице Nautobot."""
-    ip_address = f"{arp_entry['address']}/32"
-
-    try:
-        nautobot_api.ipam.ip_addresses.create([{
-            "address": ip_address,
-            "custom_fields": {
-                "mac_address": arp_entry['mac']
-            },
-            "dns_name": dns_name,
-            "description": "VRF GLOBAL",
-            "status": "Active",
-            "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
-        }])
-        logger.info(f"Created IP address {ip_address} in global table for device {device_name}")
-
-    except Exception as error:
-        # Проверяем, нужно ли создать родительский префикс
-        if "No suitable parent Prefix exists" in str(error):
-            logger.info(f"Creating parent prefix for IP {ip_address}")
-            parent_prefix = find_or_create_parent_prefix(nautobot_api, ip_address)
-            
-            if parent_prefix:
-                logger.info(f"Successfully found/created parent prefix for {ip_address}, retrying IP creation")
-                # Повторяем попытку создания IP после создания префикса
-                try:
-                    nautobot_api.ipam.ip_addresses.create([{
-                        "address": ip_address,
-                        "custom_fields": {
-                            "mac_address": arp_entry['mac']
-                        },
-                        "dns_name": dns_name,
-                        "description": "VRF GLOBAL",
-                        "status": "Active",
-                        "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
-                    }])
-                    logger.info(f"Created IP address {ip_address} in global table after ensuring parent prefix exists for device {device_name}")
-                except Exception as retry_error:
-                    if "duplicate key value violates unique constraint" in str(retry_error):
-                        logger.info(f"IP {ip_address} was created by another thread, skipping for device {device_name}")
-                    else:
-                        logger.error(f"Failed to create IP {ip_address} even after ensuring parent prefix exists for device {device_name}: {retry_error}")
-            else:
-                logger.error(f"Could not find or create parent prefix for IP {ip_address}, device {device_name}")
-        else:
-            if "duplicate key value violates unique constraint" in str(error):
-                logger.info(f"IP {ip_address} was created by another thread, skipping for device {device_name}")
-            else:
-                logger.warning(f"Failed to create IP {ip_address} in global table for device {device_name}: {error}")
-
-
 def parse_ilo_arp_output(output):
     """Парсит ARP вывод для iLO и других нестандартных устройств."""
     import re
@@ -226,41 +122,55 @@ def parse_ilo_arp_output(output):
     return arp_entries
 
 
+def create_ip_address_in_nautobot_global(nautobot_api, arp_entry, dns_name, device_name):
+    """Создает IP-адрес в глобальной таблице Nautobot."""
+    ip_address = f"{arp_entry['address']}/32"
+
+    try:
+        nautobot_api.ipam.ip_addresses.create([{
+            "address": ip_address,
+            "custom_fields": {
+                "mac_address": arp_entry['mac']
+            },
+            "dns_name": dns_name,
+            "description": "VRF GLOBAL",
+            "status": "Active",
+            "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
+        }])
+
+    except Exception as error:
+        if "duplicate key value violates unique constraint" in str(error):
+            # Race condition - другой поток уже создал IP, это нормально
+            pass
+        elif "No suitable parent Prefix exists" in str(error):
+            logger.warning(f"No parent prefix for IP {ip_address}, device {device_name}")
+        else:
+            logger.warning(f"Failed to create IP {ip_address} for device {device_name}: {error}")
+
+
 def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platform):
     """Обрабатывает глобальную ARP таблицу устройства."""
     try:
-        logger.info(f"Processing global ARP table for device {nautobot_device.name}")
-
         # Получаем глобальную ARP-таблицу с устройства
         output = net_connect.send_command('show ip arp', read_timeout=200)
         
         # Пытаемся распарсить вывод стандартным шаблоном
+        device_arp = None
         try:
             device_arp = parse_output(platform=platform, command='show ip arp', data=output)
-            logger.debug(f"Successfully parsed ARP output using standard template for {nautobot_device.name}")
-        except Exception as parse_error:
-            logger.info(f"Standard parsing failed for device {nautobot_device.name}, trying custom parser: {parse_error}")
-            
+        except Exception:
             # Пытаемся использовать кастомный парсер для iLO и других устройств
             device_arp = parse_ilo_arp_output(output)
-            
-            if not device_arp:
-                logger.warning(f"Both standard and custom parsing failed for device {nautobot_device.name}")
-                logger.debug(f"Raw ARP output for {nautobot_device.name}:\n{output}")
-                return
-            else:
-                logger.info(f"Successfully parsed ARP output using custom parser for {nautobot_device.name}")
 
-        logger.info(f"Found {len(device_arp)} ARP entries in global table for device {nautobot_device.name}")
+        if not device_arp:
+            logger.error(f"Failed to parse ARP output for device {nautobot_device.name}")
+            return
 
         # Форматируем MAC-адреса
         for arp_entry in device_arp:
             arp_entry['mac'] = format_mac_address(arp_entry['mac'])
 
         # Обрабатываем каждую ARP запись
-        processed_count = 0
-        created_count = 0
-        
         for arp_entry in device_arp:
             # Список служебных IP-адресов для пропуска
             skip_list = [
@@ -277,14 +187,12 @@ def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platfor
             if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
                 continue
 
-            processed_count += 1
             ip_with_mask = f"{arp_entry['address']}/32"
 
             # Проверяем существование IP через индивидуальный GET запрос
             try:
                 existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_with_mask)
                 if existing_ip is not None:
-                    logger.debug(f"IP {ip_with_mask} already exists in Nautobot, skipping")
                     continue
             except Exception:
                 # IP не найден, можно создавать
@@ -295,9 +203,6 @@ def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platfor
 
             # Создаем IP-адрес
             create_ip_address_in_nautobot_global(nautobot_api, arp_entry, dns_name, nautobot_device.name)
-            created_count += 1
-
-        logger.info(f"Global ARP processing for {nautobot_device.name}: processed {processed_count} entries, created {created_count} new IPs")
 
     except Exception as error:
         logger.error(f'Error processing global ARP table for device {nautobot_device.name}: {error}')
@@ -322,12 +227,10 @@ def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
         }}
         """
 
-        #logger.info(f"VRF {vrf_name}: executing GraphQL query")
         result = nautobot_api.graphql.query(query=query)
 
         # Используем json атрибут GraphQLRecord
         if not hasattr(result, 'json') or not result.json:
-            logger.warning(f"VRF {vrf_name}: no json in GraphQL result")
             raise Exception("No JSON in GraphQL result")
 
         data = result.json.get('data', {})
@@ -335,15 +238,11 @@ def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
         prefixes = vrf_data.get('prefixes', [])
 
         if not prefixes:
-            #logger.warning(f"VRF {vrf_name}: no prefixes found")
             raise Exception("No prefixes found")
 
         # Собираем IP-адреса из префиксов VRF
         vrf_ips = []
-        prefix_count = 0
-
         for prefix in prefixes:
-            prefix_count += 1
             ip_addresses = prefix.get('ip_addresses', [])
             for ip in ip_addresses:
                 address = ip.get('address')
@@ -352,12 +251,9 @@ def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
 
         # Дедупликация IP-адресов
         vrf_ips = list(set(vrf_ips))
-
-        #logger.info(f"VRF {vrf_name}: found {prefix_count} prefixes, {len(vrf_ips)} IP addresses via GraphQL")
         return vrf_ips
 
     except Exception as error:
-        #logger.warning(f"GraphQL failed for VRF {vrf_name}: {error}")
         return get_ips_in_vrf_fallback(nautobot_api, vrf_id, vrf_name)
 
 
@@ -373,8 +269,6 @@ def get_ips_in_vrf_fallback(nautobot_api, vrf_id, vrf_name):
         # Дедупликация префиксов (убираем дублированные assignments)
         prefix_ids = list(set([a.prefix.id for a in vrf_assignments]))
 
-        logger.debug(f"VRF {vrf_name}: found {len(prefix_ids)} prefixes via REST fallback")
-
         # Собираем все IP сначала, дедуплицируем в конце
         vrf_ips = []
         for prefix_id in prefix_ids:
@@ -386,8 +280,6 @@ def get_ips_in_vrf_fallback(nautobot_api, vrf_id, vrf_name):
 
         # Дедупликация IP-адресов один раз в конце
         vrf_ips = list(set(vrf_ips))
-
-        logger.debug(f"VRF {vrf_name}: total {len(vrf_ips)} IP addresses via REST fallback")
         return vrf_ips
 
     except Exception as error:
@@ -423,9 +315,6 @@ def handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
                 prefix=prefix_id,
                 vrf=vrf_id
             )
-            logger.info(f"Added VRF {vrf_id} to prefix {existing_ip.parent.prefix}")
-        else:
-            logger.info(f"VRF {vrf_id} already assigned to prefix {existing_ip.parent.prefix}")
 
         return True
 
@@ -441,7 +330,7 @@ def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf
     # Дополнительная проверка существования IP перед созданием
     try:
         existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_address)
-        if existing_ip:
+        if existing_ip is not None:
             logger.warning(
                 f"IP {ip_address} already exists but wasn't found in VRF {vrf_name} check for device {device_name}")
             # Пытаемся исправить VRF assignment
@@ -461,19 +350,18 @@ def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf
             "status": "Active",
             "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
         }])
-        logger.debug(f"Created IP address {ip_address} for device {device_name}")
 
     except Exception as error:
-        logger.warning(f"Failed to create IP {ip_address} for device {device_name}: {error}")
-
-        # Пытаемся обработать конфликт VRF
-        if "already exists" in str(error).lower():
+        if "duplicate key value violates unique constraint" in str(error):
+            # Race condition - нормальная ситуация
+            pass
+        elif "already exists" in str(error).lower():
             if handle_existing_ip_error(nautobot_api, ip_address, vrf_id):
-                logger.info(f"VRF conflict resolved for IP {ip_address}, device {device_name}")
+                pass  # VRF conflict resolved
             else:
                 logger.error(f"Could not resolve VRF conflict for IP {ip_address}, device {device_name}")
         else:
-            logger.error(f"Unexpected error creating IP {ip_address} for device {device_name}: {error}")
+            logger.warning(f"Failed to create IP {ip_address} for device {device_name}: {error}")
 
 
 def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
@@ -484,54 +372,51 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
         return
 
     try:
-        # НОВАЯ ЛОГИКА: Обрабатываем только глобальную ARP таблицу
+        # Обрабатываем глобальную ARP таблицу
         process_global_arp_table(net_connect, nautobot_device, nautobot_api, 'cisco_ios')
 
-        # ЗАКОММЕНТИРОВАННАЯ СТАРАЯ ЛОГИКА ДЛЯ VRF
-        # device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
-        # existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
+        # Обрабатываем VRF
+        device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
+        existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
 
-        # for vrf_name, vrf_id in existing_vrf_in_device.items():
-        #     logger.info(f"Processing VRF {vrf_name} for device {nautobot_device.name}")
+        for vrf_name, vrf_id in existing_vrf_in_device.items():
+            # Получаем IP-адреса в VRF
+            nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
 
-        #     # Получаем IP-адреса в VRF
-        #     nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
+            # Получаем ARP-таблицу с устройства
+            output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
+            device_arp = parse_output(platform='cisco_ios', command='show ip arp', data=output)
 
-        #     # Получаем ARP-таблицу с устройства
-        #     output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
-        #     device_arp = parse_output(platform='cisco_ios', command='show ip arp', data=output)
+            # Форматируем MAC-адреса
+            for arp_entry in device_arp:
+                arp_entry['mac'] = format_mac_address(arp_entry['mac'])
 
-        #     # Форматируем MAC-адреса
-        #     for arp_entry in device_arp:
-        #         arp_entry['mac'] = format_mac_address(arp_entry['mac'])
+            # Обрабатываем каждую ARP запись
+            for arp_entry in device_arp:
+                skip_list = [
+                    '192.168.0.0', '192.168.0.1', '192.168.0.2',
+                    '192.168.0.3', '192.168.0.4', '192.168.0.5',
+                    '192.168.0.6'
+                ]
 
-        #     # Обрабатываем каждую ARP запись
-        #     for arp_entry in device_arp:
-        #         skip_list = [
-        #             '192.168.0.0', '192.168.0.1', '192.168.0.2',
-        #             '192.168.0.3', '192.168.0.4', '192.168.0.5',
-        #             '192.168.0.6'
-        #         ]
+                # Пропускаем служебные IP-адреса
+                if any(sub in arp_entry['address'] for sub in skip_list):
+                    continue
 
-        #         # Пропускаем служебные IP-адреса
-        #         if any(sub in arp_entry['address'] for sub in skip_list):
-        #             continue
+                # Пропускаем неполные MAC-адреса
+                if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
+                    continue
 
-        #         # Пропускаем неполные MAC-адреса
-        #         if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
-        #             continue
+                # Получаем DNS имя
+                dns_name = get_dns_name(arp_entry['address'])
 
-        #         # Получаем DNS имя
-        #         dns_name = get_dns_name(arp_entry['address'])
-
-        #         # Создаем IP-адрес, если его нет в VRF
-        #         ip_with_mask = f"{arp_entry['address']}/32"
-        #         if ip_with_mask not in nautobot_device_arp:
-        #             create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name,
-        #                                           nautobot_device.name)
+                # Создаем IP-адрес, если его нет в VRF
+                ip_with_mask = f"{arp_entry['address']}/32"
+                if ip_with_mask not in nautobot_device_arp:
+                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name,
+                                                  nautobot_device.name)
 
         net_connect.disconnect()
-        logger.info(f'Completed processing device {nautobot_device.name}')
 
     except Exception as error:
         logger.error(f'Error processing device {nautobot_device.name}: {error}')
@@ -545,44 +430,41 @@ def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
         return
 
     try:
-        # НОВАЯ ЛОГИКА: Обрабатываем только глобальную ARP таблицу
+        # Обрабатываем глобальную ARP таблицу
         process_global_arp_table(net_connect, nautobot_device, nautobot_api, 'cisco_nxos')
 
-        # ЗАКОММЕНТИРОВАННАЯ СТАРАЯ ЛОГИКА ДЛЯ VRF
-        # device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
-        # existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
+        # Обрабатываем VRF
+        device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
+        existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
 
-        # for vrf_name, vrf_id in existing_vrf_in_device.items():
-        #     logger.info(f"Processing VRF {vrf_name} for device {nautobot_device.name}")
+        for vrf_name, vrf_id in existing_vrf_in_device.items():
+            # Получаем IP-адреса в VRF
+            nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
 
-        #     # Получаем IP-адреса в VRF
-        #     nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
+            # Получаем ARP-таблицу с устройства
+            output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
+            device_arp = parse_output(platform='cisco_nxos', command='show ip arp', data=output)
 
-        #     # Получаем ARP-таблицу с устройства
-        #     output = net_connect.send_command(f'show ip arp vrf {vrf_name}', read_timeout=200)
-        #     device_arp = parse_output(platform='cisco_nxos', command='show ip arp', data=output)
+            # Форматируем MAC-адреса
+            for arp_entry in device_arp:
+                arp_entry['mac'] = format_mac_address(arp_entry['mac'])
 
-        #     # Форматируем MAC-адреса
-        #     for arp_entry in device_arp:
-        #         arp_entry['mac'] = format_mac_address(arp_entry['mac'])
+            # Обрабатываем каждую ARP запись
+            for arp_entry in device_arp:
+                # Пропускаем неполные MAC-адреса
+                if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
+                    continue
 
-        #     # Обрабатываем каждую ARP запись
-        #     for arp_entry in device_arp:
-        #         # Пропускаем неполные MAC-адреса
-        #         if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
-        #             continue
+                # Получаем DNS имя
+                dns_name = get_dns_name(arp_entry['address'])
 
-        #         # Получаем DNS имя
-        #         dns_name = get_dns_name(arp_entry['address'])
-
-        #         # Создаем IP-адрес, если его нет в VRF
-        #         ip_with_mask = f"{arp_entry['address']}/32"
-        #         if ip_with_mask not in nautobot_device_arp:
-        #             create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name,
-        #                                           nautobot_device.name)
+                # Создаем IP-адрес, если его нет в VRF
+                ip_with_mask = f"{arp_entry['address']}/32"
+                if ip_with_mask not in nautobot_device_arp:
+                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name,
+                                                  nautobot_device.name)
 
         net_connect.disconnect()
-        logger.info(f'Completed processing device {nautobot_device.name}')
 
     except Exception as error:
         logger.error(f'Error processing device {nautobot_device.name}: {error}')
@@ -606,7 +488,7 @@ def add_arp_entry_to_nautobot():
         if 'raif_scripts' in tag_names:
             target_devices.append(device)
 
-    logger.info(f"Found {len(target_devices)} target devices")
+    print(f"Found {len(target_devices)} target devices")
 
     # Многопоточная обработка устройств
     with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
@@ -625,7 +507,7 @@ def add_arp_entry_to_nautobot():
                 )
 
     execution_time = time.time() - start_time
-    logger.info(f"Script execution completed in {execution_time:.2f} seconds")
+    print(f"Script execution completed in {execution_time:.2f} seconds")
 
 
 if __name__ == "__main__":

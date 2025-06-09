@@ -96,24 +96,40 @@ def find_or_create_parent_prefix(nautobot_api, ip_address):
     network = ipaddress.IPv4Network(f"{ip_obj}/24", strict=False)
     prefix_24 = str(network)
     
+    logger.info(f"Looking for prefix {prefix_24} for IP {ip_address}")
+    
     # Проверяем, есть ли префикс /24
     try:
         existing_prefix = nautobot_api.ipam.prefixes.get(prefix=prefix_24)
-        logger.debug(f"Found existing prefix {prefix_24}")
+        logger.info(f"Found existing prefix {prefix_24}")
         return existing_prefix
-    except Exception:
+    except Exception as search_error:
+        logger.info(f"Prefix {prefix_24} not found, creating new one. Search error: {search_error}")
         # Создаем префикс /24
         try:
+            logger.info(f"Attempting to create prefix {prefix_24} with namespace ed1a3ab7-deea-4872-b111-b44513de94a8")
             new_prefix = nautobot_api.ipam.prefixes.create({
                 "prefix": prefix_24,
                 "status": "Active",
                 "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
             })
-            logger.info(f"Created new prefix {prefix_24}")
+            logger.info(f"Successfully created new prefix {prefix_24}")
             return new_prefix
-        except Exception as error:
-            logger.error(f"Failed to create prefix {prefix_24}: {error}")
-            return None
+        except Exception as create_error:
+            logger.error(f"Failed to create prefix {prefix_24}. Full error: {create_error}")
+            logger.error(f"Error type: {type(create_error)}")
+            # Попробуем создать без namespace
+            try:
+                logger.info(f"Trying to create prefix {prefix_24} without explicit namespace")
+                new_prefix_simple = nautobot_api.ipam.prefixes.create({
+                    "prefix": prefix_24,
+                    "status": "Active"
+                })
+                logger.info(f"Successfully created prefix {prefix_24} without explicit namespace")
+                return new_prefix_simple
+            except Exception as simple_error:
+                logger.error(f"Failed to create prefix {prefix_24} even without namespace: {simple_error}")
+                return None
 
 
 def create_ip_address_in_nautobot_global(nautobot_api, arp_entry, dns_name, device_name):

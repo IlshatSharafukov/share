@@ -87,6 +87,35 @@ def get_dns_name(ip_address):
         return ''
 
 
+def find_or_create_parent_prefix(nautobot_api, ip_address):
+    """Находит или создает родительский префикс /24 для IP-адреса."""
+    import ipaddress
+    
+    # Определяем подсеть /24 для IP
+    ip_obj = ipaddress.IPv4Address(ip_address.split('/')[0])
+    network = ipaddress.IPv4Network(f"{ip_obj}/24", strict=False)
+    prefix_24 = str(network)
+    
+    # Проверяем, есть ли префикс /24
+    try:
+        existing_prefix = nautobot_api.ipam.prefixes.get(prefix=prefix_24)
+        logger.debug(f"Found existing prefix {prefix_24}")
+        return existing_prefix
+    except Exception:
+        # Создаем префикс /24
+        try:
+            new_prefix = nautobot_api.ipam.prefixes.create({
+                "prefix": prefix_24,
+                "status": "Active",
+                "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
+            })
+            logger.info(f"Created new prefix {prefix_24}")
+            return new_prefix
+        except Exception as error:
+            logger.error(f"Failed to create prefix {prefix_24}: {error}")
+            return None
+
+
 def create_ip_address_in_nautobot_global(nautobot_api, arp_entry, dns_name, device_name):
     """Создает IP-адрес в глобальной таблице Nautobot."""
     ip_address = f"{arp_entry['address']}/32"
@@ -98,13 +127,38 @@ def create_ip_address_in_nautobot_global(nautobot_api, arp_entry, dns_name, devi
                 "mac_address": arp_entry['mac']
             },
             "dns_name": dns_name,
+            "description": "VRF GLOBAL",
             "status": "Active",
             "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
         }])
         logger.info(f"Created IP address {ip_address} in global table for device {device_name}")
 
     except Exception as error:
-        logger.warning(f"Failed to create IP {ip_address} in global table for device {device_name}: {error}")
+        # Проверяем, нужно ли создать родительский префикс
+        if "No suitable parent Prefix exists" in str(error):
+            logger.info(f"Creating parent prefix for IP {ip_address}")
+            parent_prefix = find_or_create_parent_prefix(nautobot_api, ip_address)
+            
+            if parent_prefix:
+                # Повторяем попытку создания IP после создания префикса
+                try:
+                    nautobot_api.ipam.ip_addresses.create([{
+                        "address": ip_address,
+                        "custom_fields": {
+                            "mac_address": arp_entry['mac']
+                        },
+                        "dns_name": dns_name,
+                        "description": "VRF GLOBAL",
+                        "status": "Active",
+                        "namespace": "ed1a3ab7-deea-4872-b111-b44513de94a8"
+                    }])
+                    logger.info(f"Created IP address {ip_address} in global table after creating parent prefix for device {device_name}")
+                except Exception as retry_error:
+                    logger.error(f"Failed to create IP {ip_address} even after creating parent prefix for device {device_name}: {retry_error}")
+            else:
+                logger.error(f"Could not create parent prefix for IP {ip_address}, device {device_name}")
+        else:
+            logger.warning(f"Failed to create IP {ip_address} in global table for device {device_name}: {error}")
 
 
 def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platform):

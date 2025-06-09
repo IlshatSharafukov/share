@@ -3,8 +3,8 @@ import logging
 import concurrent.futures
 import re
 import socket
-import asyncio
-import aiodns
+from collections import defaultdict
+from threading import Lock
 
 import urllib3
 import requests
@@ -29,10 +29,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Глобальные переменные для сбора статистики
+device_timings = {}
+timing_lock = Lock()
+
+
+def log_device_timing(device_name, operation, duration):
+    """Логирует время выполнения операции для устройства."""
+    with timing_lock:
+        if device_name not in device_timings:
+            device_timings[device_name] = {}
+        device_timings[device_name][operation] = duration
+
 
 def netmiko_connect_with_retry(nautobot_device, device_type, max_retries=3):
     """Создает подключение к сетевому устройству через Netmiko с retry логикой."""
-
+    start_time = time.time()
+    
     for attempt in range(max_retries):
         try:
             netmiko_device = {
@@ -49,6 +62,8 @@ def netmiko_connect_with_retry(nautobot_device, device_type, max_retries=3):
             }
 
             net_connect = ConnectHandler(**netmiko_device)
+            duration = time.time() - start_time
+            log_device_timing(nautobot_device.name, 'netmiko_connect', duration)
             return net_connect
 
         except Exception as error:
@@ -57,6 +72,8 @@ def netmiko_connect_with_retry(nautobot_device, device_type, max_retries=3):
                 time.sleep(wait_time)
                 continue
             else:
+                duration = time.time() - start_time
+                log_device_timing(nautobot_device.name, 'netmiko_connect_failed', duration)
                 logger.error(f'Connection error {nautobot_device}')
                 return None
 
@@ -103,43 +120,8 @@ def format_mac_address(mac_address):
     return '-'.join(blocks)
 
 
-async def resolve_single_dns(resolver, ip_address):
-    """Асинхронно разрешает DNS имя для одного IP адреса."""
-    try:
-        result = await resolver.gethostbyaddr(ip_address)
-        return re.sub(r'[#*\s\[\]\"]', '', result.name)
-    except Exception:
-        return ''
-
-
-async def resolve_dns_batch(ip_addresses, max_concurrent=100):
-    """Асинхронно разрешает DNS имена для списка IP адресов."""
-    if not ip_addresses:
-        return {}
-    
-    resolver = aiodns.DNSResolver()
-    semaphore = asyncio.Semaphore(max_concurrent)
-    
-    async def resolve_with_semaphore(ip):
-        async with semaphore:
-            return await resolve_single_dns(resolver, ip)
-    
-    tasks = [resolve_with_semaphore(ip) for ip in ip_addresses]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Обрабатываем результаты и исключения
-    dns_results = {}
-    for ip, result in zip(ip_addresses, results):
-        if isinstance(result, Exception):
-            dns_results[ip] = ''
-        else:
-            dns_results[ip] = result
-    
-    return dns_results
-
-
 def get_dns_name(ip_address):
-    """Получает DNS имя для IP-адреса (синхронная версия для обратной совместимости)."""
+    """Получает DNS имя для IP-адреса."""
     try:
         dns_name, alias, address_list = socket.gethostbyaddr(ip_address)
         return re.sub(r'[#*\s\[\]\"]', '', dns_name)
@@ -223,17 +205,23 @@ def create_ip_address_in_nautobot_global(nautobot_api, arp_entry, dns_name, devi
 
 
 def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platform):
-    """Обрабатывает глобальную ARP таблицу устройства с асинхронным DNS."""
+    """Обрабатывает глобальную ARP таблицу устройства."""
+    start_time = time.time()
+    
     try:
         # Получаем глобальную ARP-таблицу с устройства
+        cmd_start = time.time()
         output = send_command_safe(net_connect, 'show ip arp')
+        cmd_duration = time.time() - cmd_start
+        log_device_timing(nautobot_device.name, 'show_ip_arp_global', cmd_duration)
+        
         # Проверяем, не пустая ли ARP таблица
-
         if is_empty_arp_table(output) or len(output) == 0:
-            # Пустая таблица - это нормально, не логируем как ошибку
+            log_device_timing(nautobot_device.name, 'process_global_arp_table', time.time() - start_time)
             return
 
         # Пытаемся распарсить вывод стандартным шаблоном
+        parse_start = time.time()
         device_arp = None
         standard_parse_error = None
         custom_parse_error = None
@@ -251,20 +239,26 @@ def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platfor
             except Exception as error:
                 custom_parse_error = str(error)
         
+        parse_duration = time.time() - parse_start
+        log_device_timing(nautobot_device.name, 'parse_arp_global', parse_duration)
+        
         if not device_arp:
-            # Детальная ошибка с примером вывода
             logger.error(f"Failed to parse ARP output for device {nautobot_device.name}:")
             logger.error(f"  Standard parser error: {standard_parse_error}")
             logger.error(f"  Custom parser error: {custom_parse_error}")
             logger.error(f"  First 500 chars of output: {output[:500]}")
+            log_device_timing(nautobot_device.name, 'process_global_arp_table', time.time() - start_time)
             return
 
         # Форматируем MAC-адреса
         for arp_entry in device_arp:
             arp_entry['mac'] = format_mac_address(arp_entry['mac'])
 
-        # Фильтруем ARP записи
-        filtered_arp = []
+        # Обрабатываем каждую ARP запись
+        dns_count = 0
+        api_checks = 0
+        api_creates = 0
+        
         for arp_entry in device_arp:
             # Список служебных IP-адресов для пропуска
             skip_list = [
@@ -281,34 +275,34 @@ def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platfor
             if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
                 continue
 
-            # Проверяем существование IP через индивидуальный GET запрос
             ip_with_mask = f"{arp_entry['address']}/32"
+
+            # Проверяем существование IP через индивидуальный GET запрос
             try:
+                api_checks += 1
                 existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_with_mask)
                 if existing_ip is not None:
                     continue
             except Exception:
                 # IP не найден, можно создавать
                 pass
-            
-            filtered_arp.append(arp_entry)
 
-        if not filtered_arp:
-            return
+            # Получаем DNS имя
+            dns_count += 1
+            dns_name = get_dns_name(arp_entry['address'])
 
-        # Собираем IP адреса для асинхронного DNS разрешения
-        ip_addresses = [arp_entry['address'] for arp_entry in filtered_arp]
-        
-        # Асинхронно разрешаем DNS имена
-        dns_results = asyncio.run(resolve_dns_batch(ip_addresses))
-
-        # Обрабатываем каждую ARP запись с готовыми DNS именами
-        for arp_entry in filtered_arp:
-            dns_name = dns_results.get(arp_entry['address'], '')
+            # Создаем IP-адрес
+            api_creates += 1
             create_ip_address_in_nautobot_global(nautobot_api, arp_entry, dns_name, nautobot_device.name)
+
+        log_device_timing(nautobot_device.name, 'dns_lookups_global', dns_count)
+        log_device_timing(nautobot_device.name, 'api_checks_global', api_checks)
+        log_device_timing(nautobot_device.name, 'api_creates_global', api_creates)
+        log_device_timing(nautobot_device.name, 'process_global_arp_table', time.time() - start_time)
 
     except Exception as error:
         logger.error(f'Error processing global ARP table for device {nautobot_device.name}: {error}')
+        log_device_timing(nautobot_device.name, 'process_global_arp_table', time.time() - start_time)
 
 
 def get_ips_in_vrf(nautobot_api, vrf_id, vrf_name):
@@ -468,10 +462,13 @@ def create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf
 
 
 def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
-    """Обрабатывает ARP записи для устройств Cisco IOS с асинхронным DNS."""
+    """Обрабатывает ARP записи для устройств Cisco IOS."""
+    device_start_time = time.time()
+    
     net_connect = netmiko_connect_with_retry(nautobot_device, 'cisco_ios')
 
     if not net_connect:
+        log_device_timing(nautobot_device.name, 'total_device_time', time.time() - device_start_time)
         return
 
     try:
@@ -479,24 +476,44 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
         process_global_arp_table(net_connect, nautobot_device, nautobot_api, 'cisco_ios')
 
         # Обрабатываем VRF
+        vrf_start = time.time()
         device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
         existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
+        vrf_get_duration = time.time() - vrf_start
+        log_device_timing(nautobot_device.name, 'get_device_vrfs', vrf_get_duration)
+
+        total_dns_lookups = 0
+        total_api_checks = 0
+        total_api_creates = 0
 
         for vrf_name, vrf_id in existing_vrf_in_device.items():
+            vrf_process_start = time.time()
             try:
                 # Получаем IP-адреса в VRF
+                vrf_ips_start = time.time()
                 nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
+                vrf_ips_duration = time.time() - vrf_ips_start
+                log_device_timing(nautobot_device.name, f'get_vrf_ips_{vrf_name}', vrf_ips_duration)
 
                 # Получаем ARP-таблицу с устройства
+                cmd_start = time.time()
                 output = send_command_safe(net_connect, f'show ip arp vrf {vrf_name}')
+                cmd_duration = time.time() - cmd_start
+                log_device_timing(nautobot_device.name, f'show_ip_arp_vrf_{vrf_name}', cmd_duration)
+                
+                parse_start = time.time()
                 device_arp = parse_output(platform='cisco_ios', command='show ip arp', data=output)
+                parse_duration = time.time() - parse_start
+                log_device_timing(nautobot_device.name, f'parse_arp_vrf_{vrf_name}', parse_duration)
 
                 # Форматируем MAC-адреса
                 for arp_entry in device_arp:
                     arp_entry['mac'] = format_mac_address(arp_entry['mac'])
 
-                # Фильтруем ARP записи
-                filtered_arp = []
+                # Обрабатываем каждую ARP запись
+                vrf_dns_count = 0
+                vrf_api_creates = 0
+                
                 for arp_entry in device_arp:
                     skip_list = [
                         '192.168.0.0', '192.168.0.1', '192.168.0.2',
@@ -512,97 +529,175 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api):
                     if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
                         continue
 
-                    # Создаем IP-адрес, если его нет в VRF
+                    # Получаем DNS имя
                     ip_with_mask = f"{arp_entry['address']}/32"
                     if ip_with_mask not in nautobot_device_arp:
-                        filtered_arp.append(arp_entry)
-
-                if not filtered_arp:
-                    continue
-
-                # Собираем IP адреса для асинхронного DNS разрешения
-                ip_addresses = [arp_entry['address'] for arp_entry in filtered_arp]
+                        vrf_dns_count += 1
+                        dns_name = get_dns_name(arp_entry['address'])
+                        vrf_api_creates += 1
+                        create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name,
+                                                      nautobot_device.name)
                 
-                # Асинхронно разрешаем DNS имена
-                dns_results = asyncio.run(resolve_dns_batch(ip_addresses))
-
-                # Обрабатываем каждую ARP запись с готовыми DNS именами
-                for arp_entry in filtered_arp:
-                    dns_name = dns_results.get(arp_entry['address'], '')
-                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name,
-                                                  nautobot_device.name)
-                    
+                total_dns_lookups += vrf_dns_count
+                total_api_creates += vrf_api_creates
+                
+                vrf_process_duration = time.time() - vrf_process_start
+                log_device_timing(nautobot_device.name, f'process_vrf_{vrf_name}', vrf_process_duration)
+                log_device_timing(nautobot_device.name, f'dns_lookups_vrf_{vrf_name}', vrf_dns_count)
+                log_device_timing(nautobot_device.name, f'api_creates_vrf_{vrf_name}', vrf_api_creates)
+                
             except Exception as vrf_error:
                 logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
 
+        log_device_timing(nautobot_device.name, 'total_dns_lookups', total_dns_lookups)
+        log_device_timing(nautobot_device.name, 'total_api_creates', total_api_creates)
+        
         net_connect.disconnect()
 
     except Exception as error:
         logger.error(f'Error processing device {nautobot_device.name}: {error}')
+    
+    finally:
+        total_device_time = time.time() - device_start_time
+        log_device_timing(nautobot_device.name, 'total_device_time', total_device_time)
 
 
-def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
-    """Обрабатывает ARP записи для устройств Cisco NXOS с асинхронным DNS."""
-    net_connect = netmiko_connect_with_retry(nautobot_device, 'cisco_nxos')
-
-    if not net_connect:
-        return
-
-    try:
-        # Обрабатываем глобальную ARP таблицу
-        process_global_arp_table(net_connect, nautobot_device, nautobot_api, 'cisco_nxos')
-
-        # Обрабатываем VRF
-        device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
-        existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
-
-        for vrf_name, vrf_id in existing_vrf_in_device.items():
-            try:
-                # Получаем IP-адреса в VRF
-                nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
-
-                # Получаем ARP-таблицу с устройства
-                output = send_command_safe(net_connect, f'show ip arp vrf {vrf_name}')
-                device_arp = parse_output(platform='cisco_nxos', command='show ip arp', data=output)
-
-                # Форматируем MAC-адреса
-                for arp_entry in device_arp:
-                    arp_entry['mac'] = format_mac_address(arp_entry['mac'])
-
-                # Фильтруем ARP записи
-                filtered_arp = []
-                for arp_entry in device_arp:
-                    # Пропускаем неполные MAC-адреса
-                    if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
-                        continue
-
-                    # Создаем IP-адрес, если его нет в VRF
-                    ip_with_mask = f"{arp_entry['address']}/32"
-                    if ip_with_mask not in nautobot_device_arp:
-                        filtered_arp.append(arp_entry)
-
-                if not filtered_arp:
-                    continue
-
-                # Собираем IP адреса для асинхронного DNS разрешения
-                ip_addresses = [arp_entry['address'] for arp_entry in filtered_arp]
-                
-                # Асинхронно разрешаем DNS имена
-                dns_results = asyncio.run(resolve_dns_batch(ip_addresses))
-
-                # Обрабатываем каждую ARP запись с готовыми DNS именами
-                for arp_entry in filtered_arp:
-                    dns_name = dns_results.get(arp_entry['address'], '')
-                    create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name,
-                                                  nautobot_device.name)
-                    
-            except Exception as vrf_error:
-                logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
-
-        net_connect.disconnect()
-
-    except Exception as error:
-        logger.error(f'Error processing device {nautobot_device.name}: {error}')
+def print_device_timing_stats():
+    """Выводит статистику по времени выполнения для каждого устройства."""
+    print("\n" + "="*100)
+    print("DEVICE PERFORMANCE STATISTICS")
+    print("="*100)
+    
+    # Сортируем устройства по общему времени выполнения (убывание)
+    sorted_devices = sorted(
+        device_timings.items(),
+        key=lambda x: x[1].get('total_device_time', 0),
+        reverse=True
+    )
+    
+    # Топ 20 самых медленных устройств
+    print(f"\nTOP 20 SLOWEST DEVICES (by total processing time):")
+    print("-" * 100)
+    print(f"{'#':<3} {'Device Name':<30} {'Total Time':<12} {'Connect':<10} {'DNS Lookups':<12} {'API Creates':<12}")
+    print("-" * 100)
+    
+    for i, (device_name, timings) in enumerate(sorted_devices[:20], 1):
+        total_time = timings.get('total_device_time', 0)
+        connect_time = timings.get('netmiko_connect', 0)
+        dns_lookups = timings.get('total_dns_lookups', 0)
+        api_creates = timings.get('total_api_creates', 0)
+        
+        print(f"{i:<3} {device_name:<30} {total_time:<12.2f} {connect_time:<10.2f} {dns_lookups:<12} {api_creates:<12}")
+    
+    # Детальная статистика для топ 10
+    print(f"\n\nDETAILED BREAKDOWN FOR TOP 10 SLOWEST DEVICES:")
+    print("=" * 120)
+    
+    for i, (device_name, timings) in enumerate(sorted_devices[:10], 1):
+        print(f"\n{i}. {device_name} (Total: {timings.get('total_device_time', 0):.2f}s)")
+        print("-" * 80)
+        
+        # Группируем операции по категориям
+        connection_ops = {}
+        global_ops = {}
+        vrf_ops = {}
+        other_ops = {}
+        
+        for operation, duration in timings.items():
+            if 'connect' in operation:
+                connection_ops[operation] = duration
+            elif 'global' in operation:
+                global_ops[operation] = duration
+            elif 'vrf' in operation:
+                vrf_ops[operation] = duration
+            elif operation not in ['total_device_time', 'total_dns_lookups', 'total_api_creates']:
+                other_ops[operation] = duration
+        
+        # Выводим по категориям
+        if connection_ops:
+            print("  Connection Operations:")
+            for op, dur in sorted(connection_ops.items(), key=lambda x: x[1], reverse=True):
+                if isinstance(dur, (int, float)):
+                    print(f"    {op:<35}: {dur:>8.2f}s")
+                else:
+                    print(f"    {op:<35}: {dur:>8}")
+        
+        if global_ops:
+            print("  Global ARP Operations:")
+            for op, dur in sorted(global_ops.items(), key=lambda x: x[1] if isinstance(x[1], (int, float)) else 0, reverse=True):
+                if isinstance(dur, (int, float)):
+                    print(f"    {op:<35}: {dur:>8.2f}s")
+                else:
+                    print(f"    {op:<35}: {dur:>8}")
+        
+        if other_ops:
+            print("  Other Operations:")
+            for op, dur in sorted(other_ops.items(), key=lambda x: x[1] if isinstance(x[1], (int, float)) else 0, reverse=True):
+                if isinstance(dur, (int, float)):
+                    print(f"    {op:<35}: {dur:>8.2f}s")
+                else:
+                    print(f"    {op:<35}: {dur:>8}")
+        
+        # VRF операции группируем отдельно
+        vrf_groups = {}
+        for op, dur in vrf_ops.items():
+            vrf_name = op.split('_')[-1] if '_' in op else 'unknown'
+            if vrf_name not in vrf_groups:
+                vrf_groups[vrf_name] = {}
+            vrf_groups[vrf_name][op] = dur
+        
+        if vrf_groups:
+            print("  VRF Operations:")
+            for vrf_name, vrf_timings in vrf_groups.items():
+                total_vrf_time = sum(v for v in vrf_timings.values() if isinstance(v, (int, float)))
+                print(f"    VRF '{vrf_name}' (Total: {total_vrf_time:.2f}s):")
+                for op, dur in sorted(vrf_timings.items(), key=lambda x: x[1] if isinstance(x[1], (int, float)) else 0, reverse=True):
+                    if isinstance(dur, (int, float)):
+                        print(f"      {op:<33}: {dur:>8.2f}s")
+                    else:
+                        print(f"      {op:<33}: {dur:>8}")
+    
+    # Общая статистика
+    print(f"\n\nOVERALL STATISTICS:")
+    print("=" * 60)
+    
+    total_devices = len(device_timings)
+    total_script_time = sum(timings.get('total_device_time', 0) for timings in device_timings.values())
+    total_dns_lookups = sum(timings.get('total_dns_lookups', 0) for timings in device_timings.values())
+    total_api_creates = sum(timings.get('total_api_creates', 0) for timings in device_timings.values())
+    
+    avg_device_time = total_script_time / total_devices if total_devices > 0 else 0
+    
+    print(f"Total devices processed: {total_devices}")
+    print(f"Total processing time: {total_script_time:.2f}s")
+    print(f"Average time per device: {avg_device_time:.2f}s")
+    print(f"Total DNS lookups: {total_dns_lookups}")
+    print(f"Total API creates: {total_api_creates}")
+    
+    if total_dns_lookups > 0:
+        avg_dns_time = total_script_time / total_dns_lookups
+        print(f"Average time per DNS lookup: {avg_dns_time:.3f}s")
+    
+    # Статистика по операциям
+    print(f"\n\nOPERATION STATISTICS:")
+    print("-" * 60)
+    
+    operation_stats = defaultdict(list)
+    for device_name, timings in device_timings.items():
+        for operation, duration in timings.items():
+            if isinstance(duration, (int, float)) and operation != 'total_device_time':
+                operation_stats[operation].append(duration)
+    
+    print(f"{'Operation':<35} {'Count':<8} {'Total':<10} {'Avg':<10} {'Max':<10}")
+    print("-" * 60)
+    
+    for operation, durations in sorted(operation_stats.items()):
+        if durations:
+            count = len(durations)
+            total = sum(durations)
+            avg = total / count
+            max_dur = max(durations)
+            print(f"{operation:<35} {count:<8} {total:<10.2f} {avg:<10.3f} {max_dur:<10.2f}")
 
 
 def add_arp_entry_to_nautobot():
@@ -627,23 +722,122 @@ def add_arp_entry_to_nautobot():
 
     # Многопоточная обработка устройств
     with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        futures = []
         for nautobot_device in target_devices:
-                if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
-                    executor.submit(
-                        create_arp_nautobot_on_cisco_nxos,
-                        nautobot_device,
-                        api,
-                    )
-                elif nautobot_device.platform and nautobot_device.platform.name == 'Cisco IOS':
-                    executor.submit(
-                        create_arp_nautobot_on_cisco_ios,
-                        nautobot_device,
-                        api,
-                    )
+            if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
+                future = executor.submit(
+                    create_arp_nautobot_on_cisco_nxos,
+                    nautobot_device,
+                    api,
+                )
+                futures.append(future)
+            elif nautobot_device.platform and nautobot_device.platform.name == 'Cisco IOS':
+                future = executor.submit(
+                    create_arp_nautobot_on_cisco_ios,
+                    nautobot_device,
+                    api,
+                )
+                futures.append(future)
+        
+        # Ждем завершения всех задач
+        concurrent.futures.wait(futures)
 
     execution_time = time.time() - start_time
     print(f"Script execution completed in {execution_time:.2f} seconds")
+    
+    # Выводим детальную статистику
+    print_device_timing_stats()
 
 
 if __name__ == "__main__":
-    add_arp_entry_to_nautobot()
+    add_arp_entry_to_nautobot()_start_time
+        log_device_timing(nautobot_device.name, 'total_device_time', total_device_time)
+
+
+def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api):
+    """Обрабатывает ARP записи для устройств Cisco NXOS."""
+    device_start_time = time.time()
+    
+    net_connect = netmiko_connect_with_retry(nautobot_device, 'cisco_nxos')
+
+    if not net_connect:
+        log_device_timing(nautobot_device.name, 'total_device_time', time.time() - device_start_time)
+        return
+
+    try:
+        # Обрабатываем глобальную ARP таблицу
+        process_global_arp_table(net_connect, nautobot_device, nautobot_api, 'cisco_nxos')
+
+        # Обрабатываем VRF
+        vrf_start = time.time()
+        device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
+        existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
+        vrf_get_duration = time.time() - vrf_start
+        log_device_timing(nautobot_device.name, 'get_device_vrfs', vrf_get_duration)
+
+        total_dns_lookups = 0
+        total_api_creates = 0
+
+        for vrf_name, vrf_id in existing_vrf_in_device.items():
+            vrf_process_start = time.time()
+            try:
+                # Получаем IP-адреса в VRF
+                vrf_ips_start = time.time()
+                nautobot_device_arp = get_ips_in_vrf(nautobot_api, vrf_id, vrf_name)
+                vrf_ips_duration = time.time() - vrf_ips_start
+                log_device_timing(nautobot_device.name, f'get_vrf_ips_{vrf_name}', vrf_ips_duration)
+
+                # Получаем ARP-таблицу с устройства
+                cmd_start = time.time()
+                output = send_command_safe(net_connect, f'show ip arp vrf {vrf_name}')
+                cmd_duration = time.time() - cmd_start
+                log_device_timing(nautobot_device.name, f'show_ip_arp_vrf_{vrf_name}', cmd_duration)
+                
+                parse_start = time.time()
+                device_arp = parse_output(platform='cisco_nxos', command='show ip arp', data=output)
+                parse_duration = time.time() - parse_start
+                log_device_timing(nautobot_device.name, f'parse_arp_vrf_{vrf_name}', parse_duration)
+
+                # Форматируем MAC-адреса
+                for arp_entry in device_arp:
+                    arp_entry['mac'] = format_mac_address(arp_entry['mac'])
+
+                # Обрабатываем каждую ARP запись
+                vrf_dns_count = 0
+                vrf_api_creates = 0
+                
+                for arp_entry in device_arp:
+                    # Пропускаем неполные MAC-адреса
+                    if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
+                        continue
+
+                    # Получаем DNS имя
+                    ip_with_mask = f"{arp_entry['address']}/32"
+                    if ip_with_mask not in nautobot_device_arp:
+                        vrf_dns_count += 1
+                        dns_name = get_dns_name(arp_entry['address'])
+                        vrf_api_creates += 1
+                        create_ip_address_in_nautobot(nautobot_api, arp_entry, dns_name, vrf_id, vrf_name,
+                                                      nautobot_device.name)
+                
+                total_dns_lookups += vrf_dns_count
+                total_api_creates += vrf_api_creates
+                
+                vrf_process_duration = time.time() - vrf_process_start
+                log_device_timing(nautobot_device.name, f'process_vrf_{vrf_name}', vrf_process_duration)
+                log_device_timing(nautobot_device.name, f'dns_lookups_vrf_{vrf_name}', vrf_dns_count)
+                log_device_timing(nautobot_device.name, f'api_creates_vrf_{vrf_name}', vrf_api_creates)
+                
+            except Exception as vrf_error:
+                logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
+
+        log_device_timing(nautobot_device.name, 'total_dns_lookups', total_dns_lookups)
+        log_device_timing(nautobot_device.name, 'total_api_creates', total_api_creates)
+        
+        net_connect.disconnect()
+
+    except Exception as error:
+        logger.error(f'Error processing device {nautobot_device.name}: {error}')
+    
+    finally:
+        total_device_time = time.time() - device

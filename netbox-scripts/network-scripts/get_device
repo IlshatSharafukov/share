@@ -1,0 +1,318 @@
+# Script to import devices from HPNA into Nautobot (using PyNautobot)
+import pynautobot
+import urllib3
+import re
+from decouple import config
+import time
+from hpnapy import *
+import concurrent.futures
+import os
+
+set_ipam_device = set()
+set_hpna_device = set()
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+HPNA_LOGIN = config('HPNA_LOGIN')
+HPNA_PASSWORD = config('HPNA_PASSWORD')
+NAUTOBOT_URL = config('NAUTOBOT_URL')
+NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
+
+location_map = {
+    'MSKX5': r'MSKX5',
+    'MSK34': r'MSK34',
+    'MSK70': r'MSK70',
+    'MSKD8': r'MSKD8',
+}
+
+roles = {
+    'BA-': 'LOAD BALANCER',
+    'FX-': 'FABRIC NEXUS',
+    'MS-': 'MULTILAYER SWITCH',
+    'MX-': 'MULTILAYER SWITCH WITH ADDITIONAL FUNCTIONS',
+    'ND-': 'NETWORK DEVICE',
+    'QSW': 'SWITCH',
+    'RT-': 'ROUTER',
+    'SW-': 'SWITCH',
+    'TS-': 'TERMINAL SERVER',
+    'NX-': 'SWITCH',
+    'FW-': 'FIREWALL'
+}
+
+device_role_map = {
+    'QSW': 'switch',
+    'MS-': 'switch',
+    'MX-': 'switch',
+    'SW-': 'switch',
+    'NX-': 'switch',
+    'FX-': 'switch'
+}
+
+
+def update_interface(nautobot_api, hpna_device_ip, device_hostname):
+    try:
+        device_ip = nautobot_api.ipam.ip_addresses.get(address=hpna_device_ip)
+        device_interface = nautobot_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname)
+        device_record = nautobot_api.dcim.devices.get(name=device_hostname)
+        nautobot_api.ipam.ip_address_to_interface.create({
+            "ip_address": device_ip.id,
+            "interface": device_interface.id
+        })
+        device_record.update({'primary_ip4': device_ip.id})
+    except Exception as err:
+        print(f"Failed to update device mgmt interface {device_hostname}: {err}")
+
+
+def fetch_device_role_for_vlan_group(device_hostname):
+    device_role = 'UNKNOWN'
+    for prefix, role in device_role_map.items():
+        if device_hostname.lower().startswith(prefix.lower()):
+            device_role = role
+            break
+    return device_role
+
+
+def generate_device_model_slug(device_model):
+    slug = device_model.lower()
+    slug = re.sub(r'\s+', '_', slug)
+    slug = re.sub(r'[^a-z0-9_]', '_', slug)
+    return slug
+
+
+def generate_slug(input_string):
+    slug = input_string.lower()
+    slug = re.sub(r'\s+', '_', slug)
+    slug = re.sub(r'[^a-z0-9_]', '_', slug)
+    return slug
+
+
+def fetch_device_role(device_hostname):
+    device_role = 'UNKNOWN'
+    for prefix, role in roles.items():
+        if device_hostname.startswith(prefix):
+            device_role = role
+            break
+    return device_role
+
+
+def nautobot_connection():
+    nautobot_api = pynautobot.api(
+        NAUTOBOT_URL,
+        token=NAUTOBOT_TOKEN,
+        threading=True
+    )
+    nautobot_api.http_session.verify = False
+    return nautobot_api
+
+
+def get_location(device_hostname):
+    for location, pattern in location_map.items():
+        if re.search(pattern, device_hostname):
+            return location
+    return 'BRANCH'
+
+
+def hpna_connection():
+    hpna_api = NAInterface("https://hpna.raiffeisen.ru", ssl_verify=False)
+    hpna_api.login(config('HPNA_WEB_LOGIN'), config('HPNA_WEB_PASSWORD'))
+    return hpna_api
+
+
+def add_new_device_to_nautobot(hpna_api_device_entry, nautobot_api, hpna_api):
+    device_hostname = re.sub(r'\.(net\.pri|NET\.PRI)$', '', str(hpna_api_device_entry.hostName)).upper()
+    set_hpna_device.add(device_hostname)
+    hpna_device_ip = hpna_api_device_entry.primaryIPAddress
+    hpna_device_vendor = hpna_api_device_entry.vendor or 'UNKNOWN'
+    hpna_device_model = hpna_api_device_entry.model or 'UNKNOWN'
+    try:
+        hpna_device_family = hpna_api.show_device_family(ip=str(hpna_device_ip))
+    except Exception:
+        hpna_device_family = 'UNKNOWN'
+
+    if hpna_device_ip is None or re.match(r'^\d+\.\d+\.\d+\.\d+$', device_hostname):
+        return
+    if hpna_device_vendor and hpna_device_model in (' ', None, 'UNKNOWN', ''):
+        return
+
+    device_hpna_location = get_location(device_hostname)
+    device_hpna_role = fetch_device_role(device_hostname)
+
+    if nautobot_api.extras.roles.get(name=device_hpna_role) is None:
+        try:
+            nautobot_api.extras.roles.create(name=device_hpna_role)
+        except pynautobot.RequestError as err:
+            print(f"Failed to create device role '{device_hpna_role}' for {device_hostname}: {err}")
+    if nautobot_api.extras.tags.get(name=device_hpna_role) is None:
+        try:
+            nautobot_api.extras.tags.create({
+                "name": device_hpna_role,
+                "content_types": ["dcim.device"]
+            })
+        except pynautobot.RequestError as err:
+            print(f"Failed to create tag '{device_hpna_role}' for {device_hostname}: {err}")
+    if nautobot_api.dcim.manufacturers.get(name=hpna_device_vendor) is None:
+        try:
+            nautobot_api.dcim.manufacturers.create(name=hpna_device_vendor)
+        except pynautobot.RequestError as err:
+            print(f"Failed to create manufacturer '{hpna_device_vendor}' for {device_hostname}: {err}")
+    if nautobot_api.dcim.device_types.get(model=hpna_device_model) is None:
+        try:
+            manufacturer_obj = nautobot_api.dcim.manufacturers.get(name=hpna_device_vendor)
+            nautobot_api.dcim.device_types.create(model=hpna_device_model, manufacturer=manufacturer_obj.id,)
+        except pynautobot.RequestError as err:
+            print(f"Failed to create device type '{hpna_device_model}' for {device_hostname}: {err}")
+    if nautobot_api.dcim.platforms.get(name=hpna_device_family) is None:
+        try:
+            nautobot_api.dcim.platforms.create(name=hpna_device_family)
+        except pynautobot.RequestError as err:
+            print(f"Failed to create platform '{hpna_device_family}' for {device_hostname}: {err}")
+
+    try:
+        device_role_id = nautobot_api.extras.roles.get(name=device_hpna_role).id
+    except pynautobot.RequestError:
+        device_role_id = 10
+        print(f"Failed to get device role for {device_hostname}, using default ID {device_role_id}")
+    try:
+        device_type_id = nautobot_api.dcim.device_types.get(model=hpna_device_model).id
+    except pynautobot.RequestError:
+        device_type_id = 58
+        print(f"Failed to get device type for {device_hostname}, using default ID {device_type_id}")
+    try:
+        location_id = nautobot_api.dcim.locations.get(name=device_hpna_location).id
+    except pynautobot.RequestError:
+        location_id = 'de6a0b63-984a-47d7-b290-d649227c629d'
+        print(f"Failed to get location_id '{device_hpna_location}' for {device_hostname}, using default ID {location_id}")
+    try:
+        platform_id = nautobot_api.dcim.platforms.get(name=hpna_device_family).id
+    except pynautobot.RequestError:
+        platform_id = 2
+        print(f"Failed to get platform '{hpna_device_family}' for {device_hostname}, using default ID {platform_id}")
+
+    print(hpna_device_ip)
+
+    if nautobot_api.dcim.devices.get(name=device_hostname) is None:
+        try:
+            nautobot_api.dcim.devices.create(
+                name=device_hostname,
+                role=device_role_id,
+                device_type=device_type_id,
+                location=location_id,
+                platform=platform_id,
+                status='Active',
+                tags=[{'name': device_hpna_role}, {'name': 'raif_scripts'}]
+            )
+        except pynautobot.RequestError as err:
+            print(f"Failed to create device {device_hostname}: {err}")
+
+        try:
+            nautobot_api.dcim.interfaces.create(
+                device=nautobot_api.dcim.devices.get(name=device_hostname).id,
+                name='mgmt interface',
+                status='Active',
+                type='virtual',
+                mtu='1500',
+                description='this interface needed for management of the device',
+                mgmt_only=True
+            )
+        except pynautobot.RequestError as err:
+            print(f"Failed to create mgmt interface on {device_hostname}: {err}")
+
+        if nautobot_api.ipam.ip_addresses.get(address=hpna_device_ip) is None:
+            try:
+                nautobot_api.ipam.ip_addresses.create(
+                    address=hpna_device_ip,
+                    status='Active',
+                    namespace='ed1a3ab7-deea-4872-b111-b44513de94a8',
+                    description='int lo0 - management IP for device'
+                )
+            except pynautobot.RequestError as err:
+                print(f"Failed to create IP address {hpna_device_ip} for {device_hostname}: {err}")
+        update_interface(nautobot_api, hpna_device_ip, device_hostname)
+
+    else:
+        if nautobot_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname) is None:
+            try:
+                nautobot_api.dcim.interfaces.create(
+                    device=nautobot_api.dcim.devices.get(name=device_hostname).id,
+                    name='mgmt interface',
+                    status='Active',
+                    type='virtual',
+                    mtu='1500',
+                    description='this interface needed for management of the device',
+                    mgmt_only=True
+                )
+            except pynautobot.RequestError as err:
+                print(f"Failed to create mgmt interface on existing device {device_hostname}: {err}")
+
+        device_interface = nautobot_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname)
+        if device_interface.ip_address_count != 1:
+
+            if nautobot_api.ipam.ip_addresses.get(address=hpna_device_ip) is None:
+                try:
+                    nautobot_api.ipam.ip_addresses.create(
+                        address=hpna_device_ip,
+                        status='Active',
+                        namespace='ed1a3ab7-deea-4872-b111-b44513de94a8',
+                        description='int lo0 - management IP for device'
+                    )
+                except pynautobot.RequestError as err:
+                    print(f"Failed to create IP address {hpna_device_ip} for {device_hostname}: {err}")
+            update_interface(nautobot_api, hpna_device_ip, device_hostname)
+
+
+def processing_hpna_device_list():
+    start_time = time.time()
+    nautobot_api = nautobot_connection()
+    hpna_api = hpna_connection()
+    hpna_device_list = hpna_api.list_device()
+    prefix_destruction_count = 0
+
+    #with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+    for device in hpna_device_list:
+        add_new_device_to_nautobot(device, nautobot_api, hpna_api)
+
+    devices_in_nautobot = nautobot_api.dcim.devices.all()
+    for device_nautobot in devices_in_nautobot:
+        nautobot_device_tags = str(device_nautobot.tags)
+        if 'raif_scripts' in nautobot_device_tags:
+            set_ipam_device.add(device_nautobot.name)
+    for device_hpna in hpna_device_list:
+        set_hpna_device.add(
+            re.sub(r'\.(net\.pri|NET\.PRI|RBRU\.PRI|rbru\.pri)$', '', str(device_hpna.hostName)).upper())
+
+    set_ipam_device.difference_update(set_hpna_device)
+    for device_for_remove in set_ipam_device:
+        device_to_delete = nautobot_api.dcim.devices.get(name=device_for_remove)
+        print(f"Removing device not found in HPNA: {device_to_delete}")
+        prefix_destruction_count += 1
+        try:
+            ip_for_delete = device_to_delete.primary_ip
+        except AttributeError:
+            ip_for_delete = None
+        if ip_for_delete is not None:
+            ip_for_delete.delete()
+        delete_ip_address_filter = nautobot_api.ipam.ip_addresses.filter(cf_Device=device_to_delete.id)
+        for ip_entry in delete_ip_address_filter:
+            ip_entry.delete()
+        delete_prefix_filter = nautobot_api.ipam.prefixes.filter(description=device_to_delete.name)
+        for prefix_entry in delete_prefix_filter:
+            prefix_entry.delete()
+        try:
+            vlan_group = nautobot_api.ipam.vlan_groups.get(name=device_for_remove)
+            vlans_in_group = nautobot_api.ipam.vlans.filter(group_id=vlan_group.id)
+            for vlan in vlans_in_group:
+                vlan.delete()
+        except Exception:
+            print(f"Error while deleting VLANs for device {device_for_remove}")
+        delete_vlan_groups_filter = nautobot_api.ipam.vlan_groups.filter(name=device_to_delete.name)
+        for vlan_group_entry in delete_vlan_groups_filter:
+            vlan_group_entry.delete()
+        delete_vrfs_filter = nautobot_api.ipam.vrfs.filter(cf_device=device_to_delete.id)
+        for vrf_entry in delete_vrfs_filter:
+            vrf_entry.delete()
+        device_to_delete.delete()
+
+    print(f"--- {time.time() - start_time:.2f} seconds ---")
+
+
+if __name__ == "__main__":
+    processing_hpna_device_list()

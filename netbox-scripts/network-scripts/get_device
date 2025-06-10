@@ -7,312 +7,689 @@ import time
 from hpnapy import *
 import concurrent.futures
 import os
+from typing import Optional, Dict, Any, Set
+from dataclasses import dataclass
 
-set_ipam_device = set()
-set_hpna_device = set()
+
+# Отключаем предупреждения SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-HPNA_LOGIN = config('HPNA_LOGIN')
-HPNA_PASSWORD = config('HPNA_PASSWORD')
-NAUTOBOT_URL = config('NAUTOBOT_URL')
-NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
 
-location_map = {
-    'MSKX5': r'MSKX5',
-    'MSK34': r'MSK34',
-    'MSK70': r'MSK70',
-    'MSKD8': r'MSKD8',
-}
-
-roles = {
-    'BA-': 'LOAD BALANCER',
-    'FX-': 'FABRIC NEXUS',
-    'MS-': 'MULTILAYER SWITCH',
-    'MX-': 'MULTILAYER SWITCH WITH ADDITIONAL FUNCTIONS',
-    'ND-': 'NETWORK DEVICE',
-    'QSW': 'SWITCH',
-    'RT-': 'ROUTER',
-    'SW-': 'SWITCH',
-    'TS-': 'TERMINAL SERVER',
-    'NX-': 'SWITCH',
-    'FW-': 'FIREWALL'
-}
-
-device_role_map = {
-    'QSW': 'switch',
-    'MS-': 'switch',
-    'MX-': 'switch',
-    'SW-': 'switch',
-    'NX-': 'switch',
-    'FX-': 'switch'
-}
+@dataclass
+class Config:
+    """Конфигурация приложения"""
+    HPNA_LOGIN: str = config('HPNA_LOGIN')
+    HPNA_PASSWORD: str = config('HPNA_PASSWORD')
+    HPNA_WEB_LOGIN: str = config('HPNA_WEB_LOGIN')
+    HPNA_WEB_PASSWORD: str = config('HPNA_WEB_PASSWORD')
+    NAUTOBOT_URL: str = config('NAUTOBOT_URL')
+    NAUTOBOT_TOKEN: str = config('NAUTOBOT_TOKEN')
+    NAMESPACE_ID: str = 'ed1a3ab7-deea-4872-b111-b44513de94a8'
+    
+    # Дефолтные ID для fallback
+    DEFAULT_DEVICE_ROLE_ID: int = 10
+    DEFAULT_DEVICE_TYPE_ID: int = 58
+    DEFAULT_LOCATION_ID: str = 'de6a0b63-984a-47d7-b290-d649227c629d'
+    DEFAULT_PLATFORM_ID: int = 2
 
 
-def update_interface(nautobot_api, hpna_device_ip, device_hostname):
-    try:
-        device_ip = nautobot_api.ipam.ip_addresses.get(address=hpna_device_ip)
-        device_interface = nautobot_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname)
-        device_record = nautobot_api.dcim.devices.get(name=device_hostname)
-        nautobot_api.ipam.ip_address_to_interface.create({
-            "ip_address": device_ip.id,
-            "interface": device_interface.id
-        })
-        device_record.update({'primary_ip4': device_ip.id})
-    except Exception as err:
-        print(f"Failed to update device mgmt interface {device_hostname}: {err}")
+class Constants:
+    """Константы приложения"""
+    
+    LOCATION_MAP = {
+        'MSKX5': r'MSKX5',
+        'MSK34': r'MSK34',
+        'MSK70': r'MSK70',
+        'MSKD8': r'MSKD8',
+    }
+    
+    DEVICE_ROLES = {
+        'BA-': 'LOAD BALANCER',
+        'FX-': 'FABRIC NEXUS',
+        'MS-': 'MULTILAYER SWITCH',
+        'MX-': 'MULTILAYER SWITCH WITH ADDITIONAL FUNCTIONS',
+        'ND-': 'NETWORK DEVICE',
+        'QSW': 'SWITCH',
+        'RT-': 'ROUTER',
+        'SW-': 'SWITCH',
+        'TS-': 'TERMINAL SERVER',
+        'NX-': 'SWITCH',
+        'FW-': 'FIREWALL'
+    }
+    
+    DEVICE_ROLE_MAP = {
+        'QSW': 'switch',
+        'MS-': 'switch',
+        'MX-': 'switch',
+        'SW-': 'switch',
+        'NX-': 'switch',
+        'FX-': 'switch'
+    }
+    
+    # Статусы
+    STATUS_ACTIVE = 'Active'
+    
+    # Теги
+    TAG_RAIF_SCRIPTS = 'raif_scripts'
+    
+    # Интерфейсы
+    MGMT_INTERFACE_NAME = 'mgmt interface'
+    MGMT_INTERFACE_TYPE = 'virtual'
+    MGMT_INTERFACE_MTU = '1500'
+    MGMT_INTERFACE_DESCRIPTION = 'this interface needed for management of the device'
+    
+    # Описания
+    MGMT_IP_DESCRIPTION = 'int lo0 - management IP for device'
 
 
-def fetch_device_role_for_vlan_group(device_hostname):
-    device_role = 'UNKNOWN'
-    for prefix, role in device_role_map.items():
-        if device_hostname.lower().startswith(prefix.lower()):
-            device_role = role
-            break
-    return device_role
+class HostnameProcessor:
+    """Класс для обработки имен хостов"""
+    
+    @staticmethod
+    def clean_hostname(hostname: str) -> str:
+        """Очищает hostname от доменных суффиксов"""
+        return re.sub(r'\.(net\.pri|NET\.PRI|RBRU\.PRI|rbru\.pri)$', '', str(hostname)).upper()
+    
+    @staticmethod
+    def get_location(hostname: str) -> str:
+        """Определяет локацию по имени хоста"""
+        for location, pattern in Constants.LOCATION_MAP.items():
+            if re.search(pattern, hostname):
+                return location
+        return 'BRANCH'
+    
+    @staticmethod
+    def get_device_role(hostname: str) -> str:
+        """Определяет роль устройства по имени хоста"""
+        for prefix, role in Constants.DEVICE_ROLES.items():
+            if hostname.startswith(prefix):
+                return role
+        return 'UNKNOWN'
 
 
-def generate_device_model_slug(device_model):
-    slug = device_model.lower()
-    slug = re.sub(r'\s+', '_', slug)
-    slug = re.sub(r'[^a-z0-9_]', '_', slug)
-    return slug
-
-
-def generate_slug(input_string):
-    slug = input_string.lower()
-    slug = re.sub(r'\s+', '_', slug)
-    slug = re.sub(r'[^a-z0-9_]', '_', slug)
-    return slug
-
-
-def fetch_device_role(device_hostname):
-    device_role = 'UNKNOWN'
-    for prefix, role in roles.items():
-        if device_hostname.startswith(prefix):
-            device_role = role
-            break
-    return device_role
-
-
-def nautobot_connection():
-    nautobot_api = pynautobot.api(
-        NAUTOBOT_URL,
-        token=NAUTOBOT_TOKEN,
-        threading=True
-    )
-    nautobot_api.http_session.verify = False
-    return nautobot_api
-
-
-def get_location(device_hostname):
-    for location, pattern in location_map.items():
-        if re.search(pattern, device_hostname):
-            return location
-    return 'BRANCH'
-
-
-def hpna_connection():
-    hpna_api = NAInterface("https://hpna.raiffeisen.ru", ssl_verify=False)
-    hpna_api.login(config('HPNA_WEB_LOGIN'), config('HPNA_WEB_PASSWORD'))
-    return hpna_api
-
-
-def add_new_device_to_nautobot(hpna_api_device_entry, nautobot_api, hpna_api):
-    device_hostname = re.sub(r'\.(net\.pri|NET\.PRI)$', '', str(hpna_api_device_entry.hostName)).upper()
-    set_hpna_device.add(device_hostname)
-    hpna_device_ip = hpna_api_device_entry.primaryIPAddress
-    hpna_device_vendor = hpna_api_device_entry.vendor or 'UNKNOWN'
-    hpna_device_model = hpna_api_device_entry.model or 'UNKNOWN'
-    try:
-        hpna_device_family = hpna_api.show_device_family(ip=str(hpna_device_ip))
-    except Exception:
-        hpna_device_family = 'UNKNOWN'
-
-    if hpna_device_ip is None or re.match(r'^\d+\.\d+\.\d+\.\d+$', device_hostname):
-        return
-    if hpna_device_vendor and hpna_device_model in (' ', None, 'UNKNOWN', ''):
-        return
-
-    device_hpna_location = get_location(device_hostname)
-    device_hpna_role = fetch_device_role(device_hostname)
-
-    if nautobot_api.extras.roles.get(name=device_hpna_role) is None:
+class NautobotObjectManager:
+    """Менеджер для создания и управления объектами Nautobot"""
+    
+    def __init__(self, api: pynautobot.api, config: Config):
+        self.api = api
+        self.config = config
+    
+    def _handle_creation_error(self, object_type: str, name: str, error: Exception, hostname: str = ""):
+        """Единая обработка ошибок создания объектов"""
+        print(f"Failed to create {object_type} '{name}' for {hostname}: {error}")
+    
+    def ensure_role_exists(self, role_name: str, hostname: str = "") -> Optional[str]:
+        """Создает роль, если её нет, и возвращает ID"""
+        role = self.api.extras.roles.get(name=role_name)
+        if role is None:
+            try:
+                role = self.api.extras.roles.create(name=role_name)
+                return role.id
+            except pynautobot.RequestError as err:
+                self._handle_creation_error("device role", role_name, err, hostname)
+                return self.config.DEFAULT_DEVICE_ROLE_ID
+        return role.id
+    
+    def ensure_tag_exists(self, tag_name: str, hostname: str = "") -> bool:
+        """Создает тег, если его нет"""
+        tag = self.api.extras.tags.get(name=tag_name)
+        if tag is None:
+            try:
+                self.api.extras.tags.create({
+                    "name": tag_name,
+                    "content_types": ["dcim.device"]
+                })
+                return True
+            except pynautobot.RequestError as err:
+                self._handle_creation_error("tag", tag_name, err, hostname)
+                return False
+        return True
+    
+    def ensure_manufacturer_exists(self, manufacturer_name: str, hostname: str = "") -> bool:
+        """Создает производителя, если его нет"""
+        manufacturer = self.api.dcim.manufacturers.get(name=manufacturer_name)
+        if manufacturer is None:
+            try:
+                self.api.dcim.manufacturers.create(name=manufacturer_name)
+                return True
+            except pynautobot.RequestError as err:
+                self._handle_creation_error("manufacturer", manufacturer_name, err, hostname)
+                return False
+        return True
+    
+    def ensure_device_type_exists(self, model: str, vendor: str, hostname: str = "") -> Optional[str]:
+        """Создает тип устройства, если его нет, и возвращает ID"""
+        device_type = self.api.dcim.device_types.get(model=model)
+        if device_type is None:
+            try:
+                manufacturer = self.api.dcim.manufacturers.get(name=vendor)
+                if manufacturer:
+                    device_type = self.api.dcim.device_types.create(
+                        model=model, 
+                        manufacturer=manufacturer.id
+                    )
+                    return device_type.id
+            except pynautobot.RequestError as err:
+                self._handle_creation_error("device type", model, err, hostname)
+                return self.config.DEFAULT_DEVICE_TYPE_ID
+        return device_type.id if device_type else self.config.DEFAULT_DEVICE_TYPE_ID
+    
+    def ensure_platform_exists(self, platform_name: str, hostname: str = "") -> Optional[str]:
+        """Создает платформу, если её нет, и возвращает ID"""
+        platform = self.api.dcim.platforms.get(name=platform_name)
+        if platform is None:
+            try:
+                platform = self.api.dcim.platforms.create(name=platform_name)
+                return platform.id
+            except pynautobot.RequestError as err:
+                self._handle_creation_error("platform", platform_name, err, hostname)
+                return self.config.DEFAULT_PLATFORM_ID
+        return platform.id
+    
+    def get_location_id(self, location_name: str, hostname: str = "") -> str:
+        """Получает ID локации с fallback на дефолтную"""
         try:
-            nautobot_api.extras.roles.create(name=device_hpna_role)
-        except pynautobot.RequestError as err:
-            print(f"Failed to create device role '{device_hpna_role}' for {device_hostname}: {err}")
-    if nautobot_api.extras.tags.get(name=device_hpna_role) is None:
-        try:
-            nautobot_api.extras.tags.create({
-                "name": device_hpna_role,
-                "content_types": ["dcim.device"]
-            })
-        except pynautobot.RequestError as err:
-            print(f"Failed to create tag '{device_hpna_role}' for {device_hostname}: {err}")
-    if nautobot_api.dcim.manufacturers.get(name=hpna_device_vendor) is None:
-        try:
-            nautobot_api.dcim.manufacturers.create(name=hpna_device_vendor)
-        except pynautobot.RequestError as err:
-            print(f"Failed to create manufacturer '{hpna_device_vendor}' for {device_hostname}: {err}")
-    if nautobot_api.dcim.device_types.get(model=hpna_device_model) is None:
-        try:
-            manufacturer_obj = nautobot_api.dcim.manufacturers.get(name=hpna_device_vendor)
-            nautobot_api.dcim.device_types.create(model=hpna_device_model, manufacturer=manufacturer_obj.id,)
-        except pynautobot.RequestError as err:
-            print(f"Failed to create device type '{hpna_device_model}' for {device_hostname}: {err}")
-    if nautobot_api.dcim.platforms.get(name=hpna_device_family) is None:
-        try:
-            nautobot_api.dcim.platforms.create(name=hpna_device_family)
-        except pynautobot.RequestError as err:
-            print(f"Failed to create platform '{hpna_device_family}' for {device_hostname}: {err}")
+            location = self.api.dcim.locations.get(name=location_name)
+            return location.id if location else self.config.DEFAULT_LOCATION_ID
+        except pynautobot.RequestError:
+            print(f"Failed to get location_id '{location_name}' for {hostname}, using default")
+            return self.config.DEFAULT_LOCATION_ID
 
-    try:
-        device_role_id = nautobot_api.extras.roles.get(name=device_hpna_role).id
-    except pynautobot.RequestError:
-        device_role_id = 10
-        print(f"Failed to get device role for {device_hostname}, using default ID {device_role_id}")
-    try:
-        device_type_id = nautobot_api.dcim.device_types.get(model=hpna_device_model).id
-    except pynautobot.RequestError:
-        device_type_id = 58
-        print(f"Failed to get device type for {device_hostname}, using default ID {device_type_id}")
-    try:
-        location_id = nautobot_api.dcim.locations.get(name=device_hpna_location).id
-    except pynautobot.RequestError:
-        location_id = 'de6a0b63-984a-47d7-b290-d649227c629d'
-        print(f"Failed to get location_id '{device_hpna_location}' for {device_hostname}, using default ID {location_id}")
-    try:
-        platform_id = nautobot_api.dcim.platforms.get(name=hpna_device_family).id
-    except pynautobot.RequestError:
-        platform_id = 2
-        print(f"Failed to get platform '{hpna_device_family}' for {device_hostname}, using default ID {platform_id}")
 
-    print(hpna_device_ip)
-
-    if nautobot_api.dcim.devices.get(name=device_hostname) is None:
+class DeviceManager:
+    """Менеджер для управления устройствами"""
+    
+    def __init__(self, api: pynautobot.api, config: Config):
+        self.api = api
+        self.config = config
+        self.object_manager = NautobotObjectManager(api, config)
+        self.hostname_processor = HostnameProcessor()
+    
+    def _validate_device_data(self, device_entry) -> tuple[bool, str, str, str, str, str]:
+        """Валидирует данные устройства"""
+        hostname = self.hostname_processor.clean_hostname(device_entry.hostName)
+        ip_address = device_entry.primaryIPAddress
+        vendor = device_entry.vendor or 'UNKNOWN'
+        model = device_entry.model or 'UNKNOWN'
+        
+        # Получаем семейство устройства
         try:
-            nautobot_api.dcim.devices.create(
-                name=device_hostname,
-                role=device_role_id,
+            family = self.hpna_api.show_device_family(ip=str(ip_address))
+        except Exception:
+            family = 'UNKNOWN'
+        
+        # Проверки валидности
+        if ip_address is None or re.match(r'^\d+\.\d+\.\d+\.\d+$', hostname):
+            return False, "", "", "", "", ""
+        
+        if not vendor or model in (' ', None, 'UNKNOWN', ''):
+            return False, "", "", "", "", ""
+        
+        return True, hostname, ip_address, vendor, model, family
+    
+    def _prepare_device_metadata(self, hostname: str) -> tuple[str, str]:
+        """Подготавливает метаданные устройства"""
+        location = self.hostname_processor.get_location(hostname)
+        role = self.hostname_processor.get_device_role(hostname)
+        return location, role
+    
+    def _ensure_device_objects_exist(self, vendor: str, model: str, family: str, 
+                                   role: str, location: str, hostname: str) -> tuple[str, str, str, str]:
+        """Создает все необходимые объекты для устройства"""
+        # Создаем объекты
+        self.object_manager.ensure_role_exists(role, hostname)
+        self.object_manager.ensure_tag_exists(role, hostname)
+        self.object_manager.ensure_manufacturer_exists(vendor, hostname)
+        self.object_manager.ensure_device_type_exists(model, vendor, hostname)
+        self.object_manager.ensure_platform_exists(family, hostname)
+        
+        # Получаем ID объектов
+        role_id = self.object_manager.ensure_role_exists(role, hostname)
+        device_type_id = self.object_manager.ensure_device_type_exists(model, vendor, hostname)
+        location_id = self.object_manager.get_location_id(location, hostname)
+        platform_id = self.object_manager.ensure_platform_exists(family, hostname)
+        
+        return role_id, device_type_id, location_id, platform_id
+    
+    def _create_device_record(self, hostname: str, role: str, role_id: str, 
+                            device_type_id: str, location_id: str, platform_id: str) -> bool:
+        """Создает запись устройства в Nautobot"""
+        try:
+            self.api.dcim.devices.create(
+                name=hostname,
+                role=role_id,
                 device_type=device_type_id,
                 location=location_id,
                 platform=platform_id,
-                status='Active',
-                tags=[{'name': device_hpna_role}, {'name': 'raif_scripts'}]
+                status=Constants.STATUS_ACTIVE,
+                tags=[{'name': role}, {'name': Constants.TAG_RAIF_SCRIPTS}]
             )
+            return True
         except pynautobot.RequestError as err:
-            print(f"Failed to create device {device_hostname}: {err}")
-
+            print(f"Failed to create device {hostname}: {err}")
+            return False
+    
+    def _create_management_interface(self, hostname: str) -> bool:
+        """Создает управляющий интерфейс для устройства"""
         try:
-            nautobot_api.dcim.interfaces.create(
-                device=nautobot_api.dcim.devices.get(name=device_hostname).id,
-                name='mgmt interface',
-                status='Active',
-                type='virtual',
-                mtu='1500',
-                description='this interface needed for management of the device',
+            device = self.api.dcim.devices.get(name=hostname)
+            if not device:
+                return False
+            
+            self.api.dcim.interfaces.create(
+                device=device.id,
+                name=Constants.MGMT_INTERFACE_NAME,
+                status=Constants.STATUS_ACTIVE,
+                type=Constants.MGMT_INTERFACE_TYPE,
+                mtu=Constants.MGMT_INTERFACE_MTU,
+                description=Constants.MGMT_INTERFACE_DESCRIPTION,
                 mgmt_only=True
             )
+            return True
         except pynautobot.RequestError as err:
-            print(f"Failed to create mgmt interface on {device_hostname}: {err}")
-
-        if nautobot_api.ipam.ip_addresses.get(address=hpna_device_ip) is None:
-            try:
-                nautobot_api.ipam.ip_addresses.create(
-                    address=hpna_device_ip,
-                    status='Active',
-                    namespace='ed1a3ab7-deea-4872-b111-b44513de94a8',
-                    description='int lo0 - management IP for device'
-                )
-            except pynautobot.RequestError as err:
-                print(f"Failed to create IP address {hpna_device_ip} for {device_hostname}: {err}")
-        update_interface(nautobot_api, hpna_device_ip, device_hostname)
-
-    else:
-        if nautobot_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname) is None:
-            try:
-                nautobot_api.dcim.interfaces.create(
-                    device=nautobot_api.dcim.devices.get(name=device_hostname).id,
-                    name='mgmt interface',
-                    status='Active',
-                    type='virtual',
-                    mtu='1500',
-                    description='this interface needed for management of the device',
-                    mgmt_only=True
-                )
-            except pynautobot.RequestError as err:
-                print(f"Failed to create mgmt interface on existing device {device_hostname}: {err}")
-
-        device_interface = nautobot_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname)
-        if device_interface.ip_address_count != 1:
-
-            if nautobot_api.ipam.ip_addresses.get(address=hpna_device_ip) is None:
-                try:
-                    nautobot_api.ipam.ip_addresses.create(
-                        address=hpna_device_ip,
-                        status='Active',
-                        namespace='ed1a3ab7-deea-4872-b111-b44513de94a8',
-                        description='int lo0 - management IP for device'
-                    )
-                except pynautobot.RequestError as err:
-                    print(f"Failed to create IP address {hpna_device_ip} for {device_hostname}: {err}")
-            update_interface(nautobot_api, hpna_device_ip, device_hostname)
-
-
-def processing_hpna_device_list():
-    start_time = time.time()
-    nautobot_api = nautobot_connection()
-    hpna_api = hpna_connection()
-    hpna_device_list = hpna_api.list_device()
-    prefix_destruction_count = 0
-
-    #with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-    for device in hpna_device_list:
-        add_new_device_to_nautobot(device, nautobot_api, hpna_api)
-
-    devices_in_nautobot = nautobot_api.dcim.devices.all()
-    for device_nautobot in devices_in_nautobot:
-        nautobot_device_tags = str(device_nautobot.tags)
-        if 'raif_scripts' in nautobot_device_tags:
-            set_ipam_device.add(device_nautobot.name)
-    for device_hpna in hpna_device_list:
-        set_hpna_device.add(
-            re.sub(r'\.(net\.pri|NET\.PRI|RBRU\.PRI|rbru\.pri)$', '', str(device_hpna.hostName)).upper())
-
-    set_ipam_device.difference_update(set_hpna_device)
-    for device_for_remove in set_ipam_device:
-        device_to_delete = nautobot_api.dcim.devices.get(name=device_for_remove)
-        print(f"Removing device not found in HPNA: {device_to_delete}")
-        prefix_destruction_count += 1
+            print(f"Failed to create mgmt interface on {hostname}: {err}")
+            return False
+    
+    def _create_ip_address(self, ip_address: str, hostname: str) -> bool:
+        """Создает IP-адрес в Nautobot"""
+        if self.api.ipam.ip_addresses.get(address=ip_address):
+            return True
+        
         try:
-            ip_for_delete = device_to_delete.primary_ip
-        except AttributeError:
-            ip_for_delete = None
-        if ip_for_delete is not None:
-            ip_for_delete.delete()
-        delete_ip_address_filter = nautobot_api.ipam.ip_addresses.filter(cf_Device=device_to_delete.id)
-        for ip_entry in delete_ip_address_filter:
-            ip_entry.delete()
-        delete_prefix_filter = nautobot_api.ipam.prefixes.filter(description=device_to_delete.name)
-        for prefix_entry in delete_prefix_filter:
-            prefix_entry.delete()
+            self.api.ipam.ip_addresses.create(
+                address=ip_address,
+                status=Constants.STATUS_ACTIVE,
+                namespace=self.config.NAMESPACE_ID,
+                description=Constants.MGMT_IP_DESCRIPTION
+            )
+            return True
+        except pynautobot.RequestError as err:
+            print(f"Failed to create IP address {ip_address} for {hostname}: {err}")
+            return False
+    
+    def _link_ip_to_interface(self, ip_address: str, hostname: str) -> bool:
+        """Связывает IP-адрес с интерфейсом"""
         try:
-            vlan_group = nautobot_api.ipam.vlan_groups.get(name=device_for_remove)
-            vlans_in_group = nautobot_api.ipam.vlans.filter(group_id=vlan_group.id)
-            for vlan in vlans_in_group:
-                vlan.delete()
-        except Exception:
-            print(f"Error while deleting VLANs for device {device_for_remove}")
-        delete_vlan_groups_filter = nautobot_api.ipam.vlan_groups.filter(name=device_to_delete.name)
-        for vlan_group_entry in delete_vlan_groups_filter:
-            vlan_group_entry.delete()
-        delete_vrfs_filter = nautobot_api.ipam.vrfs.filter(cf_device=device_to_delete.id)
-        for vrf_entry in delete_vrfs_filter:
-            vrf_entry.delete()
-        device_to_delete.delete()
+            device_ip = self.api.ipam.ip_addresses.get(address=ip_address)
+            device_interface = self.api.dcim.interfaces.get(
+                name=Constants.MGMT_INTERFACE_NAME, 
+                device=hostname
+            )
+            device_record = self.api.dcim.devices.get(name=hostname)
+            
+            if not all([device_ip, device_interface, device_record]):
+                return False
+            
+            # Создаем связь IP-интерфейс
+            self.api.ipam.ip_address_to_interface.create({
+                "ip_address": device_ip.id,
+                "interface": device_interface.id
+            })
+            
+            # Устанавливаем как primary IP
+            device_record.update({'primary_ip4': device_ip.id})
+            return True
+            
+        except Exception as err:
+            print(f"Failed to link interface {hostname}: {err}")
+            return False
+    
+    def _setup_device_management(self, hostname: str, ip_address: str) -> None:
+        """Настраивает управление устройством (интерфейс + IP)"""
+        # Проверяем/создаем интерфейс управления
+        mgmt_interface = self.api.dcim.interfaces.get(
+            name=Constants.MGMT_INTERFACE_NAME, 
+            device=hostname
+        )
+        if not mgmt_interface:
+            self._create_management_interface(hostname)
+            mgmt_interface = self.api.dcim.interfaces.get(
+                name=Constants.MGMT_INTERFACE_NAME, 
+                device=hostname
+            )
+        
+        # Проверяем привязку IP к интерфейсу
+        if mgmt_interface and mgmt_interface.ip_address_count != 1:
+            self._create_ip_address(ip_address, hostname)
+            self._link_ip_to_interface(ip_address, hostname)
+    
+    def create_or_update_device(self, device_entry, hpna_api) -> str:
+        """Создает или обновляет устройство в Nautobot"""
+        self.hpna_api = hpna_api  # Сохраняем для использования в валидации
+        
+        # Валидация данных
+        is_valid, hostname, ip_address, vendor, model, family = self._validate_device_data(device_entry)
+        if not is_valid:
+            return ""
+        
+        print(f"Processing device: {hostname} ({ip_address})")
+        
+        # Подготовка метаданных
+        location, role = self._prepare_device_metadata(hostname)
+        
+        # Создание необходимых объектов
+        role_id, device_type_id, location_id, platform_id = self._ensure_device_objects_exist(
+            vendor, model, family, role, location, hostname
+        )
+        
+        # Проверяем существование устройства
+        existing_device = self.api.dcim.devices.get(name=hostname)
+        
+        if not existing_device:
+            # Создаем новое устройство
+            if self._create_device_record(hostname, role, role_id, device_type_id, location_id, platform_id):
+                self._create_management_interface(hostname)
+                self._create_ip_address(ip_address, hostname)
+                self._link_ip_to_interface(ip_address, hostname)
+        else:
+            # Обновляем существующее устройство
+            self._setup_device_management(hostname, ip_address)
+        
+        return hostname
 
-    print(f"--- {time.time() - start_time:.2f} seconds ---")
+
+class DeviceCleanupManager:
+    """Менеджер для очистки устройств, отсутствующих в HPNA"""
+    
+    def __init__(self, api: pynautobot.api):
+        self.api = api
+    
+    def _get_device_dependencies(self, device) -> Dict[str, Any]:
+        """Получает все зависимости устройства"""
+        dependencies = {
+            'primary_ip': None,
+            'device_ips': [],
+            'prefixes': [],
+            'vlan_groups': [],
+            'vlans': [],
+            'vrfs': [],
+            'vrf_assignments': [],
+            'interfaces': [],
+            'cables': [],
+            'power_connections': [],
+            'console_connections': [],
+            'device_bays': [],
+            'inventory_items': []
+        }
+        
+        try:
+            # Primary IP
+            if hasattr(device, 'primary_ip4') and device.primary_ip4:
+                dependencies['primary_ip'] = device.primary_ip4
+            
+            # Все IP-адреса устройства
+            device_ips = self.api.ipam.ip_addresses.filter(cf_Device=device.id)
+            dependencies['device_ips'] = list(device_ips)
+            
+            # Префиксы, связанные с устройством
+            prefixes = self.api.ipam.prefixes.filter(description=device.name)
+            dependencies['prefixes'] = list(prefixes)
+            
+            # VLAN группы устройства
+            try:
+                vlan_group = self.api.ipam.vlan_groups.get(name=device.name)
+                if vlan_group:
+                    dependencies['vlan_groups'] = [vlan_group]
+                    # VLAN-ы в группе
+                    vlans = self.api.ipam.vlans.filter(group_id=vlan_group.id)
+                    dependencies['vlans'] = list(vlans)
+            except Exception:
+                pass
+            
+            # VRF, связанные с устройством
+            vrfs = self.api.ipam.vrfs.filter(cf_device=device.id)
+            dependencies['vrfs'] = list(vrfs)
+            
+            # VRF assignments
+            for vrf in dependencies['vrfs']:
+                assignments = self.api.ipam.vrf_prefix_assignments.filter(vrf=vrf.id)
+                dependencies['vrf_assignments'].extend(list(assignments))
+            
+            # Интерфейсы устройства
+            interfaces = self.api.dcim.interfaces.filter(device=device.id)
+            dependencies['interfaces'] = list(interfaces)
+            
+            # Кабели, подключенные к устройству
+            for interface in dependencies['interfaces']:
+                if hasattr(interface, 'cable') and interface.cable:
+                    dependencies['cables'].append(interface.cable)
+            
+            # Питание
+            power_outlets = self.api.dcim.power_outlets.filter(device=device.id)
+            power_ports = self.api.dcim.power_ports.filter(device=device.id)
+            for port in power_ports:
+                if hasattr(port, 'cable') and port.cable:
+                    dependencies['power_connections'].append(port.cable)
+            
+            # Консольные подключения
+            console_ports = self.api.dcim.console_ports.filter(device=device.id)
+            console_server_ports = self.api.dcim.console_server_ports.filter(device=device.id)
+            for port in console_ports:
+                if hasattr(port, 'cable') and port.cable:
+                    dependencies['console_connections'].append(port.cable)
+            
+            # Device bays
+            device_bays = self.api.dcim.device_bays.filter(device=device.id)
+            dependencies['device_bays'] = list(device_bays)
+            
+            # Inventory items
+            inventory_items = self.api.dcim.inventory_items.filter(device=device.id)
+            dependencies['inventory_items'] = list(inventory_items)
+            
+        except Exception as e:
+            print(f"Error getting dependencies for device {device.name}: {e}")
+        
+        return dependencies
+    
+    def _print_device_dependencies(self, device, dependencies: Dict[str, Any]) -> None:
+        """Выводит информацию о зависимостях устройства"""
+        print(f"\n=== Планируется удаление устройства: {device.name} ===")
+        
+        if dependencies['primary_ip']:
+            print(f"  Primary IP: {dependencies['primary_ip']}")
+        
+        if dependencies['device_ips']:
+            print(f"  Device IPs ({len(dependencies['device_ips'])}): {[str(ip.address) for ip in dependencies['device_ips']]}")
+        
+        if dependencies['prefixes']:
+            print(f"  Prefixes ({len(dependencies['prefixes'])}): {[str(p.prefix) for p in dependencies['prefixes']]}")
+        
+        if dependencies['vlans']:
+            print(f"  VLANs ({len(dependencies['vlans'])}): {[f'{v.name}({v.vid})' for v in dependencies['vlans']]}")
+        
+        if dependencies['vlan_groups']:
+            print(f"  VLAN Groups ({len(dependencies['vlan_groups'])}): {[vg.name for vg in dependencies['vlan_groups']]}")
+        
+        if dependencies['vrfs']:
+            print(f"  VRFs ({len(dependencies['vrfs'])}): {[vrf.name for vrf in dependencies['vrfs']]}")
+        
+        if dependencies['vrf_assignments']:
+            print(f"  VRF Assignments: {len(dependencies['vrf_assignments'])}")
+        
+        if dependencies['interfaces']:
+            print(f"  Interfaces ({len(dependencies['interfaces'])}): {[i.name for i in dependencies['interfaces']]}")
+        
+        if dependencies['cables']:
+            print(f"  Cables: {len(dependencies['cables'])}")
+        
+        if dependencies['power_connections']:
+            print(f"  Power connections: {len(dependencies['power_connections'])}")
+        
+        if dependencies['console_connections']:
+            print(f"  Console connections: {len(dependencies['console_connections'])}")
+        
+        if dependencies['device_bays']:
+            print(f"  Device bays: {len(dependencies['device_bays'])}")
+        
+        if dependencies['inventory_items']:
+            print(f"  Inventory items: {len(dependencies['inventory_items'])}")
+        
+        print("=" * 60)
+    
+    def _delete_device_dependencies(self, device, dependencies: Dict[str, Any]) -> None:
+        """Удаляет все зависимости устройства (в реальном режиме)"""
+        # ВНИМАНИЕ: Этот метод содержит реальное удаление!
+        # Сейчас закомментирован для безопасности
+        
+        # Удаляем в правильном порядке (зависимости сначала)
+        
+        # 1. Кабели
+        # for cable in dependencies['cables']:
+        #     cable.delete()
+        
+        # 2. IP-адреса
+        # if dependencies['primary_ip']:
+        #     dependencies['primary_ip'].delete()
+        # for ip in dependencies['device_ips']:
+        #     ip.delete()
+        
+        # 3. VLAN-ы
+        # for vlan in dependencies['vlans']:
+        #     vlan.delete()
+        
+        # 4. VLAN группы
+        # for vlan_group in dependencies['vlan_groups']:
+        #     vlan_group.delete()
+        
+        # 5. VRF assignments
+        # for vrf_assignment in dependencies['vrf_assignments']:
+        #     vrf_assignment.delete()
+        
+        # 6. VRF-ы
+        # for vrf in dependencies['vrfs']:
+        #     vrf.delete()
+        
+        # 7. Префиксы
+        # for prefix in dependencies['prefixes']:
+        #     prefix.delete()
+        
+        # 8. Inventory items
+        # for item in dependencies['inventory_items']:
+        #     item.delete()
+        
+        # 9. Device bays
+        # for bay in dependencies['device_bays']:
+        #     bay.delete()
+        
+        print(f"    [ТЕСТ] Зависимости устройства {device.name} были бы удалены")
+    
+    def cleanup_missing_devices(self, hpna_hostnames: Set[str]) -> int:
+        """Удаляет устройства, отсутствующие в HPNA"""
+        print("\n" + "="*80)
+        print("НАЧИНАЕМ АНАЛИЗ УСТРОЙСТВ ДЛЯ УДАЛЕНИЯ")
+        print("="*80)
+        
+        # Получаем все устройства с тегом raif_scripts
+        devices_in_nautobot = self.api.dcim.devices.all()
+        nautobot_hostnames = set()
+        
+        for device in devices_in_nautobot:
+            device_tags = str(device.tags)
+            if Constants.TAG_RAIF_SCRIPTS in device_tags:
+                nautobot_hostnames.add(device.name)
+        
+        # Находим устройства для удаления
+        devices_to_remove = nautobot_hostnames - hpna_hostnames
+        
+        print(f"Устройств в Nautobot с тегом '{Constants.TAG_RAIF_SCRIPTS}': {len(nautobot_hostnames)}")
+        print(f"Устройств в HPNA: {len(hpna_hostnames)}")
+        print(f"Устройств для удаления: {len(devices_to_remove)}")
+        
+        if not devices_to_remove:
+            print("Нет устройств для удаления.")
+            return 0
+        
+        removal_count = 0
+        
+        for device_name in devices_to_remove:
+            device_to_delete = self.api.dcim.devices.get(name=device_name)
+            if not device_to_delete:
+                continue
+            
+            # Получаем все зависимости
+            dependencies = self._get_device_dependencies(device_to_delete)
+            
+            # Выводим информацию о том, что будет удалено
+            self._print_device_dependencies(device_to_delete, dependencies)
+            
+            # В тестовом режиме только показываем, что будет удалено
+            self._delete_device_dependencies(device_to_delete, dependencies)
+            
+            # Само устройство (в тестовом режиме)
+            print(f"    [ТЕСТ] Устройство {device_name} было бы удалено")
+            # device_to_delete.delete()  # Раскомментировать для реального удаления
+            
+            removal_count += 1
+        
+        print(f"\n[ТЕСТ] Было бы удалено {removal_count} устройств")
+        print("="*80)
+        return removal_count
+
+
+class HpnaToNautobotImporter:
+    """Основной класс импортера"""
+    
+    def __init__(self):
+        self.config = Config()
+        self.nautobot_api = self._create_nautobot_connection()
+        self.hpna_api = self._create_hpna_connection()
+        self.device_manager = DeviceManager(self.nautobot_api, self.config)
+        self.cleanup_manager = DeviceCleanupManager(self.nautobot_api)
+    
+    def _create_nautobot_connection(self) -> pynautobot.api:
+        """Создает подключение к Nautobot"""
+        api = pynautobot.api(
+            self.config.NAUTOBOT_URL,
+            token=self.config.NAUTOBOT_TOKEN,
+            threading=True
+        )
+        api.http_session.verify = False
+        return api
+    
+    def _create_hpna_connection(self):
+        """Создает подключение к HPNA"""
+        hpna_api = NAInterface("https://hpna.raiffeisen.ru", ssl_verify=False)
+        hpna_api.login(self.config.HPNA_WEB_LOGIN, self.config.HPNA_WEB_PASSWORD)
+        return hpna_api
+    
+    def import_devices(self) -> None:
+        """Импортирует устройства из HPNA в Nautobot"""
+        start_time = time.time()
+        print("Начинаем импорт устройств из HPNA в Nautobot...")
+        
+        # Получаем список устройств из HPNA
+        hpna_device_list = self.hpna_api.list_device()
+        print(f"Найдено {len(hpna_device_list)} устройств в HPNA")
+        
+        # Обрабатываем устройства
+        processed_hostnames = set()
+        
+        # Без многопоточности для отладки
+        for device in hpna_device_list:
+            hostname = self.device_manager.create_or_update_device(device, self.hpna_api)
+            if hostname:
+                processed_hostnames.add(hostname)
+        
+        print(f"Обработано {len(processed_hostnames)} устройств")
+        
+        # Очищаем устройства, отсутствующие в HPNA
+        removed_count = self.cleanup_manager.cleanup_missing_devices(processed_hostnames)
+        
+        execution_time = time.time() - start_time
+        print(f"\nИмпорт завершен за {execution_time:.2f} секунд")
+        print(f"Обработано устройств: {len(processed_hostnames)}")
+        print(f"Удалено устройств: {removed_count}")
+
+
+def main():
+    """Главная функция"""
+    try:
+        importer = HpnaToNautobotImporter()
+        importer.import_devices()
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+        raise
 
 
 if __name__ == "__main__":
-    processing_hpna_device_list()
+    main()

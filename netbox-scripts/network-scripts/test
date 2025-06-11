@@ -146,16 +146,31 @@ def create_missing_tags(api, required_tags):
     existing_tags = {tag.name: tag for tag in api.extras.tags.all()}
     created_tags = []
     
+    # Получаем content_types для тегов (обычно включает dcim.device)
+    device_content_type = api.extras.content_types.get(
+        app_label='dcim', 
+        model='device'
+    )
+    
+    if not device_content_type:
+        print("❌ Could not find device content type")
+        return existing_tags
+    
     for tag_name in required_tags:
         if tag_name not in existing_tags:
             print(f"Creating tag: {tag_name}")
-            new_tag = api.extras.tags.create({
-                'name': tag_name,
-                'description': f'Scope tag: {tag_name}',
-                'color': 'blue'
-            })
-            existing_tags[tag_name] = new_tag
-            created_tags.append(tag_name)
+            try:
+                new_tag = api.extras.tags.create({
+                    'name': tag_name,
+                    'description': f'Scope tag: {tag_name}',
+                    'color': '3498db',  # Синий цвет в hex формате
+                    'content_types': [device_content_type.id]
+                })
+                existing_tags[tag_name] = new_tag
+                created_tags.append(tag_name)
+                print(f"✅ Created tag: {tag_name}")
+            except Exception as e:
+                print(f"❌ Failed to create tag {tag_name}: {e}")
     
     print(f"Created {len(created_tags)} new tags")
     return existing_tags

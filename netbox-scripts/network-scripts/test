@@ -1,6 +1,8 @@
 import re
 import urllib3
-from hpnapy import NAInterface
+import pandas as pd
+import pynautobot
+from decouple import config
 from openpyxl import Workbook
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.styles import PatternFill
@@ -9,102 +11,257 @@ from openpyxl.formatting.rule import CellIsRule
 # Отключаем предупреждения о самоподписанных сертификатах
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def hpna_connection():
-    """Создаёт и возвращает сессию HPNA."""
-    print("Connecting to HPNA…")
-    api = NAInterface("https://hpna.raiffeisen.ru", ssl_verify=False)
-    api.login('ruasfih', 'Lysa142yfdwzfi@')
-    print("Connected")
-    return api
+# Константы из окружения
+NAUTOBOT_URL = config('NAUTOBOT_URL')
+NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
 
+def get_nautobot_api():
+    """Возвращает клиент pynautobot."""
+    return pynautobot.api(NAUTOBOT_URL, token=NAUTOBOT_TOKEN, verify=False)
 
-def fetch_devices():
-    """Забирает список устройств и сразу его сортирует по hostName."""
-    devices = hpna_connection().list_device()
-    print(f"Fetched {len(devices)} devices")
-    # Сортируем по имени, без учёта регистра
-    devices_sorted = sorted(devices, key=lambda d: d.hostName.lower())
-    print("Devices sorted by name")
-    return devices_sorted
+def load_excel_devices(filename="new_devices.xlsx"):
+    """Загружает устройства из Excel таблицы."""
+    print(f"Loading devices from {filename}...")
+    
+    df = pd.read_excel(filename)
+    
+    # Обрабатываем заголовки (если они неправильные)
+    if len(df.columns) >= 3:
+        df.columns = ['Device Name', 'Scope', 'Subscope']
+    
+    devices = {}
+    for _, row in df.iterrows():
+        name = row['Device Name']
+        if pd.isna(name):
+            continue
+            
+        scope1 = row['Scope'] if not pd.isna(row['Scope']) else None
+        scope2 = row['Subscope'] if not pd.isna(row['Subscope']) else None
+        
+        # Собираем scope теги (убираем пустые)
+        scopes = []
+        if scope1:
+            scopes.append(f"scope_{scope1}")
+        if scope2:
+            scopes.append(f"scope_{scope2}")
+            
+        devices[name.upper()] = scopes
+    
+    print(f"Loaded {len(devices)} devices from Excel")
+    return devices
 
+def get_nautobot_devices():
+    """Получает устройства из Nautobot с их тегами."""
+    print("Fetching devices from Nautobot...")
+    
+    api = get_nautobot_api()
+    devices = list(api.dcim.devices.all())
+    
+    device_tags = {}
+    for device in devices:
+        name = device.name.upper()
+        
+        # Получаем только scope теги
+        scope_tags = []
+        if device.tags:
+            for tag in device.tags:
+                tag_name = tag.name if hasattr(tag, 'name') else str(tag)
+                if tag_name.startswith('scope_'):
+                    scope_tags.append(tag_name)
+        
+        device_tags[name] = scope_tags
+    
+    print(f"Fetched {len(device_tags)} devices from Nautobot")
+    return device_tags
 
-def clean_name(name: str) -> str:
-    """Удаляет суффикс .net.pri (в любом регистре) и переводит в верхний регистр."""
-    # Убираем суффиксы .net.pri или .NET.PRI (вариативно)
-    cleaned = re.sub(r"\.net\.pri$", "", name, flags=re.IGNORECASE)
-    return cleaned.upper()
-
-
-def export_to_excel(devices, filename="devices.xlsx"):
-    """Записывает отсортированный и очищенный список в Excel с выпадающими списками и подсветкой."""
-    print(f"Creating Excel file '{filename}'…")
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Devices"
-
-    # Заголовки
-    ws.append(["Device Name", "Scope", "Subscope"])
-
-    # Запись очищенных устройств в столбец A
-    for dev in devices:
-        name = clean_name(dev.hostName)
-        ws.append([name, "", ""])
-
-    max_row = len(devices) + 1
-
-    # Опции для выпадающих списков
-    options = [
-        "OTV", "PROD D8", "PROD 70", "PROD 34", "DTV",
-        "PROD X5", "EJP (VPN)", "iDMZ", "PCI-DCI", "PCI-D8",
-        "PCI-X5", "PCI-70", "MSK60", "MSK34", "BRANCH", "OOB"
-    ]
-    formula = f'"{",".join(options)}"'
-
-    # Настраиваем валидацию для столбцов B и C
-    dv = DataValidation(type="list", formula1=formula, allow_blank=True)
-    dv.add(f'B2:B{max_row}')
-    dv.add(f'C2:C{max_row}')
-    ws.add_data_validation(dv)
-
-    # Карта цветов для conditional formatting
-    color_map = {
-        "OTV":      "FFFFC7CE",
-        "PROD D8":  "FFC6EFCE",
-        "PROD 70":  "FFEBF1DE",
-        "PROD 34":  "FFBDD7EE",
-        "DTV":      "FFFDE9D9",
-        "PROD X5":  "FFF2DCDB",
-        "EJP (VPN)": "FFE4DFEC",
-        "iDMZ":     "FFFFF2CC",
-        "PCI-DCI":  "FFDDEBF7",
-        "PCI-D8":   "FFFCE4D6",
-        "PCI-X5":   "FFD9EAD3",
-        "PCI-70":   "FFF4DFBA",
-        "MSK60":    "FFE4F0FB",
-        "MSK34":    "FFE8EEDB",
-        "BRANCH":   "FFEDEDED",
-        "OOB":      "FFEFE7F6",
+def compare_devices(excel_devices, nautobot_devices):
+    """Сравнивает устройства из Excel и Nautobot."""
+    print("\nComparing devices...")
+    
+    excel_names = set(excel_devices.keys())
+    nautobot_names = set(nautobot_devices.keys())
+    
+    # Устройства только в Excel
+    only_in_excel = excel_names - nautobot_names
+    
+    # Устройства только в Nautobot
+    only_in_nautobot = nautobot_names - excel_names
+    
+    # Общие устройства
+    common_devices = excel_names & nautobot_names
+    
+    # Устройства с несовпадающими тегами
+    tag_mismatches = {}
+    for name in common_devices:
+        excel_tags = set(excel_devices[name])
+        nautobot_tags = set(nautobot_devices[name])
+        
+        if excel_tags != nautobot_tags:
+            tag_mismatches[name] = {
+                'excel_tags': list(excel_tags),
+                'nautobot_tags': list(nautobot_tags),
+                'missing_in_nautobot': list(excel_tags - nautobot_tags),
+                'extra_in_nautobot': list(nautobot_tags - excel_tags)
+            }
+    
+    # Отчет
+    print(f"\n📊 COMPARISON REPORT:")
+    print(f"   Excel devices: {len(excel_names)}")
+    print(f"   Nautobot devices: {len(nautobot_names)}")
+    print(f"   Common devices: {len(common_devices)}")
+    print(f"   Only in Excel: {len(only_in_excel)}")
+    print(f"   Only in Nautobot: {len(only_in_nautobot)}")
+    print(f"   Tag mismatches: {len(tag_mismatches)}")
+    
+    return {
+        'only_in_excel': only_in_excel,
+        'only_in_nautobot': only_in_nautobot,
+        'tag_mismatches': tag_mismatches
     }
 
-    # Применяем условное форматирование для каждого значения
-    for col in ("B", "C"):
-        for val, col_code in color_map.items():
-            fill = PatternFill(start_color=col_code, end_color=col_code, fill_type="solid")
-            rule = CellIsRule(
-                operator="equal",
-                formula=[f'"{val}"'],
-                stopIfTrue=True,
-                fill=fill
-            )
-            ws.conditional_formatting.add(f"{col}2:{col}{max_row}", rule)
+def create_missing_tags(api, required_tags):
+    """Создает отсутствующие теги в Nautobot."""
+    print("Checking and creating missing tags...")
+    
+    existing_tags = {tag.name: tag for tag in api.extras.tags.all()}
+    created_tags = []
+    
+    for tag_name in required_tags:
+        if tag_name not in existing_tags:
+            print(f"Creating tag: {tag_name}")
+            new_tag = api.extras.tags.create({
+                'name': tag_name,
+                'description': f'Scope tag: {tag_name}',
+                'color': 'blue'
+            })
+            existing_tags[tag_name] = new_tag
+            created_tags.append(tag_name)
+    
+    print(f"Created {len(created_tags)} new tags")
+    return existing_tags
 
+def sync_device_tags(api, device_name, target_tags, existing_tags):
+    """Синхронизирует теги устройства."""
+    try:
+        device = api.dcim.devices.get(name=device_name)
+        if not device:
+            print(f"❌ Device not found: {device_name}")
+            return False
+        
+        # Получаем текущие scope теги
+        current_scope_tags = []
+        current_other_tags = []
+        
+        if device.tags:
+            for tag in device.tags:
+                tag_name = tag.name if hasattr(tag, 'name') else str(tag)
+                if tag_name.startswith('scope_'):
+                    current_scope_tags.append(tag_name)
+                else:
+                    current_other_tags.append(tag_name)
+        
+        # Формируем новый список тегов
+        new_tag_ids = []
+        
+        # Добавляем НЕ-scope теги
+        for tag_name in current_other_tags:
+            if tag_name in existing_tags:
+                new_tag_ids.append(existing_tags[tag_name].id)
+        
+        # Добавляем целевые scope теги
+        for tag_name in target_tags:
+            if tag_name in existing_tags:
+                new_tag_ids.append(existing_tags[tag_name].id)
+        
+        # Обновляем устройство
+        device.tags = new_tag_ids
+        device.save()
+        
+        print(f"✅ Updated tags for {device_name}: {target_tags}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error updating {device_name}: {e}")
+        return False
+
+def sync_all_devices(excel_devices, comparison_result):
+    """Синхронизирует все устройства."""
+    api = get_nautobot_api()
+    
+    # Собираем все необходимые теги
+    all_required_tags = set()
+    for tags in excel_devices.values():
+        all_required_tags.update(tags)
+    
+    # Создаем отсутствующие теги
+    existing_tags = create_missing_tags(api, all_required_tags)
+    
+    # Синхронизируем устройства с несовпадающими тегами
+    print(f"\nSyncing {len(comparison_result['tag_mismatches'])} devices with tag mismatches...")
+    
+    success_count = 0
+    for device_name, mismatch_info in comparison_result['tag_mismatches'].items():
+        target_tags = excel_devices[device_name]
+        if sync_device_tags(api, device_name, target_tags, existing_tags):
+            success_count += 1
+    
+    print(f"\n✅ Successfully synced {success_count} devices")
+
+def export_comparison_report(comparison_result, filename="sync_report.xlsx"):
+    """Экспортирует отчет сравнения в Excel."""
+    print(f"Creating comparison report: {filename}")
+    
+    wb = Workbook()
+    
+    # Лист с несовпадениями тегов
+    ws_mismatches = wb.active
+    ws_mismatches.title = "Tag Mismatches"
+    ws_mismatches.append(["Device Name", "Excel Tags", "Nautobot Tags", "Missing in Nautobot", "Extra in Nautobot"])
+    
+    for device, info in comparison_result['tag_mismatches'].items():
+        ws_mismatches.append([
+            device,
+            ", ".join(info['excel_tags']),
+            ", ".join(info['nautobot_tags']),
+            ", ".join(info['missing_in_nautobot']),
+            ", ".join(info['extra_in_nautobot'])
+        ])
+    
+    # Лист с устройствами только в Excel
+    if comparison_result['only_in_excel']:
+        ws_excel = wb.create_sheet("Only in Excel")
+        ws_excel.append(["Device Name"])
+        for device in comparison_result['only_in_excel']:
+            ws_excel.append([device])
+    
+    # Лист с устройствами только в Nautobot
+    if comparison_result['only_in_nautobot']:
+        ws_nautobot = wb.create_sheet("Only in Nautobot")
+        ws_nautobot.append(["Device Name"])
+        for device in comparison_result['only_in_nautobot']:
+            ws_nautobot.append([device])
+    
     wb.save(filename)
-    print(f"Excel '{filename}' saved — записано {len(devices)} устройств.")
-
+    print(f"Report saved: {filename}")
 
 def main():
-    devices = fetch_devices()
-    export_to_excel(devices)
+    """Основная функция."""
+    print("=== NAUTOBOT SCOPE TAGS SYNCHRONIZATION ===")
+    
+    # 1. Загружаем данные
+    excel_devices = load_excel_devices("new_devices.xlsx")
+    nautobot_devices = get_nautobot_devices()
+    
+    # 2. Сравниваем
+    comparison_result = compare_devices(excel_devices, nautobot_devices)
+    
+    # 3. Создаем отчет
+    export_comparison_report(comparison_result)
+    
+    # 4. Опционально синхронизируем (раскомментировать для реального запуска)
+    # sync_all_devices(excel_devices, comparison_result)
+    
+    print("\n=== SYNCHRONIZATION COMPLETE ===")
 
 if __name__ == "__main__":
     main()

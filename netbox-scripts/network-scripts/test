@@ -19,6 +19,15 @@ def get_nautobot_api():
     """Возвращает клиент pynautobot."""
     return pynautobot.api(NAUTOBOT_URL, token=NAUTOBOT_TOKEN, verify=False)
 
+def normalize_tag(tag_value):
+    """Нормализует тег: заменяет пробелы на подчеркивания и переводит в верхний регистр."""
+    if not tag_value:
+        return None
+    
+    # Убираем лишние пробелы, заменяем пробелы на подчеркивания, переводим в верхний регистр
+    normalized = str(tag_value).strip().replace(' ', '_').upper()
+    return normalized
+
 def load_excel_devices(filename="new_devices.xlsx"):
     """Загружает устройства из Excel таблицы."""
     print(f"Loading devices from {filename}...")
@@ -38,16 +47,27 @@ def load_excel_devices(filename="new_devices.xlsx"):
         scope1 = row['Scope'] if not pd.isna(row['Scope']) else None
         scope2 = row['Subscope'] if not pd.isna(row['Subscope']) else None
         
-        # Собираем scope теги (убираем пустые)
+        # Нормализуем и собираем scope теги (убираем пустые)
         scopes = []
         if scope1:
-            scopes.append(f"scope_{scope1}")
+            normalized_scope1 = normalize_tag(scope1)
+            if normalized_scope1:
+                scopes.append(f"scope_{normalized_scope1}")
         if scope2:
-            scopes.append(f"scope_{scope2}")
+            normalized_scope2 = normalize_tag(scope2)
+            if normalized_scope2:
+                scopes.append(f"scope_{normalized_scope2}")
             
         devices[name.upper()] = scopes
     
     print(f"Loaded {len(devices)} devices from Excel")
+    
+    # Показываем примеры нормализации
+    if devices:
+        print("Examples of tag normalization:")
+        for name, tags in list(devices.items())[:3]:
+            print(f"  {name}: {tags}")
+    
     return devices
 
 def get_nautobot_devices():
@@ -216,7 +236,7 @@ def export_comparison_report(comparison_result, filename="sync_report.xlsx"):
     # Лист с несовпадениями тегов
     ws_mismatches = wb.active
     ws_mismatches.title = "Tag Mismatches"
-    ws_mismatches.append(["Device Name", "Excel Tags", "Nautobot Tags", "Missing in Nautobot", "Extra in Nautobot"])
+    ws_mismatches.append(["Device Name", "Excel Tags (Normalized)", "Nautobot Tags", "Missing in Nautobot", "Extra in Nautobot"])
     
     for device, info in comparison_result['tag_mismatches'].items():
         ws_mismatches.append([
@@ -241,8 +261,27 @@ def export_comparison_report(comparison_result, filename="sync_report.xlsx"):
         for device in comparison_result['only_in_nautobot']:
             ws_nautobot.append([device])
     
+    # Лист со статистикой нормализации тегов
+    ws_normalization = wb.create_sheet("Tag Normalization")
+    ws_normalization.append(["Original Tag", "Normalized Tag", "Transformation"])
+    
+    # Примеры нормализации
+    normalization_examples = [
+        ("PROD 70", "PROD_70", "space → underscore"),
+        ("PROD D8", "PROD_D8", "space → underscore"),
+        ("PROD 34", "PROD_34", "space → underscore"),
+        ("EJP (VPN)", "EJP_(VPN)", "space → underscore"),
+        ("iDMZ", "IDMZ", "lowercase → UPPERCASE"),
+        ("OTV", "OTV", "no change"),
+        ("BRANCH", "BRANCH", "no change"),
+    ]
+    
+    for original, normalized, transformation in normalization_examples:
+        ws_normalization.append([original, f"scope_{normalized}", transformation])
+    
     wb.save(filename)
     print(f"Report saved: {filename}")
+    print("Report includes tag normalization examples for reference")
 
 def main():
     """Основная функция."""

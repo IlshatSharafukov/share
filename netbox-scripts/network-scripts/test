@@ -1,466 +1,110 @@
-import time
-import logging
-import concurrent.futures
-
+import re
 import urllib3
-import requests
-from decouple import config
-from ntc_templates.parse import parse_output
-from netmiko import ConnectHandler
-import pynautobot
+from hpnapy import NAInterface
+from openpyxl import Workbook
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.styles import PatternFill
+from openpyxl.formatting.rule import CellIsRule
 
-# Отключаем предупреждения InsecureRequestWarning
+# Отключаем предупреждения о самоподписанных сертификатах
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Константы из окружения
-HPNA_LOGIN = config('HPNA_LOGIN')
-HPNA_PASSWORD = config('HPNA_PASSWORD')
-NAUTOBOT_URL = config('NAUTOBOT_URL')
-NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
-
-# Логгер
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-
-def connect_device(netbox_device, device_type):
-    """
-    Устанавливает SSH-подключение к устройству через Netmiko.
-    При неудаче возвращает None.
-    """
-    params = {
-        'device_type': device_type,
-        'host': str(netbox_device.primary_ip4)[:-3],
-        'username': HPNA_LOGIN,
-        'password': HPNA_PASSWORD,
-        'timeout': 200,
-        'port': 22,
-        'global_delay_factor': 2,
-        'conn_timeout': 200,
-    }
-
-    try:
-        return ConnectHandler(**params)
-    except Exception:
-        # Пробуем ещё раз
-        try:
-            return ConnectHandler(**params)
-        except Exception:
-            logger.error('Connection error: %s', netbox_device.name)
-            return None
-
-
-def sync_vlans_for_ios(netbox_device, nb_api):
-    """
-    Синхронизирует VLAN с Cisco IOS в Nautobot:
-    - создаёт/обновляет записи VLAN
-    - создаёт связи device↔vlan
-    - удаляет устаревшие связи
-    """
-    try:
-        loc_id = netbox_device.location.id
-        connection = connect_device(netbox_device, 'cisco_ios')
-        if not connection:
-            return
-
-        logger.info('Start syncing %s', netbox_device.name)
-
-        output = connection.send_command_timing(
-            'show vlan', read_timeout=200
-        )
-        device_vlans = parse_output(
-            platform="cisco_ios",
-            command="show vlan",
-            data=output
-        )
-
-        # Теги устройства
-        tags = [t.name for t in (netbox_device.tags or [])]
-        has_otv = 'scope_OTV' in tags
-        other_scope_tags = [t for t in tags if t.startswith('scope_') and t != 'scope_OTV']
-        has_other_scope = bool(other_scope_tags)
-
-        # Разделяем списки VLAN из устройства
-        if has_otv:
-            otv_vlan_list = [
-                v for v in device_vlans if int(v['vlan_id']) >= 1000
-            ]
-            other_vlan_list = [
-                v for v in device_vlans if int(v['vlan_id']) < 1000
-            ]
-        else:
-            other_vlan_list = [
-                v for v in device_vlans
-            ]
-
-        # Получаем группы VLAN в Nautobot
-        otv_group = None
-        if has_otv:
-            otv_group = nb_api.ipam.vlan_groups.get(name='OTV')
-            if not otv_group:
-                logger.error('%s: группа OTV не найдена', netbox_device.name)
-                connection.disconnect()
-                return
-
-        other_group = None
-        if has_other_scope:
-            other_name = other_scope_tags[0].replace('scope_', '')
-            other_group = nb_api.ipam.vlan_groups.get(name=other_name)
-            if not has_other_scope:
-                logger.error(
-                    '%s: группа %s не найдена',
-                    netbox_device.name, other_name
-                )
-                connection.disconnect()
-                return
-        # Текущие связи device↔vlan в Nautobot
-        device_rels = nb_api.extras.relationship_associations.filter(
-            relationship='devices_vlans',
-            destination_id=netbox_device.id
-        )
-
-        ipam_vlan_ids = {
-            int(rel.display.split(' (')[1].split(')')[0])
-            for rel in device_rels
-        }
-        existing_rels_map = {
-            str(r.serialize()['source_id']): r.serialize()
-            for r in device_rels
-        }
-
-        def sync_vlans(vlan_list, vlan_group, switch_vlan_ids):
-            """
-            Создаёт/обновляет VLAN и связи, возвращает множество VID.
-            """
-            records = list(nb_api.ipam.vlans.filter(
-                vlan_group=vlan_group.id
-            ))
-
-            existing = {
-                int(r.serialize()['vid']): r.serialize() for r in records
-            }
-
-            to_create, loc_update, rela_update = [], [], []
-            for v in vlan_list:
-                vid = int(v['vlan_id'])
-                switch_vlan_ids.add(vid)
-                name = v.get('name') or 'unknown'
-                if vid in existing:
-                    # Добавляем местоположение для OTV
-                    if loc_id not in existing[vid]['locations']:
-                        loc_update.append({
-                            'vlan': existing[vid]['id'],
-                            'location': loc_id,
-                        })
-                    # Добавляем связь device <-> vlan
-                    if existing[vid]['id'] not in existing_rels_map:
-                        rela_update.append({
-                            'relationship':
-                                '02912579-6379-43a6-9607-d3f7531ea505',
-                            'source_type': 'ipam.vlan',
-                            'destination_type': 'dcim.device',
-                            'source_id': existing[vid]['id'],
-                            'destination_id': netbox_device.id,
-                        })
-                else:
-                    nb_api.ipam.vlans.create({
-                        'location': loc_id,
-                        'vlan_group': vlan_group.id,
-                        'vid': vid,
-                        'name': name,
-                        'status': 'Active',
-                    })
-            # Вызовы API в Nautobot
-            if to_create:
-                nb_api.ipam.vlans.create(to_create)
-            if loc_update:
-                nb_api.ipam.vlan_location_assignments.create(loc_update)
-            if rela_update:
-                nb_api.extras.relationship_associations.create(rela_update)
-
-            return switch_vlan_ids
-
-        # Сбор множеств VLAN по группам
-        otv_vlan_set = set()
-        if has_otv:
-            otv_vlan_set = sync_vlans(
-                otv_vlan_list, otv_group, set()
-            )
-
-        other_vlan_set = set()
-        if has_other_scope:
-            other_vlan_set = sync_vlans(
-                other_vlan_list, other_group, set()
-            )
-
-        # Удаление старых связей
-        union_vlan_set = otv_vlan_set | other_vlan_set
-        ipam_vlan_ids.difference_update(union_vlan_set)
-
-        for candidate in ipam_vlan_ids:
-            vid = int(candidate)
-            # Пропускаем, если группа не активна
-            if has_otv:
-                if vid < 1000 and not has_other_scope:
-                    continue
-                if vid >= 1000 and not has_otv:
-                    continue
-            if has_otv:
-                group_id = (
-                    other_group.id if vid < 1000 else otv_group.id
-                )
-            else:
-                group_id = other_group.id
-            vlan = nb_api.ipam.vlans.get(vid=vid, vlan_group=group_id)
-            if not vlan:
-                continue
-
-            rel = nb_api.extras.relationship_associations.get(
-                relationship='devices_vlans',
-                destination_id=netbox_device.id,
-                source_id=vlan.id
-            )
-            if rel:
-                rel.delete()
-
-        logger.info('End syncing %s', netbox_device.name)
-
-    except Exception as exc:
-        logger.error('%s: %s', netbox_device.name, exc)
-
-
-def sync_vlans_for_nxos(netbox_device, nb_api):
-    """
-    Синхронизирует VLAN с Cisco NX-OS в Nautobot:
-    - создаёт/обновляет записи VLAN
-    - создаёт связи device↔vlan
-    - удаляет устаревшие связи
-    """
-    try:
-        loc_id = netbox_device.location.id
-        connection = connect_device(netbox_device, 'cisco_nxos')
-        if not connection:
-            return
-
-        logger.info('Start syncing %s', netbox_device.name)
-
-        output = connection.send_command_timing(
-            'show vlan brief', read_timeout=200
-        )
-        device_vlans = parse_output(
-            platform='cisco_nxos',
-            command='show vlan',
-            data=output
-        )
-
-        # Теги устройства
-        tags = [t.name for t in (netbox_device.tags or [])]
-        has_otv = 'scope_OTV' in tags
-        other_scope_tags = [t for t in tags if t.startswith('scope') and t != 'scope_OTV']
-        has_other_scope = bool(other_scope_tags)
-
-        # Разделяем списки VLAN из устройства
-        if has_otv:
-            otv_vlan_list = [
-                v for v in device_vlans if int(v['vlan_id']) >= 1000
-            ]
-            other_vlan_list = [
-                v for v in device_vlans if int(v['vlan_id']) < 1000
-            ]
-        else:
-            other_vlan_list = [
-                v for v in device_vlans
-            ]
-
-        # Получаем группы VLAN в Nautobot
-        otv_group = None
-        if has_otv:
-            otv_group = nb_api.ipam.vlan_groups.get(name='OTV')
-            if not otv_group:
-                logger.error('%s: группа OTV не найдена', netbox_device.name)
-                connection.disconnect()
-                return
-
-        other_group = None
-        if has_other_scope:
-            other_name = other_scope_tags[0].replace('scope_', '')
-            other_group = nb_api.ipam.vlan_groups.get(name=other_name)
-            if not other_group:
-                logger.error(
-                    '%s: группа %s не найдена',
-                    netbox_device.name, other_name
-                )
-                connection.disconnect()
-                return
-
-        # Текущие связи device↔vlan в Nautobot
-        device_rels = nb_api.extras.relationship_associations.filter(
-            relationship='devices_vlans',
-            destination_id=netbox_device.id
-        )
-
-        ipam_vlan_ids = {
-            int(rel.display.split(' (')[1].split(')')[0])
-            for rel in device_rels
-        }
-        existing_rels_map = {
-            str(r.serialize()['source_id']): r.serialize()
-            for r in device_rels
-        }
-
-        def sync_vlans(vlan_list, vlan_group, switch_vlan_ids):
-            """
-            Создаёт/обновляет VLAN и связи, возвращает множество VID.
-            """
-            records = list(nb_api.ipam.vlans.filter(
-                vlan_group=vlan_group.id
-            ))
-            existing = {
-                int(r.serialize()['vid']): r.serialize() for r in records
-            }
-
-            to_create, loc_update, rela_update = [], [], []
-
-            for v in vlan_list:
-                vid = int(v['vlan_id'])
-                switch_vlan_ids.add(vid)
-                name = v.get('name') or 'unknown'
-
-                if vid in existing:
-                    # Добавляем местоположение для OTV
-                    if loc_id not in existing[vid]['locations']:
-                        loc_update.append({
-                            'vlan': existing[vid]['id'],
-                            'location': loc_id,
-                        })
-                    # Добавляем связь device <-> vlan
-                    if existing[vid]['id'] not in existing_rels_map:
-                        rela_update.append({
-                            'relationship':
-                                '02912579-6379-43a6-9607-d3f7531ea505',
-                            'source_type': 'ipam.vlan',
-                            'destination_type': 'dcim.device',
-                            'source_id': existing[vid]['id'],
-                            'destination_id': netbox_device.id,
-                        })
-                else:
-                    to_create.append({
-                        'location': loc_id,
-                        'vlan_group': vlan_group.id,
-                        'vid': vid,
-                        'name': name,
-                        'status': 'Active',
-                    })
-            # Вызовы API в Nautobot
-            if to_create:
-                nb_api.ipam.vlans.create(to_create)
-            if loc_update:
-                nb_api.ipam.vlan_location_assignments.create(loc_update)
-            if rela_update:
-                nb_api.extras.relationship_associations.create(rela_update)
-
-            return switch_vlan_ids
-
-        # Сбор множеств VLAN по группам
-        otv_vlan_set = set()
-        if has_otv:
-            otv_vlan_set = sync_vlans(
-                otv_vlan_list, otv_group, set()
-            )
-
-        other_vlan_set = set()
-        if has_other_scope:
-            other_vlan_set = sync_vlans(
-                other_vlan_list, other_group, set()
-            )
-
-        # Удаление старых связей
-        union_vlan_set = otv_vlan_set | other_vlan_set
-        ipam_vlan_ids.difference_update(union_vlan_set)
-
-        for candidate in ipam_vlan_ids:
-            vid = int(candidate)
-            # Пропускаем, если группа не активна
-            if has_otv:
-                if vid < 1000 and not has_other_scope:
-                    continue
-                if vid >= 1000 and not has_otv:
-                    continue
-
-            if has_otv:
-                group_id = (
-                    other_group.id if vid < 1000 else otv_group.id
-                )
-            else:
-                group_id = other_group.id
-            vlan = nb_api.ipam.vlans.get(vid=vid, vlan_group=group_id)
-            if not vlan:
-                continue
-
-            rel = nb_api.extras.relationship_associations.get(
-                relationship='devices_vlans',
-                destination_id=netbox_device.id,
-                source_id=vlan.id
-            )
-            if rel:
-                rel.delete()
-
-        logger.info('End syncing %s', netbox_device.name)
-
-    except Exception as exc:
-        logger.error('%s: %s', netbox_device.name, exc)
-
-
-def get_nautobot_api():
-    """
-    Возвращает клиент pynautobot с увеличенным пулом соединений.
-    """
-    api = pynautobot.api(
-        NAUTOBOT_URL,
-        token=NAUTOBOT_TOKEN,
-        verify=False,
-    )
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=1000,
-        pool_maxsize=1000
-    )
-    api.http_session.mount('http://', adapter)
-    api.http_session.mount('https://', adapter)
-    api.http_session.verify = False
+def hpna_connection():
+    """Создаёт и возвращает сессию HPNA."""
+    print("Connecting to HPNA…")
+    api = NAInterface("https://hpna.raiffeisen.ru", ssl_verify=False)
+    api.login('ruasfih', 'Lysa142yfdwzfi@')
+    print("Connected")
     return api
 
 
-def main():
-    start = time.time()
-    api = get_nautobot_api()
+def fetch_devices():
+    """Забирает список устройств и сразу его сортирует по hostName."""
+    devices = hpna_connection().list_device()
+    print(f"Fetched {len(devices)} devices")
+    # Сортируем по имени, без учёта регистра
+    devices_sorted = sorted(devices, key=lambda d: d.hostName.lower())
+    print("Devices sorted by name")
+    return devices_sorted
 
-    # Строим мапу тегов
-    all_tags = list(api.extras.tags.all())
-    tag_map = {t.id: t.name for t in all_tags}
 
-    # Фильтруем нужные устройства
-    devices = list(api.dcim.devices.all())
-    targets = []
+def clean_name(name: str) -> str:
+    """Удаляет суффикс .net.pri (в любом регистре) и переводит в верхний регистр."""
+    # Убираем суффиксы .net.pri или .NET.PRI (вариативно)
+    cleaned = re.sub(r"\.net\.pri$", "", name, flags=re.IGNORECASE)
+    return cleaned.upper()
+
+
+def export_to_excel(devices, filename="devices.xlsx"):
+    """Записывает отсортированный и очищенный список в Excel с выпадающими списками и подсветкой."""
+    print(f"Creating Excel file '{filename}'…")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Devices"
+
+    # Заголовки
+    ws.append(["Device Name", "Scope", "Subscope"])
+
+    # Запись очищенных устройств в столбец A
     for dev in devices:
-        names = [tag_map.get(t.id) for t in (dev.tags or [])]
-        if 'raif_scripts' in names:
-            if 'scope_BRANCH' in names:
-                continue
-            else:
-                targets.append(dev)
+        name = clean_name(dev.hostName)
+        ws.append([name, "", ""])
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-        for dev in targets:
-            if dev.platform.name == 'Cisco NXOS':
-                executor.submit(sync_vlans_for_nxos, dev, api)
-            elif dev.platform.name == 'Cisco IOS' or dev.platform.name == 'Ruijie RG':
-                executor.submit(sync_vlans_for_ios, dev, api)
+    max_row = len(devices) + 1
 
-    logger.info('Elapsed time: %.2f sec', time.time() - start)
+    # Опции для выпадающих списков
+    options = [
+        "OTV", "PROD D8", "PROD 70", "PROD 34", "DTV",
+        "PROD X5", "EJP (VPN)", "iDMZ", "PCI-DCI", "PCI-D8",
+        "PCI-X5", "PCI-70", "MSK60", "MSK34", "BRANCH", "OOB"
+    ]
+    formula = f'"{",".join(options)}"'
+
+    # Настраиваем валидацию для столбцов B и C
+    dv = DataValidation(type="list", formula1=formula, allow_blank=True)
+    dv.add(f'B2:B{max_row}')
+    dv.add(f'C2:C{max_row}')
+    ws.add_data_validation(dv)
+
+    # Карта цветов для conditional formatting
+    color_map = {
+        "OTV":      "FFFFC7CE",
+        "PROD D8":  "FFC6EFCE",
+        "PROD 70":  "FFEBF1DE",
+        "PROD 34":  "FFBDD7EE",
+        "DTV":      "FFFDE9D9",
+        "PROD X5":  "FFF2DCDB",
+        "EJP (VPN)": "FFE4DFEC",
+        "iDMZ":     "FFFFF2CC",
+        "PCI-DCI":  "FFDDEBF7",
+        "PCI-D8":   "FFFCE4D6",
+        "PCI-X5":   "FFD9EAD3",
+        "PCI-70":   "FFF4DFBA",
+        "MSK60":    "FFE4F0FB",
+        "MSK34":    "FFE8EEDB",
+        "BRANCH":   "FFEDEDED",
+        "OOB":      "FFEFE7F6",
+    }
+
+    # Применяем условное форматирование для каждого значения
+    for col in ("B", "C"):
+        for val, col_code in color_map.items():
+            fill = PatternFill(start_color=col_code, end_color=col_code, fill_type="solid")
+            rule = CellIsRule(
+                operator="equal",
+                formula=[f'"{val}"'],
+                stopIfTrue=True,
+                fill=fill
+            )
+            ws.conditional_formatting.add(f"{col}2:{col}{max_row}", rule)
+
+    wb.save(filename)
+    print(f"Excel '{filename}' saved — записано {len(devices)} устройств.")
 
 
-if __name__ == '__main__':
+def main():
+    devices = fetch_devices()
+    export_to_excel(devices)
+
+if __name__ == "__main__":
     main()

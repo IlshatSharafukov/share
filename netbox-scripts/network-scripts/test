@@ -1,6 +1,12 @@
+import re
 import urllib3
+import pandas as pd
 import pynautobot
 from decouple import config
+from openpyxl import Workbook
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.styles import PatternFill
+from openpyxl.formatting.rule import CellIsRule
 
 # Отключаем предупреждения о самоподписанных сертификатах
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -13,110 +19,306 @@ def get_nautobot_api():
     """Возвращает клиент pynautobot."""
     return pynautobot.api(NAUTOBOT_URL, token=NAUTOBOT_TOKEN, verify=False)
 
-def get_scope_tags(api):
-    """Получает все scope теги из Nautobot."""
-    print("Fetching scope tags from Nautobot...")
+def normalize_tag(tag_value):
+    """Нормализует тег: заменяет пробелы на подчеркивания и переводит в верхний регистр."""
+    if not tag_value:
+        return None
     
-    all_tags = api.extras.tags.all()
-    scope_tags = []
-    
-    for tag in all_tags:
-        if tag.name.startswith('scope_'):
-            # Убираем префикс scope_ для создания VLAN группы
-            vlan_group_name = tag.name.replace('scope_', '')
-            scope_tags.append({
-                'tag_name': tag.name,
-                'vlan_group_name': vlan_group_name
-            })
-    
-    print(f"Found {len(scope_tags)} scope tags")
-    return scope_tags
+    # Убираем лишние пробелы, заменяем пробелы на подчеркивания, переводим в верхний регистр
+    normalized = str(tag_value).strip().replace(' ', '_').upper()
+    return normalized
 
-def get_existing_vlan_groups(api):
-    """Получает существующие VLAN группы."""
-    print("Fetching existing VLAN groups...")
+def load_excel_devices(filename="new_devices.xlsx"):
+    """Загружает устройства из Excel таблицы."""
+    print(f"Loading devices from {filename}...")
     
-    vlan_groups = api.ipam.vlan_groups.all()
-    existing_groups = {group.name: group for group in vlan_groups}
+    df = pd.read_excel(filename)
     
-    print(f"Found {len(existing_groups)} existing VLAN groups")
-    return existing_groups
-
-def create_vlan_groups(api, scope_tags, existing_groups):
-    """Создает отсутствующие VLAN группы."""
-    print("Creating missing VLAN groups...")
+    # Обрабатываем заголовки (если они неправильные)
+    if len(df.columns) >= 3:
+        df.columns = ['Device Name', 'Scope', 'Subscope']
     
-    created_groups = []
-    skipped_groups = []
-    
-    for scope_info in scope_tags:
-        vlan_group_name = scope_info['vlan_group_name']
-        tag_name = scope_info['tag_name']
-        
-        if vlan_group_name in existing_groups:
-            print(f"✅ VLAN group already exists: {vlan_group_name}")
-            skipped_groups.append(vlan_group_name)
+    devices = {}
+    for _, row in df.iterrows():
+        name = row['Device Name']
+        if pd.isna(name):
             continue
+            
+        scope1 = row['Scope'] if not pd.isna(row['Scope']) else None
+        scope2 = row['Subscope'] if not pd.isna(row['Subscope']) else None
         
-        try:
-            print(f"Creating VLAN group: {vlan_group_name}")
+        # Нормализуем и собираем scope теги (убираем пустые)
+        scopes = []
+        if scope1:
+            normalized_scope1 = normalize_tag(scope1)
+            if normalized_scope1:
+                scopes.append(f"scope_{normalized_scope1}")
+        if scope2:
+            normalized_scope2 = normalize_tag(scope2)
+            if normalized_scope2:
+                scopes.append(f"scope_{normalized_scope2}")
             
-            new_group = api.ipam.vlan_groups.create({
-                'name': vlan_group_name,
-                'description': f'VLAN group for {tag_name} scope devices'
-            })
-            
-            created_groups.append(vlan_group_name)
-            print(f"✅ Created VLAN group: {vlan_group_name}")
-            
-        except Exception as e:
-            print(f"❌ Failed to create VLAN group {vlan_group_name}: {e}")
+        devices[name.upper()] = scopes
     
-    return created_groups, skipped_groups
+    print(f"Loaded {len(devices)} devices from Excel")
+    
+    # Показываем примеры нормализации
+    if devices:
+        print("Examples of tag normalization:")
+        for name, tags in list(devices.items())[:3]:
+            print(f"  {name}: {tags}")
+    
+    return devices
+
+def get_nautobot_devices():
+    """Получает устройства из Nautobot с их тегами."""
+    print("Fetching devices from Nautobot...")
+    
+    api = get_nautobot_api()
+    devices = list(api.dcim.devices.all())
+    
+    device_tags = {}
+    for device in devices:
+        name = device.name.upper()
+        
+        # Получаем только scope теги
+        scope_tags = []
+        if device.tags:
+            for tag in device.tags:
+                tag_name = tag.name if hasattr(tag, 'name') else str(tag)
+                if tag_name.startswith('scope_'):
+                    scope_tags.append(tag_name)
+        
+        device_tags[name] = scope_tags
+    
+    print(f"Fetched {len(device_tags)} devices from Nautobot")
+    return device_tags
+
+def compare_devices(excel_devices, nautobot_devices):
+    """Сравнивает устройства из Excel и Nautobot."""
+    print("\nComparing devices...")
+    
+    excel_names = set(excel_devices.keys())
+    nautobot_names = set(nautobot_devices.keys())
+    
+    # Устройства только в Excel
+    only_in_excel = excel_names - nautobot_names
+    
+    # Устройства только в Nautobot
+    only_in_nautobot = nautobot_names - excel_names
+    
+    # Общие устройства
+    common_devices = excel_names & nautobot_names
+    
+    # Устройства с несовпадающими тегами
+    tag_mismatches = {}
+    for name in common_devices:
+        excel_tags = set(excel_devices[name])
+        nautobot_tags = set(nautobot_devices[name])
+        
+        if excel_tags != nautobot_tags:
+            tag_mismatches[name] = {
+                'excel_tags': list(excel_tags),
+                'nautobot_tags': list(nautobot_tags),
+                'missing_in_nautobot': list(excel_tags - nautobot_tags),
+                'extra_in_nautobot': list(nautobot_tags - excel_tags)
+            }
+    
+    # Отчет
+    print(f"\n📊 COMPARISON REPORT:")
+    print(f"   Excel devices: {len(excel_names)}")
+    print(f"   Nautobot devices: {len(nautobot_names)}")
+    print(f"   Common devices: {len(common_devices)}")
+    print(f"   Only in Excel: {len(only_in_excel)}")
+    print(f"   Only in Nautobot: {len(only_in_nautobot)}")
+    print(f"   Tag mismatches: {len(tag_mismatches)}")
+    
+    return {
+        'only_in_excel': only_in_excel,
+        'only_in_nautobot': only_in_nautobot,
+        'tag_mismatches': tag_mismatches
+    }
+
+def create_missing_tags(api, required_tags):
+    """Создает отсутствующие теги в Nautobot."""
+    print("Checking and creating missing tags...")
+    
+    existing_tags = {tag.name: tag for tag in api.extras.tags.all()}
+    created_tags = []
+    
+    for tag_name in required_tags:
+        if tag_name not in existing_tags:
+            print(f"Creating tag: {tag_name}")
+            try:
+                new_tag = api.extras.tags.create({
+                    'name': tag_name,
+                    'description': f'Scope tag: {tag_name}',
+                    'color': '3498db',  # Синий цвет в hex формате
+                    'content_types': ['dcim.device']  # Указываем как строку
+                })
+                existing_tags[tag_name] = new_tag
+                created_tags.append(tag_name)
+                print(f"✅ Created tag: {tag_name}")
+            except Exception as e:
+                print(f"❌ Failed to create tag {tag_name}: {e}")
+                # Попробуем создать без content_types (для совместимости)
+                try:
+                    print(f"Trying to create {tag_name} without content_types...")
+                    new_tag = api.extras.tags.create({
+                        'name': tag_name,
+                        'description': f'Scope tag: {tag_name}',
+                        'color': '3498db'
+                    })
+                    existing_tags[tag_name] = new_tag
+                    created_tags.append(tag_name)
+                    print(f"✅ Created tag {tag_name} (without content_types)")
+                except Exception as e2:
+                    print(f"❌ Completely failed to create tag {tag_name}: {e2}")
+    
+    print(f"Created {len(created_tags)} new tags")
+    return existing_tags
+
+def sync_device_tags(api, device_name, target_tags, existing_tags):
+    """Синхронизирует теги устройства."""
+    try:
+        device = api.dcim.devices.get(name=device_name)
+        if not device:
+            print(f"❌ Device not found: {device_name}")
+            return False
+        
+        # Получаем текущие scope теги
+        current_scope_tags = []
+        current_other_tags = []
+        
+        if device.tags:
+            for tag in device.tags:
+                tag_name = tag.name if hasattr(tag, 'name') else str(tag)
+                if tag_name.startswith('scope_'):
+                    current_scope_tags.append(tag_name)
+                else:
+                    current_other_tags.append(tag_name)
+        
+        # Формируем новый список тегов
+        new_tag_ids = []
+        
+        # Добавляем НЕ-scope теги
+        for tag_name in current_other_tags:
+            if tag_name in existing_tags:
+                new_tag_ids.append(existing_tags[tag_name].id)
+        
+        # Добавляем целевые scope теги
+        for tag_name in target_tags:
+            if tag_name in existing_tags:
+                new_tag_ids.append(existing_tags[tag_name].id)
+        
+        # Обновляем устройство
+        device.tags = new_tag_ids
+        device.save()
+        
+        print(f"✅ Updated tags for {device_name}: {target_tags}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error updating {device_name}: {e}")
+        return False
+
+def sync_all_devices(excel_devices, comparison_result):
+    """Синхронизирует все устройства."""
+    api = get_nautobot_api()
+    
+    # Собираем все необходимые теги
+    all_required_tags = set()
+    for tags in excel_devices.values():
+        all_required_tags.update(tags)
+    
+    # Создаем отсутствующие теги
+    existing_tags = create_missing_tags(api, all_required_tags)
+    
+    # Синхронизируем устройства с несовпадающими тегами
+    print(f"\nSyncing {len(comparison_result['tag_mismatches'])} devices with tag mismatches...")
+    
+    success_count = 0
+    for device_name, mismatch_info in comparison_result['tag_mismatches'].items():
+        target_tags = excel_devices[device_name]
+        if sync_device_tags(api, device_name, target_tags, existing_tags):
+            success_count += 1
+    
+    print(f"\n✅ Successfully synced {success_count} devices")
+
+def export_comparison_report(comparison_result, filename="sync_report.xlsx"):
+    """Экспортирует отчет сравнения в Excel."""
+    print(f"Creating comparison report: {filename}")
+    
+    wb = Workbook()
+    
+    # Лист с несовпадениями тегов
+    ws_mismatches = wb.active
+    ws_mismatches.title = "Tag Mismatches"
+    ws_mismatches.append(["Device Name", "Excel Tags (Normalized)", "Nautobot Tags", "Missing in Nautobot", "Extra in Nautobot"])
+    
+    for device, info in comparison_result['tag_mismatches'].items():
+        ws_mismatches.append([
+            device,
+            ", ".join(info['excel_tags']),
+            ", ".join(info['nautobot_tags']),
+            ", ".join(info['missing_in_nautobot']),
+            ", ".join(info['extra_in_nautobot'])
+        ])
+    
+    # Лист с устройствами только в Excel
+    if comparison_result['only_in_excel']:
+        ws_excel = wb.create_sheet("Only in Excel")
+        ws_excel.append(["Device Name"])
+        for device in comparison_result['only_in_excel']:
+            ws_excel.append([device])
+    
+    # Лист с устройствами только в Nautobot
+    if comparison_result['only_in_nautobot']:
+        ws_nautobot = wb.create_sheet("Only in Nautobot")
+        ws_nautobot.append(["Device Name"])
+        for device in comparison_result['only_in_nautobot']:
+            ws_nautobot.append([device])
+    
+    # Лист со статистикой нормализации тегов
+    ws_normalization = wb.create_sheet("Tag Normalization")
+    ws_normalization.append(["Original Tag", "Normalized Tag", "Transformation"])
+    
+    # Примеры нормализации
+    normalization_examples = [
+        ("PROD 70", "PROD_70", "space → underscore"),
+        ("PROD D8", "PROD_D8", "space → underscore"),
+        ("PROD 34", "PROD_34", "space → underscore"),
+        ("EJP (VPN)", "EJP_(VPN)", "space → underscore"),
+        ("iDMZ", "IDMZ", "lowercase → UPPERCASE"),
+        ("OTV", "OTV", "no change"),
+        ("BRANCH", "BRANCH", "no change"),
+    ]
+    
+    for original, normalized, transformation in normalization_examples:
+        ws_normalization.append([original, f"scope_{normalized}", transformation])
+    
+    wb.save(filename)
+    print(f"Report saved: {filename}")
+    print("Report includes tag normalization examples for reference")
 
 def main():
     """Основная функция."""
-    print("=== VLAN GROUPS CREATOR ===")
+    print("=== NAUTOBOT SCOPE TAGS SYNCHRONIZATION ===")
     
-    # Подключение к Nautobot
-    api = get_nautobot_api()
+    # 1. Загружаем данные
+    excel_devices = load_excel_devices("new_devices.xlsx")
+    nautobot_devices = get_nautobot_devices()
     
-    # Получаем scope теги
-    scope_tags = get_scope_tags(api)
+    # 2. Сравниваем
+    comparison_result = compare_devices(excel_devices, nautobot_devices)
     
-    if not scope_tags:
-        print("❌ No scope tags found! Run the tag sync script first.")
-        return
+    # 3. Создаем отчет
+    export_comparison_report(comparison_result)
     
-    # Получаем существующие VLAN группы
-    existing_groups = get_existing_vlan_groups(api)
+    # 4. Опционально синхронизируем (раскомментировать для реального запуска)
+    # sync_all_devices(excel_devices, comparison_result)
     
-    # Создаем отсутствующие VLAN группы
-    created_groups, skipped_groups = create_vlan_groups(api, scope_tags, existing_groups)
-    
-    # Отчет
-    print(f"\n📊 SUMMARY:")
-    print(f"   Total scope tags found: {len(scope_tags)}")
-    print(f"   VLAN groups already existed: {len(skipped_groups)}")
-    print(f"   VLAN groups created: {len(created_groups)}")
-    
-    if created_groups:
-        print(f"\n✅ Created VLAN groups:")
-        for group in created_groups:
-            print(f"   • {group}")
-    
-    if skipped_groups:
-        print(f"\n⏭️  Existing VLAN groups (skipped):")
-        for group in skipped_groups:
-            print(f"   • {group}")
-    
-    print(f"\n🎯 VLAN GROUP MAPPING:")
-    print("   Scope Tag → VLAN Group")
-    for scope_info in scope_tags:
-        status = "✅" if scope_info['vlan_group_name'] in created_groups else "⏭️"
-        print(f"   {scope_info['tag_name']} → {scope_info['vlan_group_name']} {status}")
-    
-    print("\n=== VLAN GROUPS CREATION COMPLETE ===")
+    print("\n=== SYNCHRONIZATION COMPLETE ===")
 
 if __name__ == "__main__":
     main()

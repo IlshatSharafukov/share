@@ -88,7 +88,7 @@ def sync_vlans_for_ios(netbox_device, nb_api):
         if has_pci_dci:
             # ВСЕ VLAN идут в группу PCI-DCI
             pci_vlan_list = device_vlans
-            
+
             # Получаем группу PCI-DCI
             pci_group = nb_api.ipam.vlan_groups.get(name='PCI-DCI')
             if not pci_group:
@@ -103,7 +103,7 @@ def sync_vlans_for_ios(netbox_device, nb_api):
             other_vlan_list = [
                 v for v in device_vlans if int(v['vlan_id']) < 1000
             ]
-            
+
             # Получаем группы VLAN в Nautobot
             otv_group = nb_api.ipam.vlan_groups.get(name='OTV')
             if not otv_group:
@@ -125,7 +125,7 @@ def sync_vlans_for_ios(netbox_device, nb_api):
         else:
             # Одиночный scope - все VLAN в одну группу
             other_vlan_list = device_vlans
-            
+
             other_group = None
             if has_other_scope:
                 other_name = other_scope_tags[0].replace('scope_', '')
@@ -213,18 +213,18 @@ def sync_vlans_for_ios(netbox_device, nb_api):
         elif has_otv:
             # OTV: разделение по VID
             otv_vlan_set = sync_vlans(otv_vlan_list, otv_group, set())
-            
+
             other_vlan_set = set()
             if has_other_scope:
                 other_vlan_set = sync_vlans(other_vlan_list, other_group, set())
-            
+
             union_vlan_set = otv_vlan_set | other_vlan_set
         else:
             # Одиночный scope: все VLAN в одну группу
             other_vlan_set = set()
             if has_other_scope:
                 other_vlan_set = sync_vlans(other_vlan_list, other_group, set())
-            
+
             union_vlan_set = other_vlan_set
 
         # Удаление старых связей
@@ -232,7 +232,7 @@ def sync_vlans_for_ios(netbox_device, nb_api):
 
         for candidate in ipam_vlan_ids:
             vid = int(candidate)
-            
+
             # Определяем группу для удаления связи
             if has_pci_dci:
                 group_id = pci_group.id
@@ -247,7 +247,7 @@ def sync_vlans_for_ios(netbox_device, nb_api):
                 group_id = other_group.id
             else:
                 continue
-                
+
             vlan = nb_api.ipam.vlans.get(vid=vid, vlan_group=group_id)
             if not vlan:
                 continue
@@ -301,7 +301,7 @@ def sync_vlans_for_nxos(netbox_device, nb_api):
         if has_pci_dci:
             # ВСЕ VLAN идут в группу PCI-DCI
             pci_vlan_list = device_vlans
-            
+
             # Получаем группу PCI-DCI
             pci_group = nb_api.ipam.vlan_groups.get(name='PCI-DCI')
             if not pci_group:
@@ -316,7 +316,7 @@ def sync_vlans_for_nxos(netbox_device, nb_api):
             other_vlan_list = [
                 v for v in device_vlans if int(v['vlan_id']) < 1000
             ]
-            
+
             # Получаем группы VLAN в Nautobot
             otv_group = nb_api.ipam.vlan_groups.get(name='OTV')
             if not otv_group:
@@ -338,7 +338,7 @@ def sync_vlans_for_nxos(netbox_device, nb_api):
         else:
             # Одиночный scope - все VLAN в одну группу
             other_vlan_list = device_vlans
-            
+
             other_group = None
             if has_other_scope:
                 other_name = other_scope_tags[0].replace('scope_', '')
@@ -427,18 +427,18 @@ def sync_vlans_for_nxos(netbox_device, nb_api):
         elif has_otv:
             # OTV: разделение по VID
             otv_vlan_set = sync_vlans(otv_vlan_list, otv_group, set())
-            
+
             other_vlan_set = set()
             if has_other_scope:
                 other_vlan_set = sync_vlans(other_vlan_list, other_group, set())
-            
+
             union_vlan_set = otv_vlan_set | other_vlan_set
         else:
             # Одиночный scope: все VLAN в одну группу
             other_vlan_set = set()
             if has_other_scope:
                 other_vlan_set = sync_vlans(other_vlan_list, other_group, set())
-            
+
             union_vlan_set = other_vlan_set
 
         # Удаление старых связей
@@ -446,7 +446,7 @@ def sync_vlans_for_nxos(netbox_device, nb_api):
 
         for candidate in ipam_vlan_ids:
             vid = int(candidate)
-            
+
             # Определяем группу для удаления связи
             if has_pci_dci:
                 group_id = pci_group.id
@@ -461,7 +461,7 @@ def sync_vlans_for_nxos(netbox_device, nb_api):
                 group_id = other_group.id
             else:
                 continue
-                
+
             vlan = nb_api.ipam.vlans.get(vid=vid, vlan_group=group_id)
             if not vlan:
                 continue
@@ -513,16 +513,15 @@ def main():
     for dev in devices:
         names = [tag_map.get(t.id) for t in (dev.tags or [])]
         if 'raif_scripts' in names:
-            if 'scope_BRANCH' in names:
-                continue
-            else:
-                targets.append(dev)
+            targets.append(dev)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
         for dev in targets:
             if dev.platform.name == 'Cisco NXOS':
+                #sync_vlans_for_nxos(dev,api)
                 executor.submit(sync_vlans_for_nxos, dev, api)
             elif dev.platform.name == 'Cisco IOS' or dev.platform.name == 'Ruijie RG':
+                #sync_vlans_for_ios(dev,api)
                 executor.submit(sync_vlans_for_ios, dev, api)
 
     logger.info('Elapsed time: %.2f sec', time.time() - start)

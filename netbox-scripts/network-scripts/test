@@ -43,16 +43,36 @@ def cleanup_unused_vlans():
     all_vlans = list(api.ipam.vlans.all())
     logger.info(f'Найдено VLAN: {len(all_vlans)}')
     
-    # Получаем все связи devices_vlans
+    # Получаем связи пачками для ускорения
     logger.info('Получение связей device-vlan...')
-    device_vlan_relations = list(api.extras.relationship_associations.filter(
-        relationship='devices_vlans'
-    ))
+    linked_vlan_ids = set()
     
-    # Создаем множество ID VLAN, которые связаны с устройствами
-    linked_vlan_ids = {
-        rel.source_id for rel in device_vlan_relations
-    }
+    # Используем пагинацию с большим размером страницы
+    page_size = 1000
+    offset = 0
+    
+    while True:
+        relations_page = api.extras.relationship_associations.filter(
+            relationship='devices_vlans',
+            limit=page_size,
+            offset=offset
+        )
+        
+        if not relations_page:
+            break
+            
+        # Добавляем ID из текущей страницы
+        page_vlan_ids = {rel.source_id for rel in relations_page}
+        linked_vlan_ids.update(page_vlan_ids)
+        
+        logger.info(f'Обработано связей: {offset + len(relations_page)}')
+        
+        # Если страница неполная - это последняя
+        if len(relations_page) < page_size:
+            break
+            
+        offset += page_size
+    
     logger.info(f'VLAN связанных с устройствами: {len(linked_vlan_ids)}')
     
     # Находим VLAN без связей
@@ -63,15 +83,21 @@ def cleanup_unused_vlans():
     
     logger.info(f'VLAN для удаления: {len(vlans_to_delete)}')
     
-    # Удаляем неиспользуемые VLAN
+    # Удаляем неиспользуемые VLAN пачками
     deleted_count = 0
-    for vlan in vlans_to_delete:
-        try:
-            logger.info(f'Удаление VLAN {vlan.vid} ({vlan.name}) ID: {vlan.id}')
-            vlan.delete()
-            deleted_count += 1
-        except Exception as e:
-            logger.error(f'Ошибка удаления VLAN {vlan.vid}: {e}')
+    batch_size = 50
+    
+    for i in range(0, len(vlans_to_delete), batch_size):
+        batch = vlans_to_delete[i:i + batch_size]
+        for vlan in batch:
+            try:
+                logger.info(f'Удаление VLAN {vlan.vid} ({vlan.name}) ID: {vlan.id}')
+                vlan.delete()
+                deleted_count += 1
+            except Exception as e:
+                logger.error(f'Ошибка удаления VLAN {vlan.vid}: {e}')
+        
+        logger.info(f'Обработано пачек удаления: {(i // batch_size) + 1}')
     
     logger.info(f'Успешно удалено VLAN: {deleted_count}')
 

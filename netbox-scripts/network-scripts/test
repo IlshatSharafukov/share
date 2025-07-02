@@ -127,6 +127,58 @@ def get_discovered_tag(nautobot_api):
         return None
 
 
+def process_single_vrf(nautobot_device, nautobot_api, discovered_tag_id, vrf_name, vrf_id, platform):
+    """Обрабатывает один VRF устройства."""
+    net_connect = netmiko_connect_with_retry(nautobot_device, platform)
+    
+    if not net_connect:
+        logger.error(f'Failed to connect to device {nautobot_device.name} for VRF {vrf_name}')
+        return
+
+    try:
+        # Получаем ARP-таблицу с устройства
+        output = send_command_safe(net_connect, f'show ip arp vrf {vrf_name}')
+        device_arp = parse_output(platform=platform, command='show ip arp', data=output)
+
+        # Подготавливаем батч для обработки
+        arp_batch = []
+        
+        for arp_entry in device_arp:
+            if platform == 'cisco_ios':
+                skip_list = [
+                    '192.168.0.0', '192.168.0.1', '192.168.0.2',
+                    '192.168.0.3', '192.168.0.4', '192.168.0.5',
+                    '192.168.0.6'
+                ]
+                # Пропускаем служебные IP-адреса
+                if any(sub in arp_entry['address'] for sub in skip_list):
+                    continue
+
+            # Форматируем MAC-адрес
+            arp_entry['mac'] = format_mac_address(arp_entry['mac'])
+            
+            # Пропускаем неполные MAC-адреса
+            if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
+                continue
+
+            # Получаем DNS имя
+            arp_entry['dns_name'] = get_dns_name(arp_entry['address'])
+            
+            arp_batch.append(arp_entry)
+
+        # Массово обрабатываем батч
+        process_ips_batch(nautobot_api, arp_batch, nautobot_device.name, discovered_tag_id, f"VRF {vrf_name}")
+
+    except Exception as vrf_error:
+        logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
+    finally:
+        if net_connect and hasattr(net_connect, 'disconnect'):
+            try:
+                net_connect.disconnect()
+            except Exception:
+                pass
+
+
 def parse_ilo_arp_output(output):
     """Парсит ARP вывод для iLO и других нестандартных устройств."""
     import re
@@ -543,56 +595,82 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api, discovered_t
         device_vrfs = nautobot_api.ipam.vrfs.filter(device=nautobot_device.id)
         existing_vrf_in_device = {vrf.name: vrf.id for vrf in device_vrfs}
 
-        for vrf_name, vrf_id in existing_vrf_in_device.items():
-            try:
-                # Проверяем состояние соединения перед каждым VRF
-                if not net_connect.is_alive():
-                    logger.warning(f"SSH connection lost for device {nautobot_device.name}, reconnecting...")
-                    net_connect = netmiko_connect_with_retry(nautobot_device, 'cisco_ios')
-                    if not net_connect:
-                        logger.error(f"Failed to reconnect to device {nautobot_device.name}")
-                        return
-
-                # Получаем ARP-таблицу с устройства
-                output = send_command_safe(net_connect, f'show ip arp vrf {vrf_name}')
-                device_arp = parse_output(platform='cisco_ios', command='show ip arp', data=output)
-
-                # Подготавливаем батч для обработки
-                arp_batch = []
+        # Если VRF много - обрабатываем параллельно
+        if len(existing_vrf_in_device) > 5:
+            logger.info(f'Device {nautobot_device.name} has {len(existing_vrf_in_device)} VRFs, processing in parallel')
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as vrf_executor:
+                vrf_futures = []
+                for vrf_name, vrf_id in existing_vrf_in_device.items():
+                    future = vrf_executor.submit(
+                        process_single_vrf,
+                        nautobot_device,
+                        nautobot_api,
+                        discovered_tag_id,
+                        vrf_name,
+                        vrf_id,
+                        'cisco_ios'
+                    )
+                    vrf_futures.append(future)
                 
-                for arp_entry in device_arp:
-                    skip_list = [
-                        '192.168.0.0', '192.168.0.1', '192.168.0.2',
-                        '192.168.0.3', '192.168.0.4', '192.168.0.5',
-                        '192.168.0.6'
-                    ]
+                # Ждем завершения всех VRF
+                for future in concurrent.futures.as_completed(vrf_futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f'VRF processing error for device {nautobot_device.name}: {e}')
+        else:
+            # Если VRF мало - обрабатываем последовательно (как раньше)
+            for vrf_name, vrf_id in existing_vrf_in_device.items():
+                try:
+                    # Проверяем состояние соединения перед каждым VRF
+                    if not net_connect.is_alive():
+                        logger.warning(f"SSH connection lost for device {nautobot_device.name}, reconnecting...")
+                        net_connect = netmiko_connect_with_retry(nautobot_device, 'cisco_ios')
+                        if not net_connect:
+                            logger.error(f"Failed to reconnect to device {nautobot_device.name}")
+                            return
 
-                    # Пропускаем служебные IP-адреса
-                    if any(sub in arp_entry['address'] for sub in skip_list):
-                        continue
+                    # Получаем ARP-таблицу с устройства
+                    output = send_command_safe(net_connect, f'show ip arp vrf {vrf_name}')
+                    device_arp = parse_output(platform='cisco_ios', command='show ip arp', data=output)
 
-                    # Форматируем MAC-адрес
-                    arp_entry['mac'] = format_mac_address(arp_entry['mac'])
+                    # Подготавливаем батч для обработки
+                    arp_batch = []
                     
-                    # Пропускаем неполные MAC-адреса
-                    if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
-                        continue
+                    for arp_entry in device_arp:
+                        skip_list = [
+                            '192.168.0.0', '192.168.0.1', '192.168.0.2',
+                            '192.168.0.3', '192.168.0.4', '192.168.0.5',
+                            '192.168.0.6'
+                        ]
 
-                    # Получаем DNS имя
-                    arp_entry['dns_name'] = get_dns_name(arp_entry['address'])
-                    
-                    arp_batch.append(arp_entry)
+                        # Пропускаем служебные IP-адреса
+                        if any(sub in arp_entry['address'] for sub in skip_list):
+                            continue
 
-                # Массово обрабатываем батч
-                process_ips_batch(nautobot_api, arp_batch, nautobot_device.name, discovered_tag_id, f"VRF {vrf_name}")
+                        # Форматируем MAC-адрес
+                        arp_entry['mac'] = format_mac_address(arp_entry['mac'])
+                        
+                        # Пропускаем неполные MAC-адреса
+                        if str(arp_entry['mac']).upper() == 'IN-CO-MP-LE-TE':
+                            continue
 
-            except Exception as vrf_error:
-                # Проверяем тип ошибки - если соединение закрыто, пытаемся переподключиться
-                if "socket is closed" in str(vrf_error).lower() or "connection" in str(vrf_error).lower():
-                    logger.warning(f'Connection lost during VRF {vrf_name} processing for device {nautobot_device.name}, skipping remaining VRFs')
-                    break
-                else:
-                    logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
+                        # Получаем DNS имя
+                        arp_entry['dns_name'] = get_dns_name(arp_entry['address'])
+                        
+                        arp_batch.append(arp_entry)
+
+                    # Массово обрабатываем батч
+                    process_ips_batch(nautobot_api, arp_batch, nautobot_device.name, discovered_tag_id, f"VRF {vrf_name}")
+
+                except Exception as vrf_error:
+                    # Проверяем тип ошибки - если соединение закрыто, пытаемся переподключиться
+                    if "socket is closed" in str(vrf_error).lower() or "connection" in str(vrf_error).lower():
+                        logger.warning(f'Connection lost during VRF {vrf_name} processing for device {nautobot_device.name}, skipping remaining VRFs')
+                        break
+                    else:
+                        logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
 
         if net_connect and hasattr(net_connect, 'disconnect'):
             try:

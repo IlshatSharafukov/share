@@ -198,25 +198,58 @@ def process_ips_batch(nautobot_api, arp_entries, device_name, discovered_tag_id,
         if ip_address in all_ips_cache:
             # IP существует - готовим обновление
             existing_ip = all_ips_cache[ip_address]
-            update_data = {
-                'id': existing_ip.id,
-                'custom_fields': {
-                    'mac_address': arp_entry['mac'],
-                    'last_update': current_time
-                },
-                'dns_name': arp_entry['dns_name']
-            }
-            
-            # Добавляем тег если его нет
-            if discovered_tag_id:
-                current_tags = [tag.id for tag in existing_ip.tags or []]
-                if discovered_tag_id not in current_tags:
-                    current_tags.append(discovered_tag_id)
-                    update_data['tags'] = current_tags
-            
-            to_update.append(update_data)
+            # Проверяем что это объект Nautobot, а не словарь
+            if hasattr(existing_ip, 'id'):
+                update_data = {
+                    'id': existing_ip.id,
+                    'custom_fields': {
+                        'mac_address': arp_entry['mac'],
+                        'last_update': current_time
+                    },
+                    'dns_name': arp_entry['dns_name']
+                }
+                
+                # Добавляем тег если его нет
+                if discovered_tag_id:
+                    current_tags = [tag.id for tag in existing_ip.tags or []]
+                    if discovered_tag_id not in current_tags:
+                        current_tags.append(discovered_tag_id)
+                        update_data['tags'] = current_tags
+                
+                to_update.append(update_data)
+            else:
+                # Объект в кэше поврежден, пропускаем
+                logger.warning(f"Invalid object in cache for IP {ip_address}")
+                continue
         else:
-            # IP не существует - готовим создание
+            # IP не существует - проверяем дополнительно в API перед созданием
+            try:
+                existing_ip = nautobot_api.ipam.ip_addresses.get(address=ip_address)
+                if existing_ip:
+                    # IP найден в API, но не был в кэше - добавляем в кэш и обновляем
+                    all_ips_cache[ip_address] = existing_ip
+                    update_data = {
+                        'id': existing_ip.id,
+                        'custom_fields': {
+                            'mac_address': arp_entry['mac'],
+                            'last_update': current_time
+                        },
+                        'dns_name': arp_entry['dns_name']
+                    }
+                    
+                    if discovered_tag_id:
+                        current_tags = [tag.id for tag in existing_ip.tags or []]
+                        if discovered_tag_id not in current_tags:
+                            current_tags.append(discovered_tag_id)
+                            update_data['tags'] = current_tags
+                    
+                    to_update.append(update_data)
+                    continue
+            except Exception:
+                # IP действительно не существует
+                pass
+            
+            # Готовим создание нового IP
             create_data = {
                 "address": ip_address,
                 "custom_fields": {
@@ -233,18 +266,25 @@ def process_ips_batch(nautobot_api, arp_entries, device_name, discovered_tag_id,
                 create_data['tags'] = [discovered_tag_id]
             
             to_create.append(create_data)
-            # Добавляем в кэш чтобы избежать дублирования в следующих батчах
-            all_ips_cache[ip_address] = create_data
     
     # Выполняем массовые операции с retry логикой
     if to_create:
         for attempt in range(3):
             try:
-                nautobot_api.ipam.ip_addresses.create(to_create)
+                created_ips = nautobot_api.ipam.ip_addresses.create(to_create)
                 logger.info(f"Created {len(to_create)} IPs for device {device_name}")
+                # Добавляем созданные IP в кэш
+                if isinstance(created_ips, list):
+                    for created_ip in created_ips:
+                        if hasattr(created_ip, 'address'):
+                            all_ips_cache[created_ip.address] = created_ip
                 break
             except Exception as error:
-                if attempt < 2:
+                if "already exists" in str(error).lower():
+                    # IP уже существуют - это race condition, игнорируем
+                    logger.info(f"IPs already exist for device {device_name} (race condition)")
+                    break
+                elif attempt < 2:
                     logger.warning(f"Attempt {attempt + 1} failed for creating IPs, retrying: {error}")
                     time.sleep(2 ** attempt)
                 else:

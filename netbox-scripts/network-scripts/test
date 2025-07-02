@@ -296,7 +296,7 @@ def process_ips_batch(nautobot_api, arp_entries, device_name, discovered_tag_id,
             
             to_create.append(create_data)
     
-    # Массовые операции с retry логикой
+    # Массовые операции с retry логикой - ВЕСЬ БАТЧ ЦЕЛИКОМ
     if to_create:
         for attempt in range(3):
             try:
@@ -311,30 +311,27 @@ def process_ips_batch(nautobot_api, arp_entries, device_name, discovered_tag_id,
                     logger.error(f"Error creating IPs for device {device_name}: {error}")
     
     if to_update:
-        # Разбиваем обновления на меньшие батчи
-        batch_size = 100
-        for i in range(0, len(to_update), batch_size):
-            batch = to_update[i:i + batch_size]
-            
-            for attempt in range(3):
-                try:
-                    nautobot_api.ipam.ip_addresses.update(batch)
-                    logger.info(f"Updated {len(batch)} IPs for device {device_name} (batch {i//batch_size + 1})")
-                    break
-                except Exception as error:
-                    if attempt < 2:
-                        logger.warning(f"Attempt {attempt + 1} failed for updating IPs batch {i//batch_size + 1}, retrying: {error}")
-                        time.sleep(2 ** attempt)
-                    else:
-                        logger.error(f"Error updating IPs batch {i//batch_size + 1} for device {device_name}: {error}")
-                        # Пытаемся обновить по одному если батч не работает
-                        for update_item in batch:
-                            try:
-                                existing_ip = nautobot_api.ipam.ip_addresses.get(id=update_item['id'])
-                                if existing_ip:
-                                    existing_ip.update(update_item)
-                            except Exception as single_error:
-                                logger.error(f"Failed to update single IP {update_item.get('id')}: {single_error}")
+        for attempt in range(3):
+            try:
+                # ОТПРАВЛЯЕМ ВЕСЬ БАТЧ ОБНОВЛЕНИЙ ЦЕЛИКОМ
+                nautobot_api.ipam.ip_addresses.update(to_update)
+                logger.info(f"Updated {len(to_update)} IPs for device {device_name}")
+                break
+            except Exception as error:
+                if attempt < 2:
+                    logger.warning(f"Attempt {attempt + 1} failed for updating IPs, retrying: {error}")
+                    time.sleep(2 ** attempt)
+                else:
+                    logger.error(f"Error updating IPs for device {device_name}: {error}")
+                    # Fallback - пытаемся обновить по одному если массовое обновление не работает
+                    logger.info(f"Trying individual updates for {len(to_update)} IPs...")
+                    for update_item in to_update:
+                        try:
+                            existing_ip = nautobot_api.ipam.ip_addresses.get(id=update_item['id'])
+                            if existing_ip:
+                                existing_ip.update(update_item)
+                        except Exception as single_error:
+                            logger.error(f"Failed to update single IP {update_item.get('id')}: {single_error}")
 
 
 def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platform, discovered_tag_id):

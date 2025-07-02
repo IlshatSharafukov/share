@@ -244,20 +244,45 @@ def process_ips_batch(nautobot_api, arp_entries, device_name, discovered_tag_id,
             
             to_create.append(create_data)
     
-    # Массовые операции
-    try:
-        if to_create:
-            nautobot_api.ipam.ip_addresses.create(to_create)
-            logger.info(f"Created {len(to_create)} IPs for device {device_name}")
-    except Exception as error:
-        logger.error(f"Error creating IPs for device {device_name}: {error}")
+    # Массовые операции с retry логикой
+    if to_create:
+        for attempt in range(3):
+            try:
+                nautobot_api.ipam.ip_addresses.create(to_create)
+                logger.info(f"Created {len(to_create)} IPs for device {device_name}")
+                break
+            except Exception as error:
+                if attempt < 2:
+                    logger.warning(f"Attempt {attempt + 1} failed for creating IPs, retrying: {error}")
+                    time.sleep(2 ** attempt)  # 1, 2 секунды
+                else:
+                    logger.error(f"Error creating IPs for device {device_name}: {error}")
     
-    try:
-        if to_update:
-            nautobot_api.ipam.ip_addresses.update(to_update)
-            logger.info(f"Updated {len(to_update)} IPs for device {device_name}")
-    except Exception as error:
-        logger.error(f"Error updating IPs for device {device_name}: {error}")
+    if to_update:
+        # Разбиваем обновления на меньшие батчи
+        batch_size = 100
+        for i in range(0, len(to_update), batch_size):
+            batch = to_update[i:i + batch_size]
+            
+            for attempt in range(3):
+                try:
+                    nautobot_api.ipam.ip_addresses.update(batch)
+                    logger.info(f"Updated {len(batch)} IPs for device {device_name} (batch {i//batch_size + 1})")
+                    break
+                except Exception as error:
+                    if attempt < 2:
+                        logger.warning(f"Attempt {attempt + 1} failed for updating IPs batch {i//batch_size + 1}, retrying: {error}")
+                        time.sleep(2 ** attempt)
+                    else:
+                        logger.error(f"Error updating IPs batch {i//batch_size + 1} for device {device_name}: {error}")
+                        # Пытаемся обновить по одному если батч не работает
+                        for update_item in batch:
+                            try:
+                                existing_ip = nautobot_api.ipam.ip_addresses.get(id=update_item['id'])
+                                if existing_ip:
+                                    existing_ip.update(update_item)
+                            except Exception as single_error:
+                                logger.error(f"Failed to update single IP {update_item.get('id')}: {single_error}")
 
 
 def process_global_arp_table(net_connect, nautobot_device, nautobot_api, platform, discovered_tag_id):
@@ -520,6 +545,14 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api, discovered_t
 
         for vrf_name, vrf_id in existing_vrf_in_device.items():
             try:
+                # Проверяем состояние соединения перед каждым VRF
+                if not net_connect.is_alive():
+                    logger.warning(f"SSH connection lost for device {nautobot_device.name}, reconnecting...")
+                    net_connect = netmiko_connect_with_retry(nautobot_device, 'cisco_ios')
+                    if not net_connect:
+                        logger.error(f"Failed to reconnect to device {nautobot_device.name}")
+                        return
+
                 # Получаем ARP-таблицу с устройства
                 output = send_command_safe(net_connect, f'show ip arp vrf {vrf_name}')
                 device_arp = parse_output(platform='cisco_ios', command='show ip arp', data=output)
@@ -554,9 +587,18 @@ def create_arp_nautobot_on_cisco_ios(nautobot_device, nautobot_api, discovered_t
                 process_ips_batch(nautobot_api, arp_batch, nautobot_device.name, discovered_tag_id, f"VRF {vrf_name}")
 
             except Exception as vrf_error:
-                logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
+                # Проверяем тип ошибки - если соединение закрыто, пытаемся переподключиться
+                if "socket is closed" in str(vrf_error).lower() or "connection" in str(vrf_error).lower():
+                    logger.warning(f'Connection lost during VRF {vrf_name} processing for device {nautobot_device.name}, skipping remaining VRFs')
+                    break
+                else:
+                    logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
 
-        net_connect.disconnect()
+        if net_connect and hasattr(net_connect, 'disconnect'):
+            try:
+                net_connect.disconnect()
+            except Exception:
+                pass  # Игнорируем ошибки при отключении
 
     except Exception as error:
         logger.error(f'Error processing device {nautobot_device.name}: {error}')
@@ -579,6 +621,14 @@ def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api, discovered_
 
         for vrf_name, vrf_id in existing_vrf_in_device.items():
             try:
+                # Проверяем состояние соединения перед каждым VRF
+                if not net_connect.is_alive():
+                    logger.warning(f"SSH connection lost for device {nautobot_device.name}, reconnecting...")
+                    net_connect = netmiko_connect_with_retry(nautobot_device, 'cisco_nxos')
+                    if not net_connect:
+                        logger.error(f"Failed to reconnect to device {nautobot_device.name}")
+                        return
+
                 # Получаем ARP-таблицу с устройства
                 output = send_command_safe(net_connect, f'show ip arp vrf {vrf_name}')
                 device_arp = parse_output(platform='cisco_nxos', command='show ip arp', data=output)
@@ -603,9 +653,18 @@ def create_arp_nautobot_on_cisco_nxos(nautobot_device, nautobot_api, discovered_
                 process_ips_batch(nautobot_api, arp_batch, nautobot_device.name, discovered_tag_id, f"VRF {vrf_name}")
 
             except Exception as vrf_error:
-                logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
+                # Проверяем тип ошибки - если соединение закрыто, пытаемся переподключиться
+                if "socket is closed" in str(vrf_error).lower() or "connection" in str(vrf_error).lower():
+                    logger.warning(f'Connection lost during VRF {vrf_name} processing for device {nautobot_device.name}, skipping remaining VRFs')
+                    break
+                else:
+                    logger.error(f'Error processing VRF {vrf_name} for device {nautobot_device.name}: {vrf_error}')
 
-        net_connect.disconnect()
+        if net_connect and hasattr(net_connect, 'disconnect'):
+            try:
+                net_connect.disconnect()
+            except Exception:
+                pass  # Игнорируем ошибки при отключении
 
     except Exception as error:
         logger.error(f'Error processing device {nautobot_device.name}: {error}')
@@ -634,8 +693,8 @@ def add_arp_entry_to_nautobot():
 
     print(f"Found {len(target_devices)} target devices")
 
-    # Многопоточная обработка устройств
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+    # Многопоточная обработка устройств с уменьшенным количеством потоков
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:  # Уменьшено с 100 до 50
         for nautobot_device in target_devices:
             if nautobot_device.platform and nautobot_device.platform.name == 'Cisco NXOS':
                 executor.submit(

@@ -109,13 +109,20 @@ def synchronize_vrfs(device_vrfs, netbox_device, netbox_api):
     logger.debug(f"  Device VRFs ({len(device_vrf_names)}): {sorted(device_vrf_names)}")
     logger.debug(f"  Raw device_vrfs count: {len(device_vrfs)}")
     
-    # Определяем что нужно удалить
+    # Определяем что нужно удалить, ИСКЛЮЧАЕМ GRT из удаления
     vrfs_to_delete = netbox_vrf_names - device_vrf_names
+    # Убираем GRT из списка на удаление - он никогда не должен удаляться
+    vrfs_to_delete.discard('GRT')
     
     # Логируем план удаления
     if vrfs_to_delete:
         logger.info(f"VRFs to delete from {netbox_device.name}: {list(vrfs_to_delete)}")
         for vrf_name in vrfs_to_delete:
+            # Дополнительная проверка на GRT (на всякий случай)
+            if vrf_name == 'GRT':
+                logger.warning(f"SKIPPING GRT deletion for {netbox_device.name} - GRT is protected")
+                continue
+                
             # ВРЕМЕННО ЗАКОММЕНТИРОВАНО - пока только логируем
             logger.warning(f"WOULD DELETE VRF: {vrf_name} from {netbox_device.name}")
             

@@ -1,3 +1,4 @@
+import concurrent.futures
 import time
 import pynetbox
 import requests
@@ -86,8 +87,37 @@ def netmiko_connect(netbox_device, device_type):
                 logger.error(f"Connection failed to {netbox_device.name}: {e}")
                 return None
 
+def synchronize_vrfs(device_vrfs, netbox_device, netbox_api):
+    """Синхронизация VRF между устройством и NetBox"""
+    
+    # Получаем VRF из NetBox для данного устройства
+    netbox_vrfs = list(netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id))
+    netbox_vrf_names = {vrf.name for vrf in netbox_vrfs}
+    device_vrf_names = {vrf.get('name') for vrf in device_vrfs if vrf.get('name') and vrf.get('name') != 'default'}
+    
+    # Определяем что нужно удалить
+    vrfs_to_delete = netbox_vrf_names - device_vrf_names
+    
+    # Логируем план удаления
+    if vrfs_to_delete:
+        logger.info(f"VRFs to delete from {netbox_device.name}: {list(vrfs_to_delete)}")
+        for vrf_name in vrfs_to_delete:
+            # ВРЕМЕННО ЗАКОММЕНТИРОВАНО - пока только логируем
+            logger.warning(f"WOULD DELETE VRF: {vrf_name} from {netbox_device.name}")
+            
+            # Раскомментировать когда будете готовы к реальному удалению:
+            # try:
+            #     vrf_to_delete = netbox_api.ipam.vrfs.get(name=vrf_name, cf_device=netbox_device.id)
+            #     if vrf_to_delete:
+            #         vrf_to_delete.delete()
+            #         logger.info(f"DELETED VRF: {vrf_name} from {netbox_device.name}")
+            # except Exception as e:
+            #     logger.error(f"Failed to delete VRF {vrf_name}: {e}")
+    
+    return vrfs_to_delete
+
 def create_vrf_netbox_on_cisco_ios(netbox_device, netbox_api):
-    logger.info(f'START SCRIPT {netbox_device.name} (Cisco IOS)')
+    logger.info(f'START {netbox_device.name} (IOS)')
     
     try:
         net_connect = netmiko_connect(netbox_device, 'cisco_ios')
@@ -99,11 +129,14 @@ def create_vrf_netbox_on_cisco_ios(netbox_device, netbox_api):
         
         if not netmiko_vrfs:
             logger.warning(f"No VRFs found on {netbox_device.name}")
+            # Если на устройстве нет VRF, проверяем что удалить из NetBox
+            synchronize_vrfs([], netbox_device, netbox_api)
             return
 
-        netbox_vrfs = netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id)
-        netbox_device_vrfs = [str(vrf.name) for vrf in netbox_vrfs]
+        # Синхронизируем VRF (определяем что удалить)
+        synchronize_vrfs(netmiko_vrfs, netbox_device, netbox_api)
 
+        # Обрабатываем VRF с устройства
         for netmiko_vrf in netmiko_vrfs:
             try:
                 vrf_name = netmiko_vrf.get('name')
@@ -174,7 +207,7 @@ def create_vrf_netbox_on_cisco_ios(netbox_device, netbox_api):
         except:
             pass
     
-    logger.info(f'END SCRIPT {netbox_device.name}')
+    logger.info(f'END {netbox_device.name}')
 
 def create_vrf_netbox_on_cisco_nxos(netbox_device, netbox_api):
     logger.info(f'START {netbox_device.name} (NXOS)')
@@ -187,13 +220,20 @@ def create_vrf_netbox_on_cisco_nxos(netbox_device, netbox_api):
         netmiko_vrfs = parse_output(platform='cisco_nxos', command='show run vrf', data=output)
         
         if not netmiko_vrfs:
+            logger.warning(f"No VRFs found on {netbox_device.name}")
+            synchronize_vrfs([], netbox_device, netbox_api)
             return
+
+        # Синхронизируем VRF
+        synchronize_vrfs(netmiko_vrfs, netbox_device, netbox_api)
 
         for netmiko_vrf in netmiko_vrfs:
             try:
                 vrf_name = netmiko_vrf.get('name')
                 if not vrf_name or vrf_name == 'default':
                     continue
+
+                logger.info(f"Processing VRF '{vrf_name}' on {netbox_device.name}")
 
                 rd_value = netmiko_vrf.get('rd', '')
                 evpn_var = True if 'evpn' in netmiko_vrf.get('evpn', '') else False
@@ -268,7 +308,15 @@ def create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api):
         netmiko_vrfs = parse_output(platform="huawei_vrp", command="display ip vpn verbose instance", data=output)
         
         if not netmiko_vrfs:
+            logger.warning(f"No VRFs found on {netbox_device.name}")
+            # Для Huawei не синхронизируем GRT, только пользовательские VRF
+            user_vrfs = []
+            synchronize_vrfs(user_vrfs, netbox_device, netbox_api)
             return
+
+        # Синхронизируем VRF (исключаем GRT из синхронизации)
+        user_vrfs = [vrf for vrf in netmiko_vrfs if vrf.get('name') != 'GRT']
+        synchronize_vrfs(user_vrfs, netbox_device, netbox_api)
 
         for parsed_vrf_huawei in netmiko_vrfs:
             try:
@@ -279,8 +327,10 @@ def create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api):
                 parsed_vrf_huawei['rt_export'] = parsed_vrf_huawei['rt_export'].split()
 
                 vrf_name = parsed_vrf_huawei.get('name')
-                if not vrf_name or vrf_name == 'default':
+                if not vrf_name or vrf_name in ['default', 'GRT']:
                     continue
+
+                logger.info(f"Processing VRF '{vrf_name}' on {netbox_device.name}")
 
                 rd_value = parsed_vrf_huawei.get('rd', '')
                 rt_import_values = parsed_vrf_huawei['rt_import']
@@ -363,7 +413,7 @@ def add_vrf_to_netbox_for_one_device(device_name: str):
 
 def add_vrf_to_netbox():
     start_time = time.time()
-    logger.info("Starting VRF discovery")
+    logger.info("Starting VRF discovery and synchronization")
 
     try:
         netbox_api = netbox_connection()
@@ -403,7 +453,7 @@ def add_vrf_to_netbox():
     except Exception as e:
         logger.error(f"Main error: {e}")
 
-    logger.info(f"Total time: {time.time() - start_time:.2f}s")
+    logger.info(f"VRF synchronization completed in {time.time() - start_time:.2f}s")
 
 if __name__ == "__main__":
     add_vrf_to_netbox()

@@ -462,16 +462,16 @@ def add_vrf_to_netbox():
             for device in script_devices:
                 platform_name = device.platform.name if device.platform else "Unknown"
                 
+                future = None
                 if platform_name == 'Cisco IOS':
                     future = executor.submit(create_vrf_netbox_on_cisco_ios, device, netbox_api)
                 elif platform_name == 'Cisco NXOS':
                     future = executor.submit(create_vrf_netbox_on_cisco_nxos, device, netbox_api)
                 elif platform_name == 'Huawei Versatile Routing Platform':
                     future = executor.submit(create_vrf_netbox_on_huawei_vrp, device, netbox_api)
-                else:
-                    continue
-                    
-                futures.append((future, device.name))
+                
+                if future:
+                    futures.append((future, device.name))
 
             for future, device_name in futures:
                 try:

@@ -87,6 +87,108 @@ def netmiko_connect(netbox_device, device_type):
                 logger.error(f"Connection failed to {netbox_device.name}: {e}")
                 return None
 
+def delete_vrf_with_dependencies(vrf_to_delete, netbox_api, device_name):
+    """
+    Безопасное удаление VRF с проверкой и удалением зависимых объектов
+    Возвращает True если VRF удален успешно, False если есть критические зависимости
+    """
+    try:
+        vrf_name = vrf_to_delete.name
+        vrf_id = vrf_to_delete.id
+        
+        # Проверяем IP-адреса в этом VRF
+        ip_addresses = list(netbox_api.ipam.ip_addresses.filter(vrf_id=vrf_id))
+        if ip_addresses:
+            logger.info(f"Found {len(ip_addresses)} IP addresses in VRF {vrf_name}")
+            
+            # Удаляем IP-адреса (если они не привязаны к интерфейсам)
+            for ip_addr in ip_addresses:
+                try:
+                    # Проверяем, привязан ли IP к интерфейсу
+                    if ip_addr.assigned_object:
+                        logger.warning(f"IP {ip_addr.address} is assigned to {ip_addr.assigned_object}, skipping deletion")
+                        continue
+                    
+                    # Удаляем неприсвоенный IP
+                    ip_addr.delete()
+                    logger.info(f"Deleted IP address: {ip_addr.address} from VRF {vrf_name}")
+                except Exception as ip_error:
+                    logger.error(f"Failed to delete IP {ip_addr.address}: {ip_error}")
+        
+        # Проверяем префиксы в этом VRF
+        prefixes = list(netbox_api.ipam.prefixes.filter(vrf_id=vrf_id))
+        if prefixes:
+            logger.info(f"Found {len(prefixes)} prefixes in VRF {vrf_name}")
+            
+            # Удаляем префиксы (если они не имеют дочерних префиксов)
+            for prefix in prefixes:
+                try:
+                    # Проверяем, есть ли дочерние префиксы
+                    child_prefixes = list(netbox_api.ipam.prefixes.filter(
+                        within_include=str(prefix.prefix),
+                        vrf_id=vrf_id
+                    ))
+                    
+                    # Если есть только сам префикс (length = 1), то дочерних нет
+                    if len(child_prefixes) > 1:
+                        logger.warning(f"Prefix {prefix.prefix} has child prefixes, skipping deletion")
+                        continue
+                    
+                    # Проверяем, есть ли IP-адреса в этом префиксе
+                    prefix_ips = list(netbox_api.ipam.ip_addresses.filter(
+                        parent=str(prefix.prefix),
+                        vrf_id=vrf_id
+                    ))
+                    
+                    if prefix_ips:
+                        logger.warning(f"Prefix {prefix.prefix} contains IP addresses, skipping deletion")
+                        continue
+                    
+                    # Удаляем пустой префикс
+                    prefix.delete()
+                    logger.info(f"Deleted prefix: {prefix.prefix} from VRF {vrf_name}")
+                except Exception as prefix_error:
+                    logger.error(f"Failed to delete prefix {prefix.prefix}: {prefix_error}")
+        
+        # Проверяем route targets
+        import_rts = list(vrf_to_delete.import_targets) if vrf_to_delete.import_targets else []
+        export_rts = list(vrf_to_delete.export_targets) if vrf_to_delete.export_targets else []
+        
+        # Очищаем route targets перед удалением VRF
+        if import_rts or export_rts:
+            try:
+                vrf_to_delete.update({'import_targets': []})
+                vrf_to_delete.update({'export_targets': []})
+                logger.info(f"Cleared route targets for VRF {vrf_name}")
+            except Exception as rt_error:
+                logger.error(f"Failed to clear route targets for VRF {vrf_name}: {rt_error}")
+        
+        # Повторно проверяем, остались ли зависимости
+        remaining_ips = list(netbox_api.ipam.ip_addresses.filter(vrf_id=vrf_id))
+        remaining_prefixes = list(netbox_api.ipam.prefixes.filter(vrf_id=vrf_id))
+        
+        if remaining_ips or remaining_prefixes:
+            logger.warning(f"VRF {vrf_name} still has dependencies:")
+            if remaining_ips:
+                logger.warning(f"  - {len(remaining_ips)} IP addresses")
+            if remaining_prefixes:
+                logger.warning(f"  - {len(remaining_prefixes)} prefixes")
+            return False
+        
+        # Пытаемся удалить VRF
+        vrf_to_delete.delete()
+        logger.info(f"Successfully deleted VRF: {vrf_name} from {device_name}")
+        return True
+        
+    except Exception as e:
+        # Проверяем, содержит ли ошибка информацию о зависимостях
+        if "409 Conflict" in str(e) and "dependent objects" in str(e):
+            logger.error(f"VRF {vrf_to_delete.name} cannot be deleted due to dependencies: {e}")
+            return False
+        else:
+            logger.error(f"Unexpected error deleting VRF {vrf_to_delete.name}: {e}")
+            return False
+
 def synchronize_vrfs(device_vrfs, netbox_device, netbox_api):
     """Синхронизация VRF между устройством и NetBox"""
     
@@ -130,8 +232,11 @@ def synchronize_vrfs(device_vrfs, netbox_device, netbox_api):
             # try:
             #     vrf_to_delete = netbox_api.ipam.vrfs.get(name=vrf_name, cf_device=netbox_device.id)
             #     if vrf_to_delete:
-            #         vrf_to_delete.delete()
-            #         logger.info(f"DELETED VRF: {vrf_name} from {netbox_device.name}")
+            #         # Проверяем зависимые объекты перед удалением
+            #         if delete_vrf_with_dependencies(vrf_to_delete, netbox_api, netbox_device.name):
+            #             logger.info(f"DELETED VRF: {vrf_name} from {netbox_device.name}")
+            #         else:
+            #             logger.warning(f"VRF {vrf_name} has dependencies and was not deleted")
             # except Exception as e:
             #     logger.error(f"Failed to delete VRF {vrf_name}: {e}")
     

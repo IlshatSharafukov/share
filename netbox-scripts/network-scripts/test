@@ -35,6 +35,10 @@ def create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_
 
 def update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, evpn_var):
     try:
+        logger.info(f"Updating route targets for VRF {netbox_vrf_for_update.name}")
+        logger.debug(f"Import targets: {rt_import_values}")
+        logger.debug(f"Export targets: {rt_export_values}")
+        
         update_list_import = []
         for rt in rt_import_values:
             rt_obj = netbox_api.ipam.route_targets.get(name=str(rt))
@@ -47,11 +51,28 @@ def update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_
             if rt_obj:
                 update_list_export.append(rt_obj.id)
 
-        netbox_vrf_for_update.update({'import_targets': update_list_import})
-        netbox_vrf_for_update.update({'export_targets': update_list_export})
+        # Получаем текущие route targets для сравнения
+        current_import = [rt.id for rt in netbox_vrf_for_update.import_targets] if netbox_vrf_for_update.import_targets else []
+        current_export = [rt.id for rt in netbox_vrf_for_update.export_targets] if netbox_vrf_for_update.export_targets else []
+        
+        logger.debug(f"Current import IDs: {current_import}")
+        logger.debug(f"New import IDs: {update_list_import}")
+        logger.debug(f"Current export IDs: {current_export}")
+        logger.debug(f"New export IDs: {update_list_export}")
+
+        # Обновляем только если есть изменения
+        if set(current_import) != set(update_list_import) or set(current_export) != set(update_list_export):
+            netbox_vrf_for_update.update({'import_targets': update_list_import})
+            netbox_vrf_for_update.update({'export_targets': update_list_export})
+            logger.info(f"Route targets updated for VRF {netbox_vrf_for_update.name}")
+        else:
+            logger.debug(f"Route targets unchanged for VRF {netbox_vrf_for_update.name}")
+            
         netbox_vrf_for_update.update({'custom_fields': {'EVPN': evpn_var}})
+        
     except Exception as e:
         logger.error(f"Route targets update error for VRF {netbox_vrf_for_update.name}: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
 
 def netbox_connection():
     netbox_api = pynetbox.api(config('NETBOX_URL'), token=config('NETBOX_TOKEN'), threading=True)
@@ -114,71 +135,47 @@ def create_vrf_netbox_on_cisco_ios(netbox_device, netbox_api):
 
                 create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device)
 
-                # Детальная проверка создания VRF
-                is_vrf_exists = str(vrf_name) in netbox_device_vrfs
+                # Проверяем существующие VRF с тем же именем
+                existing_vrfs = list(netbox_api.ipam.vrfs.filter(name=vrf_name, cf_device=netbox_device.id))
                 
-                if not is_vrf_exists:
-                    logger.info(f"Creating VRF {vrf_name} with RD '{rd_value}' for {netbox_device.name}")
-                    try:
-                        created_vrf = netbox_api.ipam.vrfs.create(
-                            name=vrf_name, rd=rd_value,
-                            description=f'discovered from {netbox_device.name}',
-                            custom_fields={'device': netbox_device.id}
-                        )
-                        logger.info(f"VRF {vrf_name} created with ID {created_vrf.id}")
-                    except Exception as create_error:
-                        logger.error(f"VRF creation failed for {vrf_name}: {create_error}")
-                        continue
-
-                # Детальный поиск созданного VRF
-                logger.debug(f"Searching for VRF {vrf_name} with device={netbox_device.id}, rd='{rd_value}'")
+                # Ищем VRF с нужным RD
+                matching_vrf = None
+                for existing_vrf in existing_vrfs:
+                    if existing_vrf.rd == rd_value:
+                        matching_vrf = existing_vrf
+                        logger.info(f"VRF {vrf_name} with matching RD '{rd_value}' already exists")
+                        break
                 
-                # Пробуем разные варианты поиска
-                netbox_vrf_for_update = None
+                if not matching_vrf:
+                    if existing_vrfs:
+                        # Есть VRF с тем же именем но другим RD - обновляем RD
+                        old_vrf = existing_vrfs[0]
+                        logger.warning(f"VRF {vrf_name} exists with different RD '{old_vrf.rd}', updating to '{rd_value}'")
+                        try:
+                            old_vrf.update({'rd': rd_value})
+                            logger.info(f"Updated RD for VRF {vrf_name} from '{old_vrf.rd}' to '{rd_value}'")
+                            matching_vrf = old_vrf
+                        except Exception as update_error:
+                            logger.error(f"Failed to update RD for VRF {vrf_name}: {update_error}")
+                            continue
+                    else:
+                        # VRF не существует - создаем новый
+                        logger.info(f"Creating VRF {vrf_name} with RD '{rd_value}' for {netbox_device.name}")
+                        try:
+                            matching_vrf = netbox_api.ipam.vrfs.create(
+                                name=vrf_name, rd=rd_value,
+                                description=f'discovered from {netbox_device.name}',
+                                custom_fields={'device': netbox_device.id}
+                            )
+                            logger.info(f"VRF {vrf_name} created with ID {matching_vrf.id}")
+                        except Exception as create_error:
+                            logger.error(f"VRF creation failed for {vrf_name}: {create_error}")
+                            continue
+
+                netbox_vrf_for_update = matching_vrf
                 
-                # Поиск 1: по имени, устройству и RD
-                try:
-                    netbox_vrf_for_update = netbox_api.ipam.vrfs.get(
-                        name=vrf_name, cf_device=netbox_device.id, rd=rd_value
-                    )
-                except Exception as e:
-                    logger.warning(f"Search method 1 failed for {vrf_name}: {e}")
-
-                # Поиск 2: только по имени и устройству
                 if not netbox_vrf_for_update:
-                    try:
-                        found_vrfs = list(netbox_api.ipam.vrfs.filter(name=vrf_name, cf_device=netbox_device.id))
-                        if len(found_vrfs) == 1:
-                            netbox_vrf_for_update = found_vrfs[0]
-                            logger.info(f"Found VRF {vrf_name} using method 2")
-                        elif len(found_vrfs) > 1:
-                            logger.warning(f"Multiple VRFs found for {vrf_name}: {[v.rd for v in found_vrfs]}")
-                            # Берем первый или с подходящим RD
-                            for vrf in found_vrfs:
-                                if vrf.rd == rd_value:
-                                    netbox_vrf_for_update = vrf
-                                    break
-                            if not netbox_vrf_for_update:
-                                netbox_vrf_for_update = found_vrfs[0]
-                    except Exception as e:
-                        logger.error(f"Search method 2 failed for {vrf_name}: {e}")
-
-                # Поиск 3: все VRF устройства и фильтрация
-                if not netbox_vrf_for_update:
-                    logger.warning(f"Trying method 3 for VRF {vrf_name}")
-                    try:
-                        all_device_vrfs = list(netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id))
-                        for vrf in all_device_vrfs:
-                            if vrf.name == vrf_name:
-                                netbox_vrf_for_update = vrf
-                                logger.info(f"Found VRF {vrf_name} using method 3, RD: {vrf.rd}")
-                                break
-                    except Exception as e:
-                        logger.error(f"Search method 3 failed for {vrf_name}: {e}")
-
-                if not netbox_vrf_for_update:
-                    logger.error(f"Could not find VRF {vrf_name} for {netbox_device.name} after all search methods")
-                    logger.error(f"Available VRFs: {[v.name for v in netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id)]}")
+                    logger.error(f"No VRF found for update: {vrf_name}")
                     continue
 
                 update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, False)

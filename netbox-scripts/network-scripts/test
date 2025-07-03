@@ -47,8 +47,14 @@ def test_ssh_connection(device):
     
     # Проверяем наличие IP адреса
     if not device.primary_ip:
-        logger.error(f"{device_name}: Отсутствует primary IP адрес")
-        return False
+        error_info = {
+            'device': device_name,
+            'ip': 'НЕТ IP',
+            'platform': device.platform.name if device.platform else 'Unknown',
+            'error': 'Отсутствует primary IP адрес',
+            'error_type': 'NO_IP'
+        }
+        return False, error_info
     
     # Получаем IP без маски
     host_ip = str(device.primary_ip).split('/')[0]
@@ -69,8 +75,6 @@ def test_ssh_connection(device):
     }
     
     try:
-        logger.info(f"{device_name} ({host_ip}): Попытка подключения...")
-        
         # Устанавливаем SSH соединение
         net_connect = ConnectHandler(**connection_params)
         
@@ -80,20 +84,37 @@ def test_ssh_connection(device):
         # Закрываем соединение
         net_connect.disconnect()
         
-        logger.info(f"✅ {device_name} ({host_ip}): SSH соединение успешно")
-        return True
+        return True, None
         
     except NetMikoTimeoutException:
-        logger.error(f"❌ {device_name} ({host_ip}): Таймаут подключения")
-        return False
+        error_info = {
+            'device': device_name,
+            'ip': host_ip,
+            'platform': device.platform.name if device.platform else 'Unknown',
+            'error': 'Таймаут подключения (устройство недоступно)',
+            'error_type': 'TIMEOUT'
+        }
+        return False, error_info
         
     except NetMikoAuthenticationException:
-        logger.error(f"❌ {device_name} ({host_ip}): Ошибка аутентификации")
-        return False
+        error_info = {
+            'device': device_name,
+            'ip': host_ip,
+            'platform': device.platform.name if device.platform else 'Unknown',
+            'error': 'Ошибка аутентификации (неверный логин/пароль)',
+            'error_type': 'AUTH_ERROR'
+        }
+        return False, error_info
         
     except Exception as e:
-        logger.error(f"❌ {device_name} ({host_ip}): Ошибка подключения - {str(e)}")
-        return False
+        error_info = {
+            'device': device_name,
+            'ip': host_ip,
+            'platform': device.platform.name if device.platform else 'Unknown',
+            'error': f'Другая ошибка: {str(e)}',
+            'error_type': 'OTHER_ERROR'
+        }
+        return False, error_info
 
 
 def test_single_device(device_name):
@@ -102,10 +123,18 @@ def test_single_device(device_name):
     device = netbox_api.dcim.devices.get(name=device_name.upper())
     
     if not device:
-        logger.error(f"Устройство {device_name} не найдено в NetBox")
+        print(f"Устройство {device_name} не найдено в NetBox")
         return
     
-    test_ssh_connection(device)
+    result, error_info = test_ssh_connection(device)
+    
+    if result:
+        print(f"✅ {device_name}: SSH соединение успешно")
+    else:
+        print(f"❌ {device_name}: {error_info['error']}")
+        print(f"   IP: {error_info['ip']}")
+        print(f"   Платформа: {error_info['platform']}")
+        print(f"   Тип ошибки: {error_info['error_type']}")
 
 
 def test_all_devices():
@@ -126,7 +155,7 @@ def test_all_devices():
     logger.info(f"Найдено {len(script_devices)} устройств для тестирования")
     
     successful_connections = 0
-    failed_connections = 0
+    failed_connections = []
     
     # Параллельное тестирование с ограничением потоков
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
@@ -137,25 +166,101 @@ def test_all_devices():
         for future in concurrent.futures.as_completed(future_to_device):
             device = future_to_device[future]
             try:
-                result = future.result()
+                result, error_info = future.result()
                 if result:
                     successful_connections += 1
                 else:
-                    failed_connections += 1
+                    failed_connections.append(error_info)
             except Exception as exc:
-                logger.error(f"❌ {device.name}: Исключение при выполнении - {exc}")
-                failed_connections += 1
+                error_info = {
+                    'device': device.name,
+                    'ip': str(device.primary_ip).split('/')[0] if device.primary_ip else 'НЕТ IP',
+                    'platform': device.platform.name if device.platform else 'Unknown',
+                    'error': f'Исключение при выполнении: {exc}',
+                    'error_type': 'EXCEPTION'
+                }
+                failed_connections.append(error_info)
     
-    # Статистика
+    # Детальная статистика по ошибкам
     total_time = time.time() - start_time
-    logger.info(f"\n{'='*60}")
-    logger.info(f"СТАТИСТИКА ТЕСТИРОВАНИЯ SSH СОЕДИНЕНИЙ")
-    logger.info(f"{'='*60}")
-    logger.info(f"Всего устройств: {len(script_devices)}")
-    logger.info(f"Успешных подключений: {successful_connections}")
-    logger.info(f"Неудачных подключений: {failed_connections}")
-    logger.info(f"Время выполнения: {total_time:.2f} секунд")
-    logger.info(f"{'='*60}")
+    
+    print(f"\n{'='*80}")
+    print(f"АНАЛИЗ НЕУДАЧНЫХ SSH ПОДКЛЮЧЕНИЙ")
+    print(f"{'='*80}")
+    print(f"Всего устройств: {len(script_devices)}")
+    print(f"Успешных подключений: {successful_connections}")
+    print(f"Неудачных подключений: {len(failed_connections)}")
+    print(f"Время выполнения: {total_time:.2f} секунд")
+    
+    if failed_connections:
+        print(f"\n{'='*80}")
+        print(f"ДЕТАЛЬНЫЙ АНАЛИЗ ОШИБОК:")
+        print(f"{'='*80}")
+        
+        # Группировка по типам ошибок
+        error_types = {}
+        for error in failed_connections:
+            error_type = error['error_type']
+            if error_type not in error_types:
+                error_types[error_type] = []
+            error_types[error_type].append(error)
+        
+        # Вывод статистики по типам ошибок
+        for error_type, errors in error_types.items():
+            print(f"\n{error_type}: {len(errors)} устройств")
+            print("-" * 60)
+            
+            for error in errors:
+                print(f"  Устройство: {error['device']}")
+                print(f"  IP: {error['ip']}")
+                print(f"  Платформа: {error['platform']}")
+                print(f"  Ошибка: {error['error']}")
+                print()
+        
+        # Группировка по платформам
+        print(f"\n{'='*80}")
+        print(f"СТАТИСТИКА ОШИБОК ПО ПЛАТФОРМАМ:")
+        print(f"{'='*80}")
+        
+        platform_stats = {}
+        for error in failed_connections:
+            platform = error['platform']
+            if platform not in platform_stats:
+                platform_stats[platform] = {'total': 0, 'timeout': 0, 'auth': 0, 'other': 0}
+            
+            platform_stats[platform]['total'] += 1
+            
+            if error['error_type'] == 'TIMEOUT':
+                platform_stats[platform]['timeout'] += 1
+            elif error['error_type'] == 'AUTH_ERROR':
+                platform_stats[platform]['auth'] += 1
+            else:
+                platform_stats[platform]['other'] += 1
+        
+        for platform, stats in platform_stats.items():
+            print(f"\n{platform}:")
+            print(f"  Всего ошибок: {stats['total']}")
+            print(f"  Таймауты: {stats['timeout']}")
+            print(f"  Ошибки аутентификации: {stats['auth']}")
+            print(f"  Другие ошибки: {stats['other']}")
+    
+    print(f"\n{'='*80}")
+    
+    # Сохранение в файл для дальнейшего анализа
+    if failed_connections:
+        with open('failed_ssh_connections.txt', 'w', encoding='utf-8') as f:
+            f.write("СПИСОК УСТРОЙСТВ С ОШИБКАМИ SSH ПОДКЛЮЧЕНИЯ\n")
+            f.write("=" * 80 + "\n\n")
+            
+            for error in failed_connections:
+                f.write(f"Устройство: {error['device']}\n")
+                f.write(f"IP: {error['ip']}\n")
+                f.write(f"Платформа: {error['platform']}\n")
+                f.write(f"Тип ошибки: {error['error_type']}\n")
+                f.write(f"Ошибка: {error['error']}\n")
+                f.write("-" * 40 + "\n\n")
+        
+        print(f"Детальный список ошибок сохранен в файл: failed_ssh_connections.txt")
 
 
 if __name__ == "__main__":

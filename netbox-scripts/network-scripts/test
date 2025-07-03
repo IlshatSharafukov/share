@@ -13,7 +13,7 @@ import traceback
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.DEBUG,  # Временно включаем DEBUG
     format="%(asctime)s [%(levelname)s] - %(message)s",
     handlers=[
         logging.FileHandler("vrf_script.log", encoding='utf-8'),
@@ -95,6 +95,12 @@ def synchronize_vrfs(device_vrfs, netbox_device, netbox_api):
     netbox_vrf_names = {vrf.name for vrf in netbox_vrfs}
     device_vrf_names = {vrf.get('name') for vrf in device_vrfs if vrf.get('name') and vrf.get('name') != 'default'}
     
+    # ОТЛАДОЧНАЯ ИНФОРМАЦИЯ
+    logger.debug(f"Device {netbox_device.name}:")
+    logger.debug(f"  NetBox VRFs ({len(netbox_vrf_names)}): {sorted(netbox_vrf_names)}")
+    logger.debug(f"  Device VRFs ({len(device_vrf_names)}): {sorted(device_vrf_names)}")
+    logger.debug(f"  Raw device_vrfs count: {len(device_vrfs)}")
+    
     # Определяем что нужно удалить
     vrfs_to_delete = netbox_vrf_names - device_vrf_names
     
@@ -125,7 +131,13 @@ def create_vrf_netbox_on_cisco_ios(netbox_device, netbox_api):
             return
 
         output = net_connect.send_command('show run | section vrf')
+        
+        # ОТЛАДКА для IOS
+        logger.debug(f"IOS command output preview: {output[:500]}...")
+        
         netmiko_vrfs = parse_output(platform='cisco_ios', command='show run vrf', data=output)
+        
+        logger.debug(f"IOS parsed VRFs count: {len(netmiko_vrfs) if netmiko_vrfs else 0}")
         
         if not netmiko_vrfs:
             logger.warning(f"No VRFs found on {netbox_device.name}")
@@ -217,7 +229,13 @@ def create_vrf_netbox_on_cisco_nxos(netbox_device, netbox_api):
             return
 
         output = net_connect.send_command('show run | section vrf')
+        
+        # ОТЛАДКА для NXOS  
+        logger.debug(f"NXOS command output preview: {output[:500]}...")
+        
         netmiko_vrfs = parse_output(platform='cisco_nxos', command='show run vrf', data=output)
+        
+        logger.debug(f"NXOS parsed VRFs count: {len(netmiko_vrfs) if netmiko_vrfs else 0}")
         
         if not netmiko_vrfs:
             logger.warning(f"No VRFs found on {netbox_device.name}")
@@ -305,7 +323,18 @@ def create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api):
             )
 
         output = net_connect.send_command('display ip vpn-instance verbose')
+        
+        # ОТЛАДКА: сохраняем первые 1000 символов вывода
+        logger.debug(f"Huawei command output preview: {output[:1000]}...")
+        
         netmiko_vrfs = parse_output(platform="huawei_vrp", command="display ip vpn verbose instance", data=output)
+        
+        # ОТЛАДКА: проверяем результат парсинга
+        logger.debug(f"Parsed VRFs count: {len(netmiko_vrfs) if netmiko_vrfs else 0}")
+        if netmiko_vrfs:
+            logger.debug(f"First parsed VRF: {netmiko_vrfs[0]}")
+        else:
+            logger.warning(f"Parser returned empty result for {netbox_device.name}")
         
         if not netmiko_vrfs:
             logger.warning(f"No VRFs found on {netbox_device.name}")

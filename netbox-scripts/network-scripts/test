@@ -1,271 +1,354 @@
 import pynetbox
-import requests
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetMikoTimeoutException, NetMikoAuthenticationException
-from decouple import config
 import urllib3
-import logging
-import concurrent.futures
+import re
+from decouple import config
 import time
+from hpnapy import *
+import concurrent.futures
+import os
 
-# Отключаем предупреждения SSL
+set_ipam_device = set()
+set_hpna_device = set()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger()
+HPNA_LOGIN = config('HPNA_LOGIN')
+HPNA_PASSWORD = config('HPNA_PASSWORD')
+NETBOX_URL = config('NETBOX_URL')
+NETBOX_TOKEN = config('NETBOX_TOKEN')
+
+
+location_map = {
+    'MSKX5': r'MSKX5',
+    'MSK34': r'MSK34',
+    'MSK70': r'MSK70',
+    'MSKD8': r'MSKD8',
+}
+
+device_roles = {
+    'BA-': 'LOAD BALANCER',
+    'FX-': 'FABRIC NEXUS',
+    'MS-': 'MULTILAYER SWITCH',
+    'MX-': 'MULTILAYER SWITCH WITH ADDITIONAL FUNCTIONS',
+    'ND-': 'NETWORK DEVICE',
+    'QSW': 'SWITCH',
+    'RT-': 'ROUTER',
+    'SW-': 'SWITCH',
+    'TS-': 'TERMINAL SERVER',
+    'NX-': 'SWITCH',
+    'FW-': 'FIREWALL'
+}
+
+device_role_map = {
+    'QSW': 'switch',
+    'MS-': 'switch',
+    'MX-': 'switch',
+    'SW-': 'switch',
+    'NX-': 'switch',
+    'FX-': 'switch'
+}
+
+
+def update_interface(netbox_api, hpna_device_ip, device_hostname):
+    try:
+        device_ip = netbox_api.ipam.ip_addresses.get(address=hpna_device_ip, vrf_name='default')
+        device_interface = netbox_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname)
+        device_name_nb = netbox_api.dcim.devices.get(name=device_hostname)
+        update_dict = dict(assigned_object_id=device_interface.id, assigned_object_type="dcim.interface")
+        device_ip.update(update_dict)
+        device_name_nb.primary_ip4 = device_ip
+        device_name_nb.save()
+    except pynetbox.RequestError as err:
+        print(f"Failed to update device mgmt interface {device_hostname}: {err}")
+
+
+def fetch_device_role_for_vlan_group(device_hostname):
+    device_role = 'UNKNOWN'
+    for prefix, role in device_role_map.items():
+        if device_hostname.lower().startswith(prefix.lower()):
+            device_role = role
+            break
+    return device_role
+
+
+def generate_device_model_slug(device_model):
+    device_model_slug = device_model.lower()
+    device_model_slug = re.sub(r'\s+', '_', device_model_slug)
+    device_model_slug = re.sub(r'[^a-z0-9_]', '_', device_model_slug)
+    return device_model_slug
+
+
+def generate_slug(input_string):
+    slug = input_string.lower()
+    slug = re.sub(r'\s+', '_', slug)
+    slug = re.sub(r'[^a-z0-9_]', '_', slug)
+    return slug
+
+
+def fetch_device_role(device_hostname):
+    device_role = 'UNKNOWN'
+    for prefix, role in device_roles.items():
+        if device_hostname.startswith(prefix):
+            device_role = role
+            break
+    return device_role
 
 
 def netbox_connection():
-    """Подключение к NetBox API"""
     netbox_api = pynetbox.api(
         config('NETBOX_URL'),
         token=config('NETBOX_TOKEN'),
         threading=True
     )
-    adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
-    netbox_api.http_session.mount('http://', adapter)
-    netbox_api.http_session.mount('https://', adapter)
     netbox_api.http_session.verify = False
     return netbox_api
 
 
-def get_device_type(platform_name):
-    """Определение типа устройства для netmiko"""
-    platform_mapping = {
-        'Cisco IOS': 'cisco_ios',
-        'Cisco NXOS': 'cisco_nxos',
-        'Huawei Versatile Routing Platform': 'huawei_vrp',
-        'Ruijie RG': 'cisco_ios'
-    }
-    return platform_mapping.get(platform_name, 'cisco_ios')
+def get_location(device_hostname):
+    for location, pattern in location_map.items():
+        if re.search(pattern, device_hostname):
+            return location
+    return 'BRANCH'
 
 
-def test_ssh_connection(device):
-    """Тестирование SSH соединения с устройством"""
-    device_name = device.name
-    
-    # Проверяем наличие IP адреса
-    if not device.primary_ip:
-        error_info = {
-            'device': device_name,
-            'ip': 'НЕТ IP',
-            'platform': device.platform.name if device.platform else 'Unknown',
-            'error': 'Отсутствует primary IP адрес',
-            'error_type': 'NO_IP'
-        }
-        return False, error_info
-    
-    # Получаем IP без маски
-    host_ip = str(device.primary_ip).split('/')[0]
-    
-    # Определяем тип устройства
-    device_type = get_device_type(device.platform.name if device.platform else 'Unknown')
-    
-    # Параметры подключения
-    connection_params = {
-        'device_type': device_type,
-        'host': host_ip,
-        'username': config('HPNA_LOGIN'),
-        'password': config('HPNA_PASSWORD'),
-        'timeout': 30,
-        'conn_timeout': 30,
-        'port': 22,
-        'global_delay_factor': 1
-    }
-    
+def hpna_connection():
+    hpna_api = NAInterface("https://hpna.raiffeisen.ru", ssl_verify=False)
+    hpna_api.login(config('HPNA_WEB_LOGIN'), config('HPNA_WEB_PASSWORD'))
+    return hpna_api
+
+
+def add_new_device_to_netbox(hpna_api_device_entry, netbox_api, hpna_api):
+    device_hostname = (re.sub(r'\.(net\.pri|NET\.PRI)$', '', str(hpna_api_device_entry.hostName))).upper()
+    set_hpna_device.add(str(device_hostname))
+    hpna_device_ip = hpna_api_device_entry.primaryIPAddress
+    hpna_device_vendor = hpna_api_device_entry.vendor
+    hpna_device_model = hpna_api_device_entry.model
+
     try:
-        # Устанавливаем SSH соединение
-        net_connect = ConnectHandler(**connection_params)
-        
-        # Простая проверка - отправляем команду
-        output = net_connect.send_command('show version', read_timeout=10)
-        
-        # Закрываем соединение
-        net_connect.disconnect()
-        
-        return True, None
-        
-    except NetMikoTimeoutException:
-        error_info = {
-            'device': device_name,
-            'ip': host_ip,
-            'platform': device.platform.name if device.platform else 'Unknown',
-            'error': 'Таймаут подключения (устройство недоступно)',
-            'error_type': 'TIMEOUT'
-        }
-        return False, error_info
-        
-    except NetMikoAuthenticationException:
-        error_info = {
-            'device': device_name,
-            'ip': host_ip,
-            'platform': device.platform.name if device.platform else 'Unknown',
-            'error': 'Ошибка аутентификации (неверный логин/пароль)',
-            'error_type': 'AUTH_ERROR'
-        }
-        return False, error_info
-        
-    except Exception as e:
-        error_info = {
-            'device': device_name,
-            'ip': host_ip,
-            'platform': device.platform.name if device.platform else 'Unknown',
-            'error': f'Другая ошибка: {str(e)}',
-            'error_type': 'OTHER_ERROR'
-        }
-        return False, error_info
+        hpna_device_family = hpna_api.show_device_family(ip=str(hpna_device_ip))
+    except Exception:
+        hpna_device_family = 'UNKNOWN'
 
+    if hpna_device_vendor is None:
+        hpna_device_vendor = 'UNKNOWN'
 
-def test_single_device(device_name):
-    """Тестирование SSH соединения для одного устройства"""
-    netbox_api = netbox_connection()
-    device = netbox_api.dcim.devices.get(name=device_name.upper())
-    
-    if not device:
-        print(f"Устройство {device_name} не найдено в NetBox")
+    if hpna_device_model is None:
+        hpna_device_model = 'UNKNOWN'
+
+    if hpna_device_ip is None or re.search("^\w+\.\w+\.\w+\.\w+$", device_hostname):
         return
-    
-    result, error_info = test_ssh_connection(device)
-    
-    if result:
-        print(f"✅ {device_name}: SSH соединение успешно")
-    else:
-        print(f"❌ {device_name}: {error_info['error']}")
-        print(f"   IP: {error_info['ip']}")
-        print(f"   Платформа: {error_info['platform']}")
-        print(f"   Тип ошибки: {error_info['error_type']}")
+    if hpna_device_vendor and hpna_device_model == (' ' or None or 'UNKNOWN' or ''):
+        return
 
+    device_hpna_location = get_location(device_hostname)
+    device_hpna_role = fetch_device_role(device_hostname)
 
-def test_all_devices():
-    """Тестирование SSH соединений для всех устройств с тегом raif_scripts"""
-    start_time = time.time()
-    
-    netbox_api = netbox_connection()
-    
-    # Получаем все устройства с тегом raif_scripts
-    all_devices = netbox_api.dcim.devices.all()
-    script_devices = []
-    
-    for device in all_devices:
-        device_tags = str(device.tags)
-        if 'raif_scripts' in device_tags:
-            script_devices.append(device)
-    
-    logger.info(f"Найдено {len(script_devices)} устройств для тестирования")
-    
-    successful_connections = 0
-    failed_connections = []
-    
-    # Параллельное тестирование с ограничением потоков
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        # Отправляем задачи на выполнение
-        future_to_device = {executor.submit(test_ssh_connection, device): device for device in script_devices}
-        
-        # Обрабатываем результаты
-        for future in concurrent.futures.as_completed(future_to_device):
-            device = future_to_device[future]
+    device_role_slug = generate_slug(device_hpna_role)
+    device_vendor_slug = generate_slug(hpna_device_vendor)
+    device_model_slug = generate_device_model_slug(hpna_device_model)
+    device_platform_slug = generate_slug(hpna_device_family)
+
+    if netbox_api.dcim.device_roles.get(name=device_hpna_role, slug=device_role_slug) is None:
+        try:
+            netbox_api.dcim.device_roles.create(name=device_hpna_role, slug=device_role_slug)
+        except pynetbox.RequestError as err:
+            print(f"Failed to create device role for device {device_hostname}: {err}")
+    if netbox_api.extras.tags.get(name=device_hpna_role, slug=device_role_slug) is None:
+        try:
+            netbox_api.extras.tags.create(name=device_hpna_role, slug=device_role_slug)
+        except pynetbox.RequestError as err:
+            print(f"Failed to create tag for device {device_hostname}: {err}")
+    if netbox_api.dcim.manufacturers.get(name=hpna_device_vendor, slug=device_vendor_slug) is None:
+        try:
+            netbox_api.dcim.manufacturers.create(name=hpna_device_vendor, slug=device_vendor_slug)
+        except pynetbox.RequestError as err:
+            print(f"Failed to create manufacturers for device {device_hostname}: {err}")
+    if netbox_api.dcim.device_types.get(model=hpna_device_model) is None:
+        try:
+            device_vendor_nb = netbox_api.dcim.manufacturers.get(name=hpna_device_vendor, slug=device_vendor_slug)
+            netbox_api.dcim.device_types.create(model=hpna_device_model, manufacturer=device_vendor_nb.id,
+                                                slug=device_model_slug)
+        except pynetbox.RequestError as err:
+            print(f"Failed to create device vendor for device {device_hostname}: {err}")
+    if netbox_api.dcim.platforms.get(name=hpna_device_family) is None:
+        try:
+            netbox_api.dcim.platforms.create(name=hpna_device_family, slug=device_platform_slug)
+        except pynetbox.RequestError as err:
+            print(f"Failed to create device platform for device {device_hostname}: {err}")
+
+    try:
+        device_role_id = netbox_api.dcim.device_roles.get(name=device_hpna_role).id
+    except pynetbox.RequestError as err:
+        device_role_id = 10
+        print(f'Failed to get device role: {device_hostname}')
+
+    try:
+        device_type_id = netbox_api.dcim.device_types.get(model=hpna_device_model).id
+    except pynetbox.RequestError as err:
+        device_type_id = 58
+        print(f'Failed to get device type: {device_hostname}')
+
+    try:
+        site_id = netbox_api.dcim.sites.get(name=device_hpna_location).id
+    except pynetbox.RequestError as err:
+        site_id = 6
+        print(f'Failed to get site: {device_hostname}')
+
+    try:
+        platform_id = netbox_api.dcim.platforms.get(name=hpna_device_family).id
+    except pynetbox.RequestError as err:
+        platform_id = 2
+        print(f'Failed to get platform: {device_hostname}')
+
+    if netbox_api.dcim.devices.get(name=device_hostname) is None:
+        try:
+            netbox_api.dcim.devices.create(name=device_hostname,
+                                           role=device_role_id,
+                                           device_type=device_type_id,
+                                           site=site_id,
+                                           platform=platform_id,
+                                           status='active',
+                                           tags=[{'name': device_hpna_role}, {'name': 'raif_scripts'}])
+        except pynetbox.RequestError as err:
+            print(f"Failed to create device {device_hostname}: {err}")
+
+        try:
+            netbox_api.dcim.interfaces.create(device=(netbox_api.dcim.devices.get(name=device_hostname)).id,
+                                              name='mgmt interface',
+                                              type='virtual',
+                                              mtu='1500',
+                                              description='this interface need for mgmt and control device',
+                                              mgmt_only=True)
+        except pynetbox.RequestError as err:
+            print(f"Failed to create device mgmt interface {device_hostname}: {err}")
+
+        if netbox_api.ipam.ip_addresses.get(address=hpna_device_ip, vrf_name='default') is None:
             try:
-                result, error_info = future.result()
-                if result:
-                    successful_connections += 1
-                else:
-                    failed_connections.append(error_info)
-            except Exception as exc:
-                error_info = {
-                    'device': device.name,
-                    'ip': str(device.primary_ip).split('/')[0] if device.primary_ip else 'НЕТ IP',
-                    'platform': device.platform.name if device.platform else 'Unknown',
-                    'error': f'Исключение при выполнении: {exc}',
-                    'error_type': 'EXCEPTION'
-                }
-                failed_connections.append(error_info)
-    
-    # Детальная статистика по ошибкам
-    total_time = time.time() - start_time
-    
-    print(f"\n{'='*80}")
-    print(f"АНАЛИЗ НЕУДАЧНЫХ SSH ПОДКЛЮЧЕНИЙ")
-    print(f"{'='*80}")
-    print(f"Всего устройств: {len(script_devices)}")
-    print(f"Успешных подключений: {successful_connections}")
-    print(f"Неудачных подключений: {len(failed_connections)}")
-    print(f"Время выполнения: {total_time:.2f} секунд")
-    
-    if failed_connections:
-        print(f"\n{'='*80}")
-        print(f"ДЕТАЛЬНЫЙ АНАЛИЗ ОШИБОК:")
-        print(f"{'='*80}")
-        
-        # Группировка по типам ошибок
-        error_types = {}
-        for error in failed_connections:
-            error_type = error['error_type']
-            if error_type not in error_types:
-                error_types[error_type] = []
-            error_types[error_type].append(error)
-        
-        # Вывод статистики по типам ошибок
-        for error_type, errors in error_types.items():
-            print(f"\n{error_type}: {len(errors)} устройств")
-            print("-" * 60)
-            
-            for error in errors:
-                print(f"  Устройство: {error['device']}")
-                print(f"  IP: {error['ip']}")
-                print(f"  Платформа: {error['platform']}")
-                print(f"  Ошибка: {error['error']}")
-                print()
-        
-        # Группировка по платформам
-        print(f"\n{'='*80}")
-        print(f"СТАТИСТИКА ОШИБОК ПО ПЛАТФОРМАМ:")
-        print(f"{'='*80}")
-        
-        platform_stats = {}
-        for error in failed_connections:
-            platform = error['platform']
-            if platform not in platform_stats:
-                platform_stats[platform] = {'total': 0, 'timeout': 0, 'auth': 0, 'other': 0}
-            
-            platform_stats[platform]['total'] += 1
-            
-            if error['error_type'] == 'TIMEOUT':
-                platform_stats[platform]['timeout'] += 1
-            elif error['error_type'] == 'AUTH_ERROR':
-                platform_stats[platform]['auth'] += 1
-            else:
-                platform_stats[platform]['other'] += 1
-        
-        for platform, stats in platform_stats.items():
-            print(f"\n{platform}:")
-            print(f"  Всего ошибок: {stats['total']}")
-            print(f"  Таймауты: {stats['timeout']}")
-            print(f"  Ошибки аутентификации: {stats['auth']}")
-            print(f"  Другие ошибки: {stats['other']}")
-    
-    print(f"\n{'='*80}")
-    
-    # Сохранение в файл для дальнейшего анализа
-    if failed_connections:
-        with open('failed_ssh_connections.txt', 'w', encoding='utf-8') as f:
-            f.write("СПИСОК УСТРОЙСТВ С ОШИБКАМИ SSH ПОДКЛЮЧЕНИЯ\n")
-            f.write("=" * 80 + "\n\n")
-            
-            for error in failed_connections:
-                f.write(f"Устройство: {error['device']}\n")
-                f.write(f"IP: {error['ip']}\n")
-                f.write(f"Платформа: {error['platform']}\n")
-                f.write(f"Тип ошибки: {error['error_type']}\n")
-                f.write(f"Ошибка: {error['error']}\n")
-                f.write("-" * 40 + "\n\n")
-        
-        print(f"Детальный список ошибок сохранен в файл: failed_ssh_connections.txt")
+                netbox_api.ipam.ip_addresses.create(address=hpna_device_ip,
+                                                    vrf=(netbox_api.ipam.vrfs.get(name='default')).id,
+                                                    description='int loo0; this ip need for mgmt and control device')
+            except pynetbox.RequestError as err:
+                print(f"Failed to create device mgmt ip address {device_hostname}: {err}")
+
+        update_interface(netbox_api, hpna_device_ip, device_hostname)
+
+        device_role_for_device_group = fetch_device_role_for_vlan_group(device_hostname)
+
+        vlan_group_slug = generate_slug(device_hostname)
+        if netbox_api.ipam.vlan_groups.get(name=device_hostname) is None:
+            try:
+                netbox_api.ipam.vlan_groups.create(name=device_hostname,
+                                                   slug=vlan_group_slug,
+                                                   scope_type='dcim.site',
+                                                   scope_id=netbox_api.dcim.sites.get(name=device_hpna_location).id)
+            except pynetbox.RequestError as err:
+                print(f'Error when create vlan group: {device_hostname} - {err}')
+
+    else:
+        if netbox_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname) is None:
+            try:
+                netbox_api.dcim.interfaces.create(device=(netbox_api.dcim.devices.get(name=device_hostname)).id,
+                                                  name='mgmt interface',
+                                                  type='virtual',
+                                                  mtu='1500',
+                                                  description='this interface need for mgmt and control device',
+                                                  mgmt_only=True)
+            except pynetbox.RequestError as err:
+                print(f"Failed to create device mgmt interface {device_hostname}: {err}")
+
+        device_interface = netbox_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname)
+
+        if device_interface.count_ipaddresses != 1:
+            if netbox_api.ipam.ip_addresses.get(address=hpna_device_ip, vrf_name='default') is None:
+                try:
+                    netbox_api.ipam.ip_addresses.create(address=hpna_device_ip,
+                                                        vrf=(netbox_api.ipam.vrfs.get(name='default')).id,
+                                                        description='int loo0; this ip need for mgmt and control device')
+                except pynetbox.RequestError as err:
+                    print(f"Failed to create device mgmt ip address {device_hostname}: {err}")
+
+            update_interface(netbox_api, hpna_device_ip, device_hostname)
+
+        vlan_group_slug = generate_slug(device_hostname)
+        if netbox_api.ipam.vlan_groups.get(name=device_hostname) is None:
+            try:
+                netbox_api.ipam.vlan_groups.create(name=device_hostname,
+                                                   slug=vlan_group_slug,
+                                                   scope_type='dcim.site',
+                                                   scope_id=netbox_api.dcim.sites.get(name=device_hpna_location).id)
+            except pynetbox.RequestError as err:
+                print(f'Error when create vlan group: {device_hostname} - {err}')
+
+
+def processing_hpna_device_list():
+    start_time = time.time()
+    netbox_api = netbox_connection()
+    hpna_api = hpna_connection()
+    hpna_device_list = hpna_api.list_device()
+    prefix_destruction_count = 0
+
+    # for device in hpna_device_list:
+    #     add_new_device_to_netbox(device, netbox_api, hpna_api)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        for device in hpna_device_list:
+            executor.submit(add_new_device_to_netbox, device, netbox_api, hpna_api)
+
+    devices_in_netbox = netbox_api.dcim.devices.all()
+
+    for device_netbox in devices_in_netbox:
+        netbox_device_tags = str(device_netbox.tags)
+        if 'raif_scripts' in netbox_device_tags:
+            set_ipam_device.add(str(device_netbox.name))
+
+    for device_hpna in hpna_device_list:
+        set_hpna_device.add((re.sub(r'\.(net\.pri|NET\.PRI|RBRU\.PRI|rbru\.pri)$', '', str(device_hpna.hostName))).upper())
+
+    set_ipam_device.difference_update(set_hpna_device)
+
+    for device_for_remove in set_ipam_device:
+        devices_in_netbox_for_delete = netbox_api.dcim.devices.get(name=device_for_remove)
+        print(devices_in_netbox_for_delete)
+        prefix_destruction_count += 1
+
+        try:
+            ip_for_delete = devices_in_netbox_for_delete.primary_ip
+        except:
+            ip_for_delete = None
+
+        if ip_for_delete is not None:
+            ip_for_delete.delete()
+
+        delete_ip_address_filter = netbox_api.ipam.ip_addresses.filter(cf_Device=devices_in_netbox_for_delete.id)
+
+        for delete_ip_entry in delete_ip_address_filter:
+            delete_ip_entry.delete()
+
+        delete_prefix_filter = netbox_api.ipam.prefixes.filter(description=devices_in_netbox_for_delete.name)
+
+        for delete_prefix_entry in delete_prefix_filter:
+            delete_prefix_entry.delete()
+        try:
+            netbox_device_vlan_group = netbox_api.ipam.vlan_groups.get(name=devices_in_netbox_for_delete)
+            netbox_device_vlans_in_vlan_group = netbox_api.ipam.vlans.filter(group_id=netbox_device_vlan_group.id)
+            for delete in netbox_device_vlans_in_vlan_group:
+                delete.delete()
+        except:
+            print('Error while delete vlan groups')
+
+        delete_vlan_groups_filter = netbox_api.ipam.vlan_groups.filter(name=devices_in_netbox_for_delete.name)
+
+        for delete_vlan_group_entry in delete_vlan_groups_filter:
+            delete_vlan_group_entry.delete()
+
+        delete_vrfs_filter = netbox_api.ipam.vrfs.filter(cf_device=devices_in_netbox_for_delete.id)
+
+        for delete_vrf_entry in delete_vrfs_filter:
+            delete_vrf_entry.delete()
+
+        devices_in_netbox_for_delete.delete()
+
+    print("--- %s seconds ---" % (time.time() - start_time))
 
 
 if __name__ == "__main__":
-    # Тестирование всех устройств
-    test_all_devices()
-    
-    # Или тестирование одного устройства (раскомментируйте строку ниже)
-    # test_single_device("DEVICE_NAME")
+    processing_hpna_device_list()

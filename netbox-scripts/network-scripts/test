@@ -93,7 +93,15 @@ def synchronize_vrfs(device_vrfs, netbox_device, netbox_api):
     # Получаем VRF из NetBox для данного устройства
     netbox_vrfs = list(netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id))
     netbox_vrf_names = {vrf.name for vrf in netbox_vrfs}
-    device_vrf_names = {vrf.get('name') for vrf in device_vrfs if vrf.get('name') and vrf.get('name') != 'default'}
+    
+    # Очищаем имена VRF от лишних символов (запятые, пробелы)
+    device_vrf_names = set()
+    for vrf in device_vrfs:
+        vrf_name = vrf.get('name')
+        if vrf_name and vrf_name != 'default':
+            # Убираем запятые и пробелы в конце
+            clean_name = vrf_name.rstrip(', ')
+            device_vrf_names.add(clean_name)
     
     # ОТЛАДОЧНАЯ ИНФОРМАЦИЯ
     logger.debug(f"Device {netbox_device.name}:")
@@ -349,11 +357,17 @@ def create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api):
 
         for parsed_vrf_huawei in netmiko_vrfs:
             try:
+                # Исправляем имя VRF - убираем запятые в конце
                 if parsed_vrf_huawei['name'].endswith(','):
                     parsed_vrf_huawei['name'] = parsed_vrf_huawei['name'][:-1]
 
                 parsed_vrf_huawei['rt_import'] = parsed_vrf_huawei['rt_import'].split()
                 parsed_vrf_huawei['rt_export'] = parsed_vrf_huawei['rt_export'].split()
+
+        # Исправляем имена VRF для синхронизации ПЕРЕД сравнением
+        for vrf in netmiko_vrfs:
+            if vrf.get('name') and vrf['name'].endswith(','):
+                vrf['name'] = vrf['name'][:-1]
 
                 vrf_name = parsed_vrf_huawei.get('name')
                 if not vrf_name or vrf_name in ['default', 'GRT']:

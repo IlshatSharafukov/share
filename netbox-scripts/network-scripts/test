@@ -351,6 +351,11 @@ def create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api):
             synchronize_vrfs(user_vrfs, netbox_device, netbox_api)
             return
 
+        # Исправляем имена VRF для синхронизации ПЕРЕД сравнением
+        for vrf in netmiko_vrfs:
+            if vrf.get('name') and vrf['name'].endswith(','):
+                vrf['name'] = vrf['name'][:-1]
+
         # Синхронизируем VRF (исключаем GRT из синхронизации)
         user_vrfs = [vrf for vrf in netmiko_vrfs if vrf.get('name') != 'GRT']
         synchronize_vrfs(user_vrfs, netbox_device, netbox_api)
@@ -363,11 +368,6 @@ def create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api):
 
                 parsed_vrf_huawei['rt_import'] = parsed_vrf_huawei['rt_import'].split()
                 parsed_vrf_huawei['rt_export'] = parsed_vrf_huawei['rt_export'].split()
-
-        # Исправляем имена VRF для синхронизации ПЕРЕД сравнением
-        for vrf in netmiko_vrfs:
-            if vrf.get('name') and vrf['name'].endswith(','):
-                vrf['name'] = vrf['name'][:-1]
 
                 vrf_name = parsed_vrf_huawei.get('name')
                 if not vrf_name or vrf_name in ['default', 'GRT']:

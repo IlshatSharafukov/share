@@ -8,53 +8,122 @@ from decouple import config
 from netmiko.exceptions import NetMikoTimeoutException, NetMikoAuthenticationException
 from ntc_templates.parse import parse_output
 import logging
+import traceback
+from functools import wraps
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# Улучшенная настройка логирования
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] %(funcName)s:%(lineno)d - %(message)s",
+    handlers=[
+        logging.FileHandler("vrf_script.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger()
+
+def error_handler(func):
+    """Декоратор для обработки ошибок с детальным логированием"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            # Получаем имя устройства из аргументов если возможно
+            device_name = "Unknown"
+            if args and hasattr(args[0], 'name'):
+                device_name = args[0].name
+            elif len(args) > 0:
+                device_name = str(args[0])
+            
+            logger.error(f"ERROR in {func.__name__} for device {device_name}: {str(e)}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            raise  # Пробрасываем ошибку дальше
+    return wrapper
 
 
 def create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device):
+    """Создание route targets с улучшенным логированием"""
+    logger.debug(f"Creating route targets for {netbox_device.name}: import={rt_import_values}, export={rt_export_values}")
+    
     combined_values_set = set(rt_import_values) | set(rt_export_values)
     combined_values_list = list(combined_values_set)
+    
     for route_target_device in combined_values_list:
         try:
             netbox_rt = netbox_api.ipam.route_targets.get(name=str(route_target_device))
             if netbox_rt:
-                pass
+                logger.debug(f'Route target {route_target_device} already exists')
             else:
                 netbox_api.ipam.route_targets.create(name=route_target_device)
-                print(f'{route_target_device} создан в NetBox')
+                logger.info(f'Route target {route_target_device} created for {netbox_device.name}')
         except Exception as e:
-            print(f'Ошибка при работе с Route Target {route_target_device}: {e}, {netbox_device}')
+            logger.error(f'Error working with Route Target {route_target_device} for {netbox_device.name}: {e}')
+            logger.error(f'Traceback: {traceback.format_exc()}')
 
 
 def update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, evpn_var):
-    update_list_import = [netbox_api.ipam.route_targets.get(name=str(rt)).id for rt in rt_import_values]
-    netbox_vrf_for_update.update({'import_targets': update_list_import})
+    """Обновление route targets с проверками"""
+    try:
+        logger.debug(f"Updating route targets for VRF {netbox_vrf_for_update.name}")
+        
+        # Проверяем что route targets существуют
+        update_list_import = []
+        for rt in rt_import_values:
+            rt_obj = netbox_api.ipam.route_targets.get(name=str(rt))
+            if rt_obj:
+                update_list_import.append(rt_obj.id)
+            else:
+                logger.warning(f"Route target {rt} not found for import")
+        
+        update_list_export = []
+        for rt in rt_export_values:
+            rt_obj = netbox_api.ipam.route_targets.get(name=str(rt))
+            if rt_obj:
+                update_list_export.append(rt_obj.id)
+            else:
+                logger.warning(f"Route target {rt} not found for export")
 
-    update_list_export = [netbox_api.ipam.route_targets.get(name=str(rt)).id for rt in rt_export_values]
-    netbox_vrf_for_update.update({'export_targets': update_list_export})
-
-    netbox_vrf_for_update.update({'custom_fields': {'EVPN': evpn_var}})
+        netbox_vrf_for_update.update({'import_targets': update_list_import})
+        netbox_vrf_for_update.update({'export_targets': update_list_export})
+        netbox_vrf_for_update.update({'custom_fields': {'EVPN': evpn_var}})
+        
+        logger.debug(f"Successfully updated route targets for VRF {netbox_vrf_for_update.name}")
+        
+    except Exception as e:
+        logger.error(f"Error updating route targets for VRF {netbox_vrf_for_update.name}: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
 
 
 def netbox_connection():
-    netbox_api = pynetbox.api(
-        config('NETBOX_URL'),
-        token=config('NETBOX_TOKEN'),
-        threading=True
-    )
-    adapter = requests.adapters.HTTPAdapter(pool_connections=500, pool_maxsize=500)
-    netbox_api.http_session.mount('http://', adapter)
-    netbox_api.http_session.mount('https://', adapter)
-
-    netbox_api.http_session.verify = False
-    return netbox_api
+    """Подключение к NetBox с логированием"""
+    try:
+        logger.info("Connecting to NetBox...")
+        netbox_api = pynetbox.api(
+            config('NETBOX_URL'),
+            token=config('NETBOX_TOKEN'),
+            threading=True
+        )
+        adapter = requests.adapters.HTTPAdapter(pool_connections=500, pool_maxsize=500)
+        netbox_api.http_session.mount('http://', adapter)
+        netbox_api.http_session.mount('https://', adapter)
+        netbox_api.http_session.verify = False
+        
+        logger.info("Successfully connected to NetBox")
+        return netbox_api
+    except Exception as e:
+        logger.error(f"Failed to connect to NetBox: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
 
 
 def netmiko_connect(netbox_device, device_type):
+    """Подключение через Netmiko с детальным логированием"""
+    logger.info(f"Attempting to connect to {netbox_device.name} ({netbox_device.primary_ip}) via {device_type}")
+    
     netmiko_device = {
         'device_type': device_type,
         'host': str(netbox_device.primary_ip)[:-3:],
@@ -68,261 +137,433 @@ def netmiko_connect(netbox_device, device_type):
 
     try:
         net_connect = ConnectHandler(**netmiko_device)
-    except Exception as error:
+        logger.info(f"Successfully connected to {netbox_device.name}")
+        return net_connect
+    except NetMikoTimeoutException as e:
+        logger.error(f"Timeout connecting to {netbox_device.name}: {e}")
+        return None
+    except NetMikoAuthenticationException as e:
+        logger.error(f"Authentication failed for {netbox_device.name}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Connection error to {netbox_device.name}: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        # Повторная попытка
         try:
+            logger.info(f"Retrying connection to {netbox_device.name}")
             net_connect = ConnectHandler(**netmiko_device)
-        except Exception as error:
-            logger.error(f"Connection error {netbox_device}")
+            logger.info(f"Successfully connected to {netbox_device.name} on retry")
+            return net_connect
+        except Exception as retry_error:
+            logger.error(f"Retry connection failed for {netbox_device.name}: {retry_error}")
+            logger.error(f"Retry traceback: {traceback.format_exc()}")
             return None
 
-    return net_connect
 
-
+@error_handler
 def create_vrf_netbox_on_cisco_ios(netbox_device, netbox_api):
+    """Обработка Cisco IOS с полным логированием"""
+    logger.info(f'START SCRIPT for {netbox_device.name} (Cisco IOS)')
+    
     net_connect = netmiko_connect(netbox_device, 'cisco_ios')
-
     if not net_connect:
+        logger.error(f"Failed to connect to {netbox_device.name}, skipping")
         return
-    logger.info(f'START SCRIPT {netbox_device}')
-    output = net_connect.send_command('show run | section vrf')
 
     try:
-        netmiko_vrfs = parse_output(platform='cisco_ios', command='show run vrf', data=output)
-        if not netmiko_vrfs:
-            raise ValueError
-    except ValueError as e:
-        net_connect.disconnect()
-        # print(f"Ошибка: {e}")
-        return
-    netbox_vrfs = netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id)
-    netbox_device_vrfs = [
-        str(netbox_vrf.name) for netbox_vrf in netbox_vrfs
-    ]
-    for netmiko_vrfs_show_run in netmiko_vrfs:
+        logger.debug(f"Sending command 'show run | section vrf' to {netbox_device.name}")
+        output = net_connect.send_command('show run | section vrf')
+        logger.debug(f"Command output length: {len(output)} characters")
+
         try:
-            vrf_name = netmiko_vrfs_show_run.get('name')
-            if not vrf_name:
-                raise KeyError(f"Отсутствует ключ 'name' в данных VRF {netbox_device}, {vrf_name}")
-            if vrf_name in ['default']:
-                continue
+            netmiko_vrfs = parse_output(platform='cisco_ios', command='show run vrf', data=output)
+            if not netmiko_vrfs:
+                logger.warning(f"No VRFs found on {netbox_device.name}")
+                return
+            logger.info(f"Found {len(netmiko_vrfs)} VRFs on {netbox_device.name}")
+        except Exception as parse_error:
+            logger.error(f"Parse error for {netbox_device.name}: {parse_error}")
+            logger.error(f"Output was: {output[:500]}...")  # Первые 500 символов
+            return
 
-            evpn_var = False
+        netbox_vrfs = netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id)
+        netbox_device_vrfs = [str(netbox_vrf.name) for netbox_vrf in netbox_vrfs]
+        logger.debug(f"Existing NetBox VRFs for {netbox_device.name}: {netbox_device_vrfs}")
 
-            rt_import_values = netmiko_vrfs_show_run.get('rt_import', [])
-            rt_export_values = netmiko_vrfs_show_run.get('rt_export', [])
-
-            if not isinstance(rt_import_values, list) or not isinstance(rt_export_values, list):
-                raise ValueError(f"Неверный формат import/export для VRF {vrf_name}, {netbox_device}")
-
-            create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device)
-
+        for i, netmiko_vrf in enumerate(netmiko_vrfs):
+            logger.debug(f"Processing VRF {i+1}/{len(netmiko_vrfs)} on {netbox_device.name}")
+            
             try:
-                is_vrf_exists = False
-                if str(vrf_name) in netbox_device_vrfs:
-                    is_vrf_exists = True
+                vrf_name = netmiko_vrf.get('name')
+                if not vrf_name:
+                    logger.error(f"Missing 'name' key in VRF data for {netbox_device.name}: {netmiko_vrf}")
+                    continue
+                    
+                if vrf_name in ['default']:
+                    logger.debug(f"Skipping default VRF on {netbox_device.name}")
+                    continue
 
-                if not is_vrf_exists:
-                    netbox_api.ipam.vrfs.create(name=vrf_name, rd=netmiko_vrfs_show_run['rd'],
-                                                description=f'discovered from {netbox_device.name}',
-                                                custom_fields={'device': netbox_device.id}
-                                                )
+                logger.info(f"Processing VRF '{vrf_name}' on {netbox_device.name}")
 
-            except pynetbox.core.query.RequestError as e:
-                print(f"Ошибка при создании/обновлении VRF {vrf_name} на устройстве {netbox_device.name}: {e}")
+                evpn_var = False
+                rt_import_values = netmiko_vrf.get('rt_import', [])
+                rt_export_values = netmiko_vrf.get('rt_export', [])
 
-            netbox_vrf_for_update = netbox_api.ipam.vrfs.get(name=vrf_name,
-                                                             cf_device=netbox_device.id, rd=netmiko_vrfs_show_run['rd'])
+                if not isinstance(rt_import_values, list) or not isinstance(rt_export_values, list):
+                    logger.error(f"Invalid import/export format for VRF {vrf_name} on {netbox_device.name}")
+                    continue
 
-            update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, evpn_var)
+                create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device)
 
-        except Exception as error:
-            if 'get() returned more than one result' not in error:
-                logger.error(f'SCRIPT {netbox_device} - {error} - {vrf_name}')
+                try:
+                    is_vrf_exists = str(vrf_name) in netbox_device_vrfs
+                    
+                    if not is_vrf_exists:
+                        logger.info(f"Creating VRF {vrf_name} in NetBox for {netbox_device.name}")
+                        netbox_api.ipam.vrfs.create(
+                            name=vrf_name, 
+                            rd=netmiko_vrf['rd'],
+                            description=f'discovered from {netbox_device.name}',
+                            custom_fields={'device': netbox_device.id}
+                        )
+                    else:
+                        logger.debug(f"VRF {vrf_name} already exists in NetBox for {netbox_device.name}")
 
-    logger.info(f'END SCRIPT {netbox_device}')
-    net_connect.disconnect()
+                except pynetbox.core.query.RequestError as e:
+                    logger.error(f"NetBox API error creating VRF {vrf_name} on {netbox_device.name}: {e}")
+                    continue
+
+                netbox_vrf_for_update = netbox_api.ipam.vrfs.get(
+                    name=vrf_name,
+                    cf_device=netbox_device.id, 
+                    rd=netmiko_vrf['rd']
+                )
+                
+                if not netbox_vrf_for_update:
+                    logger.error(f"Could not find created VRF {vrf_name} for {netbox_device.name}")
+                    continue
+
+                update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, evpn_var)
+                logger.info(f"Successfully processed VRF {vrf_name} on {netbox_device.name}")
+
+            except Exception as vrf_error:
+                logger.error(f'Error processing VRF on {netbox_device.name}: {vrf_error}')
+                logger.error(f'VRF data: {netmiko_vrf}')
+                logger.error(f'Traceback: {traceback.format_exc()}')
+                continue  # Продолжаем обработку следующего VRF
+
+    finally:
+        try:
+            net_connect.disconnect()
+            logger.info(f"Disconnected from {netbox_device.name}")
+        except Exception as disconnect_error:
+            logger.error(f"Error disconnecting from {netbox_device.name}: {disconnect_error}")
+
+    logger.info(f'END SCRIPT for {netbox_device.name} (Cisco IOS)')
 
 
+@error_handler
 def create_vrf_netbox_on_cisco_nxos(netbox_device, netbox_api):
+    """Обработка Cisco NXOS с полным логированием"""
+    logger.info(f'START SCRIPT for {netbox_device.name} (Cisco NXOS)')
+    
     net_connect = netmiko_connect(netbox_device, 'cisco_nxos')
     if not net_connect:
+        logger.error(f"Failed to connect to {netbox_device.name}, skipping")
         return
-    logger.info(f'START SCRIPT {netbox_device}')
-    output = net_connect.send_command('show run | section vrf')
+
     try:
-        netmiko_vrfs = parse_output(platform='cisco_nxos', command='show run vrf', data=output)
-        if not netmiko_vrfs:
-            raise ValueError(f'Ошибка парсинга VRF {netbox_device}')
-    except ValueError as e:
-        print(f"Ошибка: {e}")
-        return
-    netbox_vrfs = netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id)
-    netbox_device_vrfs = [
-        str(netbox_vrf.name) for netbox_vrf in netbox_vrfs
-    ]
-    for netmiko_vrfs_show_run in netmiko_vrfs:
+        logger.debug(f"Sending command 'show run | section vrf' to {netbox_device.name}")
+        output = net_connect.send_command('show run | section vrf')
+        
         try:
-            vrf_name = netmiko_vrfs_show_run.get('name')
-            if not vrf_name:
-                raise KeyError(f"Отсутствует ключ 'name' в данных VRF {netbox_device}, {vrf_name}")
-            if vrf_name in ['default']:
-                continue
+            netmiko_vrfs = parse_output(platform='cisco_nxos', command='show run vrf', data=output)
+            if not netmiko_vrfs:
+                logger.warning(f"No VRFs found on {netbox_device.name}")
+                return
+            logger.info(f"Found {len(netmiko_vrfs)} VRFs on {netbox_device.name}")
+        except Exception as parse_error:
+            logger.error(f"Parse error for {netbox_device.name}: {parse_error}")
+            logger.error(f"Output was: {output[:500]}...")
+            return
 
-            evpn_var = True if 'evpn' in netmiko_vrfs_show_run['evpn'] else False
+        netbox_vrfs = netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id)
+        netbox_device_vrfs = [str(netbox_vrf.name) for netbox_vrf in netbox_vrfs]
 
-            rt_import_values = netmiko_vrfs_show_run.get('rt_import', [])
-            rt_export_values = netmiko_vrfs_show_run.get('rt_export', [])
-
-            if not isinstance(rt_import_values, list) or not isinstance(rt_export_values, list):
-                raise ValueError(f"Неверный формат import/export для VRF {vrf_name}, {netbox_device}")
-
-            create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device)
-
+        for netmiko_vrf in netmiko_vrfs:
             try:
-                is_vrf_exists = False
-                if str(vrf_name) in netbox_device_vrfs:
-                    is_vrf_exists = True
-                if not is_vrf_exists:
-                    netbox_api.ipam.vrfs.create(name=vrf_name, rd=netmiko_vrfs_show_run['rd'],
-                                                description=f'discovered from {netbox_device.name}',
-                                                custom_fields={'device': netbox_device.id}
-                                                )
-            except pynetbox.core.query.RequestError as e:
-                print(f"Ошибка при создании/обновлении VRF {vrf_name} на устройстве {netbox_device.name}: {e}")
-            netbox_vrf_for_update = netbox_api.ipam.vrfs.get(name=vrf_name,
-                                                             cf_device=netbox_device.id)
+                vrf_name = netmiko_vrf.get('name')
+                if not vrf_name:
+                    logger.error(f"Missing 'name' key in VRF data for {netbox_device.name}")
+                    continue
+                    
+                if vrf_name in ['default']:
+                    continue
 
-            update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, evpn_var)
-        except Exception as error:
-            logger.error(f'SCRIPT {netbox_device} - {error} - {netmiko_vrfs_show_run}')
+                logger.info(f"Processing VRF '{vrf_name}' on {netbox_device.name}")
 
-    logger.info(f'END SCRIPT {netbox_device}')
-    net_connect.disconnect()
+                evpn_var = True if 'evpn' in netmiko_vrf.get('evpn', '') else False
+                rt_import_values = netmiko_vrf.get('rt_import', [])
+                rt_export_values = netmiko_vrf.get('rt_export', [])
+
+                if not isinstance(rt_import_values, list) or not isinstance(rt_export_values, list):
+                    logger.error(f"Invalid import/export format for VRF {vrf_name} on {netbox_device.name}")
+                    continue
+
+                create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device)
+
+                try:
+                    is_vrf_exists = str(vrf_name) in netbox_device_vrfs
+                    
+                    if not is_vrf_exists:
+                        logger.info(f"Creating VRF {vrf_name} in NetBox for {netbox_device.name}")
+                        netbox_api.ipam.vrfs.create(
+                            name=vrf_name, 
+                            rd=netmiko_vrf['rd'],
+                            description=f'discovered from {netbox_device.name}',
+                            custom_fields={'device': netbox_device.id}
+                        )
+                        
+                except pynetbox.core.query.RequestError as e:
+                    logger.error(f"NetBox API error creating VRF {vrf_name} on {netbox_device.name}: {e}")
+                    continue
+
+                netbox_vrf_for_update = netbox_api.ipam.vrfs.get(
+                    name=vrf_name,
+                    cf_device=netbox_device.id
+                )
+
+                update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, evpn_var)
+                logger.info(f"Successfully processed VRF {vrf_name} on {netbox_device.name}")
+
+            except Exception as vrf_error:
+                logger.error(f'Error processing VRF on {netbox_device.name}: {vrf_error}')
+                logger.error(f'VRF data: {netmiko_vrf}')
+                logger.error(f'Traceback: {traceback.format_exc()}')
+
+    finally:
+        try:
+            net_connect.disconnect()
+            logger.info(f"Disconnected from {netbox_device.name}")
+        except Exception as disconnect_error:
+            logger.error(f"Error disconnecting from {netbox_device.name}: {disconnect_error}")
+
+    logger.info(f'END SCRIPT for {netbox_device.name} (Cisco NXOS)')
 
 
+@error_handler
 def create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api):
+    """Обработка Huawei VRP с полным логированием"""
+    logger.info(f'START SCRIPT for {netbox_device.name} (Huawei VRP)')
+    
     net_connect = netmiko_connect(netbox_device, 'huawei_vrp')
     if not net_connect:
-        print(f'Ошибка подключения {netbox_device}')
+        logger.error(f'Connection error for {netbox_device.name}')
         return
-
-    public_vrf = netbox_api.ipam.vrfs.get(name='GRT', cf_device=netbox_device.id)
-
-    if not public_vrf:
-        netbox_api.ipam.vrfs.create(name='GRT', rd='',
-                                    description=f'discovered from {netbox_device.name}',
-                                    custom_fields={'device': netbox_device.id}
-                                    )
-
-    output = net_connect.send_command('display ip vpn-instance verbose')
 
     try:
-        netmiko_vrfs = parse_output(platform="huawei_vrp", command="display ip vpn verbose instance", data=output)
-        if not netmiko_vrfs:
-            raise ValueError(f'Ошибка парсинга VRF {netbox_device}')
-    except ValueError as e:
-        print(f"Ошибка: {e}")
-        return
+        # Создание GRT VRF
+        public_vrf = netbox_api.ipam.vrfs.get(name='GRT', cf_device=netbox_device.id)
+        if not public_vrf:
+            logger.info(f"Creating GRT VRF for {netbox_device.name}")
+            netbox_api.ipam.vrfs.create(
+                name='GRT', 
+                rd='',
+                description=f'discovered from {netbox_device.name}',
+                custom_fields={'device': netbox_device.id}
+            )
 
-    evpn_var = False
+        logger.debug(f"Sending command 'display ip vpn-instance verbose' to {netbox_device.name}")
+        output = net_connect.send_command('display ip vpn-instance verbose')
 
-    netbox_vrfs = netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id)
-    netbox_device_vrfs = [
-        str(netbox_vrf.name) for netbox_vrf in netbox_vrfs
-    ]
-
-    for parsed_vrf_huawei in netmiko_vrfs:
         try:
-            if parsed_vrf_huawei['name'].endswith(','):
-                parsed_vrf_huawei['name'] = parsed_vrf_huawei['name'][:-1]
+            netmiko_vrfs = parse_output(platform="huawei_vrp", command="display ip vpn verbose instance", data=output)
+            if not netmiko_vrfs:
+                logger.warning(f"No VRFs found on {netbox_device.name}")
+                return
+            logger.info(f"Found {len(netmiko_vrfs)} VRFs on {netbox_device.name}")
+        except Exception as parse_error:
+            logger.error(f"Parse error for {netbox_device.name}: {parse_error}")
+            logger.error(f"Output was: {output[:500]}...")
+            return
 
-            parsed_vrf_huawei['rt_import'] = parsed_vrf_huawei['rt_import'].split()
-            parsed_vrf_huawei['rt_export'] = parsed_vrf_huawei['rt_export'].split()
+        evpn_var = False
+        netbox_vrfs = netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id)
+        netbox_device_vrfs = [str(netbox_vrf.name) for netbox_vrf in netbox_vrfs]
 
-            vrf_name = parsed_vrf_huawei.get('name')
-            if not vrf_name:
-                raise KeyError(f"Отсутствует ключ 'name' в данных VRF {netbox_device}, {vrf_name}")
-            if vrf_name in ['default']:
-                continue
-
-            rt_import_values = parsed_vrf_huawei['rt_import']
-            rt_export_values = parsed_vrf_huawei['rt_export']
-
-            create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device)
-
+        for parsed_vrf_huawei in netmiko_vrfs:
             try:
-                is_vrf_exists = False
-                if str(vrf_name) in netbox_device_vrfs:
-                    is_vrf_exists = True
-                    # print(f"VRF {netbox_vrf.name} уже существует в NetBox")
-                if not is_vrf_exists:
-                    netbox_api.ipam.vrfs.create(name=vrf_name, rd=parsed_vrf_huawei['rd'],
-                                                description=f'discovered from {netbox_device.name}',
-                                                custom_fields={'device': netbox_device.id}
-                                                )
-                    # print(f"VRF {vrf_name} создан в NetBox")
-            except Exception as e:
-                print(f"Ошибка при создании/обновлении VRF {vrf_name} на устройстве {netbox_device.name}: {e}")
+                # Очистка имени VRF
+                if parsed_vrf_huawei['name'].endswith(','):
+                    parsed_vrf_huawei['name'] = parsed_vrf_huawei['name'][:-1]
 
-            netbox_vrf_for_update = netbox_api.ipam.vrfs.get(name=vrf_name,
-                                                             cf_device=netbox_device.id)
+                parsed_vrf_huawei['rt_import'] = parsed_vrf_huawei['rt_import'].split()
+                parsed_vrf_huawei['rt_export'] = parsed_vrf_huawei['rt_export'].split()
 
-            update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, evpn_var)
-        except Exception as error:
-            logger.error(f'ERROR SCRIPT {netbox_device} - {error}')
+                vrf_name = parsed_vrf_huawei.get('name')
+                if not vrf_name:
+                    logger.error(f"Missing 'name' key in VRF data for {netbox_device.name}")
+                    continue
+                    
+                if vrf_name in ['default']:
+                    continue
 
-    logger.info(f'END SCRIPT {netbox_device}')
-    net_connect.disconnect()
+                logger.info(f"Processing VRF '{vrf_name}' on {netbox_device.name}")
+
+                rt_import_values = parsed_vrf_huawei['rt_import']
+                rt_export_values = parsed_vrf_huawei['rt_export']
+
+                create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device)
+
+                try:
+                    is_vrf_exists = str(vrf_name) in netbox_device_vrfs
+                    
+                    if not is_vrf_exists:
+                        logger.info(f"Creating VRF {vrf_name} in NetBox for {netbox_device.name}")
+                        netbox_api.ipam.vrfs.create(
+                            name=vrf_name, 
+                            rd=parsed_vrf_huawei['rd'],
+                            description=f'discovered from {netbox_device.name}',
+                            custom_fields={'device': netbox_device.id}
+                        )
+                        
+                except Exception as create_error:
+                    logger.error(f"Error creating VRF {vrf_name} on {netbox_device.name}: {create_error}")
+                    continue
+
+                netbox_vrf_for_update = netbox_api.ipam.vrfs.get(
+                    name=vrf_name,
+                    cf_device=netbox_device.id
+                )
+
+                update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, evpn_var)
+                logger.info(f"Successfully processed VRF {vrf_name} on {netbox_device.name}")
+
+            except Exception as vrf_error:
+                logger.error(f'Error processing VRF on {netbox_device.name}: {vrf_error}')
+                logger.error(f'Traceback: {traceback.format_exc()}')
+
+    finally:
+        try:
+            net_connect.disconnect()
+            logger.info(f"Disconnected from {netbox_device.name}")
+        except Exception as disconnect_error:
+            logger.error(f"Error disconnecting from {netbox_device.name}: {disconnect_error}")
+
+    logger.info(f'END SCRIPT for {netbox_device.name} (Huawei VRP)')
 
 
 def add_vrf_to_netbox_for_one_device(device_name: str):
+    """Обработка одного устройства с логированием"""
     start_time = time.time()
+    logger.info(f"Starting VRF discovery for device: {device_name}")
 
-    netbox_api = netbox_connection()
-    netbox_device = netbox_api.dcim.devices.get(name=device_name.upper())
+    try:
+        netbox_api = netbox_connection()
+        netbox_device = netbox_api.dcim.devices.get(name=device_name.upper())
+        
+        if not netbox_device:
+            logger.error(f"Device {device_name} not found in NetBox")
+            return
+            
+        if not netbox_device.platform:
+            logger.error(f"Device {device_name} has no platform defined")
+            return
 
-    if (netbox_device.platform.name == 'Cisco IOS'
-            or netbox_device.platform.name == 'Ruijie RG'):
-        create_vrf_netbox_on_cisco_ios(
-            netbox_device,
-            netbox_api
-        )
+        platform_name = netbox_device.platform.name
+        logger.info(f"Device {device_name} platform: {platform_name}")
 
-    elif netbox_device.platform.name == 'Cisco NXOS':
-        create_vrf_netbox_on_cisco_nxos(
-            netbox_device,
-            netbox_api
-        )
+        if platform_name in ['Cisco IOS', 'Ruijie RG']:
+            create_vrf_netbox_on_cisco_ios(netbox_device, netbox_api)
+        elif platform_name == 'Cisco NXOS':
+            create_vrf_netbox_on_cisco_nxos(netbox_device, netbox_api)
+        elif platform_name == 'Huawei Versatile Routing Platform':
+            create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api)
+        else:
+            logger.warning(f"Unsupported platform {platform_name} for device {device_name}")
 
-    elif netbox_device.platform.name == 'Huawei Versatile Routing Platform':
-        create_vrf_netbox_on_huawei_vrp(
-            netbox_device,
-            netbox_api
-        )
-    print("--- %s seconds ---" % (time.time() - start_time))
+    except Exception as e:
+        logger.error(f"Error processing device {device_name}: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+    
+    elapsed_time = time.time() - start_time
+    logger.info(f"Completed VRF discovery for {device_name} in {elapsed_time:.2f} seconds")
+
+
+def process_device_wrapper(netbox_device, netbox_api):
+    """Обертка для обработки устройства в потоке"""
+    try:
+        platform_name = netbox_device.platform.name
+        
+        if platform_name == 'Cisco IOS':
+            create_vrf_netbox_on_cisco_ios(netbox_device, netbox_api)
+        elif platform_name == 'Cisco NXOS':
+            create_vrf_netbox_on_cisco_nxos(netbox_device, netbox_api)
+        elif platform_name == 'Huawei Versatile Routing Platform':
+            create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api)
+        else:
+            logger.warning(f"Unsupported platform {platform_name} for device {netbox_device.name}")
+            
+    except Exception as e:
+        logger.error(f"Error in thread for device {netbox_device.name}: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
 
 
 def add_vrf_to_netbox():
+    """Основная функция с улучшенным логированием потоков"""
     start_time = time.time()
+    logger.info("Starting VRF discovery for all devices")
 
-    netbox_api = netbox_connection()
-    script_devices = []
-    netbox_all_devices = netbox_api.dcim.devices.all()
-    for netbox_device in netbox_all_devices:
-        netbox_device_tags = str(netbox_device.tags)
-        if 'raif_scripts' in netbox_device_tags:
-            script_devices.append(netbox_device)
+    try:
+        netbox_api = netbox_connection()
+        script_devices = []
+        
+        logger.info("Getting devices with 'raif_scripts' tag")
+        netbox_all_devices = netbox_api.dcim.devices.all()
+        
+        for netbox_device in netbox_all_devices:
+            netbox_device_tags = str(netbox_device.tags)
+            if 'raif_scripts' in netbox_device_tags:
+                script_devices.append(netbox_device)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-        for netbox_device in script_devices:
-            if netbox_device.platform.name == 'Cisco IOS':
-                executor.submit(create_vrf_netbox_on_cisco_ios, netbox_device, netbox_api)
-            elif netbox_device.platform.name == 'Cisco NXOS':
-                executor.submit(create_vrf_netbox_on_cisco_nxos, netbox_device, netbox_api)
-            elif netbox_device.platform.name == 'Huawei Versatile Routing Platform':
-                executor.submit(create_vrf_netbox_on_huawei_vrp, netbox_device, netbox_api)
+        logger.info(f"Found {len(script_devices)} devices to process")
 
-    print("--- %s seconds ---" % (time.time() - start_time))
+        # Уменьшаем количество потоков для лучшего контроля
+        max_workers = min(20, len(script_devices))  # Было 100
+        logger.info(f"Using {max_workers} worker threads")
+
+        completed_devices = []
+        failed_devices = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Создаем future для каждого устройства
+            future_to_device = {
+                executor.submit(process_device_wrapper, device, netbox_api): device 
+                for device in script_devices
+            }
+
+            # Ожидаем завершения всех задач
+            for future in concurrent.futures.as_completed(future_to_device):
+                device = future_to_device[future]
+                try:
+                    future.result()  # Получаем результат (или ошибку)
+                    completed_devices.append(device.name)
+                    logger.info(f"Successfully completed: {device.name}")
+                except Exception as e:
+                    failed_devices.append(device.name)
+                    logger.error(f"Failed to process {device.name}: {e}")
+
+        logger.info(f"Completed devices ({len(completed_devices)}): {', '.join(completed_devices)}")
+        if failed_devices:
+            logger.error(f"Failed devices ({len(failed_devices)}): {', '.join(failed_devices)}")
+
+    except Exception as e:
+        logger.error(f"Error in main function: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+
+    elapsed_time = time.time() - start_time
+    logger.info(f"VRF discovery completed in {elapsed_time:.2f} seconds")
 
 
 if __name__ == "__main__":

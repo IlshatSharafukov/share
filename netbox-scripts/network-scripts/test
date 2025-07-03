@@ -5,7 +5,11 @@ from decouple import config
 import time
 from hpnapy import *
 import concurrent.futures
-import os
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger()
 
 set_ipam_device = set()
 set_hpna_device = set()
@@ -15,7 +19,6 @@ HPNA_LOGIN = config('HPNA_LOGIN')
 HPNA_PASSWORD = config('HPNA_PASSWORD')
 NETBOX_URL = config('NETBOX_URL')
 NETBOX_TOKEN = config('NETBOX_TOKEN')
-
 
 location_map = {
     'MSKX5': r'MSKX5',
@@ -48,17 +51,93 @@ device_role_map = {
 }
 
 
-def update_interface(netbox_api, hpna_device_ip, device_hostname):
+def create_or_get_default_vrf(netbox_api):
+    """Создает или получает default VRF"""
     try:
-        device_ip = netbox_api.ipam.ip_addresses.get(address=hpna_device_ip, vrf_name='default')
-        device_interface = netbox_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname)
-        device_name_nb = netbox_api.dcim.devices.get(name=device_hostname)
-        update_dict = dict(assigned_object_id=device_interface.id, assigned_object_type="dcim.interface")
-        device_ip.update(update_dict)
-        device_name_nb.primary_ip4 = device_ip
-        device_name_nb.save()
-    except pynetbox.RequestError as err:
-        print(f"Failed to update device mgmt interface {device_hostname}: {err}")
+        default_vrf = netbox_api.ipam.vrfs.get(name='default')
+        if not default_vrf:
+            logger.info("Создаем default VRF")
+            default_vrf = netbox_api.ipam.vrfs.create(
+                name='default',
+                rd='',
+                description='Default VRF for management'
+            )
+        return default_vrf
+    except Exception as e:
+        logger.error(f"Ошибка при работе с default VRF: {e}")
+        return None
+
+
+def update_device_ip_address(netbox_api, device_hostname, hpna_device_ip):
+    """Обновляет IP адрес устройства в NetBox"""
+    try:
+        # Получаем устройство
+        device = netbox_api.dcim.devices.get(name=device_hostname)
+        if not device:
+            logger.error(f"Устройство {device_hostname} не найдено в NetBox")
+            return False
+
+        # Проверяем наличие default VRF
+        default_vrf = create_or_get_default_vrf(netbox_api)
+        if not default_vrf:
+            logger.error(f"Не удалось получить default VRF для {device_hostname}")
+            return False
+
+        # Получаем или создаем mgmt interface
+        mgmt_interface = netbox_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname)
+        if not mgmt_interface:
+            logger.info(f"Создаем mgmt interface для {device_hostname}")
+            mgmt_interface = netbox_api.dcim.interfaces.create(
+                device=device.id,
+                name='mgmt interface',
+                type='virtual',
+                mtu=1500,
+                description='Management interface for device control',
+                mgmt_only=True
+            )
+
+        # Формируем IP с маской /32 если её нет
+        if '/' not in hpna_device_ip:
+            ip_with_mask = f"{hpna_device_ip}/32"
+        else:
+            ip_with_mask = hpna_device_ip
+
+        # Проверяем существование IP адреса
+        existing_ip = netbox_api.ipam.ip_addresses.get(address=ip_with_mask)
+        
+        if not existing_ip:
+            logger.info(f"Создаем IP адрес {ip_with_mask} для {device_hostname}")
+            # Создаем новый IP адрес
+            new_ip = netbox_api.ipam.ip_addresses.create(
+                address=ip_with_mask,
+                vrf=default_vrf.id,
+                description=f'Management IP for {device_hostname}',
+                assigned_object_type='dcim.interface',
+                assigned_object_id=mgmt_interface.id
+            )
+            ip_to_assign = new_ip
+        else:
+            logger.info(f"IP адрес {ip_with_mask} уже существует, обновляем привязку для {device_hostname}")
+            # Обновляем существующий IP
+            existing_ip.update({
+                'assigned_object_type': 'dcim.interface',
+                'assigned_object_id': mgmt_interface.id,
+                'vrf': default_vrf.id,
+                'description': f'Management IP for {device_hostname}'
+            })
+            ip_to_assign = existing_ip
+
+        # Устанавливаем как primary IP
+        logger.info(f"Устанавливаем {ip_with_mask} как primary IP для {device_hostname}")
+        device.primary_ip4 = ip_to_assign.id
+        device.save()
+
+        logger.info(f"✅ Успешно обновлен IP адрес для {device_hostname}: {ip_with_mask}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка при обновлении IP адреса для {device_hostname}: {e}")
+        return False
 
 
 def fetch_device_role_for_vlan_group(device_hostname):
@@ -99,6 +178,9 @@ def netbox_connection():
         token=config('NETBOX_TOKEN'),
         threading=True
     )
+    adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
+    netbox_api.http_session.mount('http://', adapter)
+    netbox_api.http_session.mount('https://', adapter)
     netbox_api.http_session.verify = False
     return netbox_api
 
@@ -134,9 +216,13 @@ def add_new_device_to_netbox(hpna_api_device_entry, netbox_api, hpna_api):
     if hpna_device_model is None:
         hpna_device_model = 'UNKNOWN'
 
-    if hpna_device_ip is None or re.search("^\w+\.\w+\.\w+\.\w+$", device_hostname):
+    # Проверка валидности IP
+    if hpna_device_ip is None or re.search(r"^\w+\.\w+\.\w+\.\w+$", device_hostname):
+        logger.warning(f"Пропускаем {device_hostname}: некорректный IP или hostname")
         return
-    if hpna_device_vendor and hpna_device_model == (' ' or None or 'UNKNOWN' or ''):
+
+    if hpna_device_vendor in [' ', None, 'UNKNOWN', ''] and hpna_device_model in [' ', None, 'UNKNOWN', '']:
+        logger.warning(f"Пропускаем {device_hostname}: неизвестные vendor и model")
         return
 
     device_hpna_location = get_location(device_hostname)
@@ -147,207 +233,228 @@ def add_new_device_to_netbox(hpna_api_device_entry, netbox_api, hpna_api):
     device_model_slug = generate_device_model_slug(hpna_device_model)
     device_platform_slug = generate_slug(hpna_device_family)
 
-    if netbox_api.dcim.device_roles.get(name=device_hpna_role, slug=device_role_slug) is None:
-        try:
+    # Создание необходимых объектов в NetBox
+    try:
+        # Device Role
+        if netbox_api.dcim.device_roles.get(name=device_hpna_role, slug=device_role_slug) is None:
             netbox_api.dcim.device_roles.create(name=device_hpna_role, slug=device_role_slug)
-        except pynetbox.RequestError as err:
-            print(f"Failed to create device role for device {device_hostname}: {err}")
-    if netbox_api.extras.tags.get(name=device_hpna_role, slug=device_role_slug) is None:
-        try:
-            netbox_api.extras.tags.create(name=device_hpna_role, slug=device_role_slug)
-        except pynetbox.RequestError as err:
-            print(f"Failed to create tag for device {device_hostname}: {err}")
-    if netbox_api.dcim.manufacturers.get(name=hpna_device_vendor, slug=device_vendor_slug) is None:
-        try:
-            netbox_api.dcim.manufacturers.create(name=hpna_device_vendor, slug=device_vendor_slug)
-        except pynetbox.RequestError as err:
-            print(f"Failed to create manufacturers for device {device_hostname}: {err}")
-    if netbox_api.dcim.device_types.get(model=hpna_device_model) is None:
-        try:
-            device_vendor_nb = netbox_api.dcim.manufacturers.get(name=hpna_device_vendor, slug=device_vendor_slug)
-            netbox_api.dcim.device_types.create(model=hpna_device_model, manufacturer=device_vendor_nb.id,
-                                                slug=device_model_slug)
-        except pynetbox.RequestError as err:
-            print(f"Failed to create device vendor for device {device_hostname}: {err}")
-    if netbox_api.dcim.platforms.get(name=hpna_device_family) is None:
-        try:
-            netbox_api.dcim.platforms.create(name=hpna_device_family, slug=device_platform_slug)
-        except pynetbox.RequestError as err:
-            print(f"Failed to create device platform for device {device_hostname}: {err}")
 
+        # Tag
+        if netbox_api.extras.tags.get(name=device_hpna_role, slug=device_role_slug) is None:
+            netbox_api.extras.tags.create(name=device_hpna_role, slug=device_role_slug)
+
+        # Manufacturer
+        if netbox_api.dcim.manufacturers.get(name=hpna_device_vendor, slug=device_vendor_slug) is None:
+            netbox_api.dcim.manufacturers.create(name=hpna_device_vendor, slug=device_vendor_slug)
+
+        # Device Type
+        if netbox_api.dcim.device_types.get(model=hpna_device_model) is None:
+            device_vendor_nb = netbox_api.dcim.manufacturers.get(name=hpna_device_vendor, slug=device_vendor_slug)
+            netbox_api.dcim.device_types.create(
+                model=hpna_device_model, 
+                manufacturer=device_vendor_nb.id,
+                slug=device_model_slug
+            )
+
+        # Platform
+        if netbox_api.dcim.platforms.get(name=hpna_device_family) is None:
+            netbox_api.dcim.platforms.create(name=hpna_device_family, slug=device_platform_slug)
+
+    except Exception as e:
+        logger.error(f"Ошибка при создании объектов NetBox для {device_hostname}: {e}")
+
+    # Получение ID объектов
     try:
         device_role_id = netbox_api.dcim.device_roles.get(name=device_hpna_role).id
-    except pynetbox.RequestError as err:
+    except:
         device_role_id = 10
-        print(f'Failed to get device role: {device_hostname}')
+        logger.warning(f'Не удалось получить device role для {device_hostname}')
 
     try:
         device_type_id = netbox_api.dcim.device_types.get(model=hpna_device_model).id
-    except pynetbox.RequestError as err:
+    except:
         device_type_id = 58
-        print(f'Failed to get device type: {device_hostname}')
+        logger.warning(f'Не удалось получить device type для {device_hostname}')
 
     try:
         site_id = netbox_api.dcim.sites.get(name=device_hpna_location).id
-    except pynetbox.RequestError as err:
+    except:
         site_id = 6
-        print(f'Failed to get site: {device_hostname}')
+        logger.warning(f'Не удалось получить site для {device_hostname}')
 
     try:
         platform_id = netbox_api.dcim.platforms.get(name=hpna_device_family).id
-    except pynetbox.RequestError as err:
+    except:
         platform_id = 2
-        print(f'Failed to get platform: {device_hostname}')
+        logger.warning(f'Не удалось получить platform для {device_hostname}')
 
-    if netbox_api.dcim.devices.get(name=device_hostname) is None:
+    # Проверяем существование устройства
+    existing_device = netbox_api.dcim.devices.get(name=device_hostname)
+    
+    if not existing_device:
+        # Создаем новое устройство
+        logger.info(f"Создаем новое устройство: {device_hostname}")
         try:
-            netbox_api.dcim.devices.create(name=device_hostname,
-                                           role=device_role_id,
-                                           device_type=device_type_id,
-                                           site=site_id,
-                                           platform=platform_id,
-                                           status='active',
-                                           tags=[{'name': device_hpna_role}, {'name': 'raif_scripts'}])
-        except pynetbox.RequestError as err:
-            print(f"Failed to create device {device_hostname}: {err}")
+            new_device = netbox_api.dcim.devices.create(
+                name=device_hostname,
+                role=device_role_id,
+                device_type=device_type_id,
+                site=site_id,
+                platform=platform_id,
+                status='active',
+                tags=[{'name': device_hpna_role}, {'name': 'raif_scripts'}]
+            )
+            logger.info(f"✅ Создано устройство: {device_hostname}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при создании устройства {device_hostname}: {e}")
+            return
 
+    # Обновляем IP адрес (для новых и существующих устройств)
+    update_device_ip_address(netbox_api, device_hostname, hpna_device_ip)
+
+    # Создание VLAN Group
+    vlan_group_slug = generate_slug(device_hostname)
+    if netbox_api.ipam.vlan_groups.get(name=device_hostname) is None:
         try:
-            netbox_api.dcim.interfaces.create(device=(netbox_api.dcim.devices.get(name=device_hostname)).id,
-                                              name='mgmt interface',
-                                              type='virtual',
-                                              mtu='1500',
-                                              description='this interface need for mgmt and control device',
-                                              mgmt_only=True)
-        except pynetbox.RequestError as err:
-            print(f"Failed to create device mgmt interface {device_hostname}: {err}")
+            netbox_api.ipam.vlan_groups.create(
+                name=device_hostname,
+                slug=vlan_group_slug,
+                scope_type='dcim.site',
+                scope_id=netbox_api.dcim.sites.get(name=device_hpna_location).id
+            )
+        except Exception as e:
+            logger.error(f'Ошибка при создании VLAN группы для {device_hostname}: {e}')
 
-        if netbox_api.ipam.ip_addresses.get(address=hpna_device_ip, vrf_name='default') is None:
-            try:
-                netbox_api.ipam.ip_addresses.create(address=hpna_device_ip,
-                                                    vrf=(netbox_api.ipam.vrfs.get(name='default')).id,
-                                                    description='int loo0; this ip need for mgmt and control device')
-            except pynetbox.RequestError as err:
-                print(f"Failed to create device mgmt ip address {device_hostname}: {err}")
 
-        update_interface(netbox_api, hpna_device_ip, device_hostname)
+def update_existing_devices_ip():
+    """Обновляет IP адреса для всех существующих устройств с тегом raif_scripts"""
+    logger.info("Обновление IP адресов для существующих устройств...")
+    
+    netbox_api = netbox_connection()
+    hpna_api = hpna_connection()
+    
+    # Получаем все устройства из HPNA
+    hpna_device_list = hpna_api.list_device()
+    hpna_devices_dict = {}
+    
+    for device in hpna_device_list:
+        hostname = (re.sub(r'\.(net\.pri|NET\.PRI|RBRU\.PRI|rbru\.pri)$', '', str(device.hostName))).upper()
+        if device.primaryIPAddress:
+            hpna_devices_dict[hostname] = device.primaryIPAddress
 
-        device_role_for_device_group = fetch_device_role_for_vlan_group(device_hostname)
-
-        vlan_group_slug = generate_slug(device_hostname)
-        if netbox_api.ipam.vlan_groups.get(name=device_hostname) is None:
-            try:
-                netbox_api.ipam.vlan_groups.create(name=device_hostname,
-                                                   slug=vlan_group_slug,
-                                                   scope_type='dcim.site',
-                                                   scope_id=netbox_api.dcim.sites.get(name=device_hpna_location).id)
-            except pynetbox.RequestError as err:
-                print(f'Error when create vlan group: {device_hostname} - {err}')
-
-    else:
-        if netbox_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname) is None:
-            try:
-                netbox_api.dcim.interfaces.create(device=(netbox_api.dcim.devices.get(name=device_hostname)).id,
-                                                  name='mgmt interface',
-                                                  type='virtual',
-                                                  mtu='1500',
-                                                  description='this interface need for mgmt and control device',
-                                                  mgmt_only=True)
-            except pynetbox.RequestError as err:
-                print(f"Failed to create device mgmt interface {device_hostname}: {err}")
-
-        device_interface = netbox_api.dcim.interfaces.get(name='mgmt interface', device=device_hostname)
-
-        if device_interface.count_ipaddresses != 1:
-            if netbox_api.ipam.ip_addresses.get(address=hpna_device_ip, vrf_name='default') is None:
-                try:
-                    netbox_api.ipam.ip_addresses.create(address=hpna_device_ip,
-                                                        vrf=(netbox_api.ipam.vrfs.get(name='default')).id,
-                                                        description='int loo0; this ip need for mgmt and control device')
-                except pynetbox.RequestError as err:
-                    print(f"Failed to create device mgmt ip address {device_hostname}: {err}")
-
-            update_interface(netbox_api, hpna_device_ip, device_hostname)
-
-        vlan_group_slug = generate_slug(device_hostname)
-        if netbox_api.ipam.vlan_groups.get(name=device_hostname) is None:
-            try:
-                netbox_api.ipam.vlan_groups.create(name=device_hostname,
-                                                   slug=vlan_group_slug,
-                                                   scope_type='dcim.site',
-                                                   scope_id=netbox_api.dcim.sites.get(name=device_hpna_location).id)
-            except pynetbox.RequestError as err:
-                print(f'Error when create vlan group: {device_hostname} - {err}')
+    # Получаем все устройства с тегом raif_scripts из NetBox
+    netbox_devices = netbox_api.dcim.devices.filter(tag='raif_scripts')
+    
+    updated_count = 0
+    for device in netbox_devices:
+        if device.name in hpna_devices_dict:
+            hpna_ip = hpna_devices_dict[device.name]
+            
+            # Проверяем текущий primary IP
+            current_ip = device.primary_ip4
+            expected_ip_with_mask = f"{hpna_ip}/32" if '/' not in hpna_ip else hpna_ip
+            
+            if not current_ip or str(current_ip.address) != expected_ip_with_mask:
+                logger.info(f"Обновляем IP для {device.name}: {hpna_ip}")
+                if update_device_ip_address(netbox_api, device.name, hpna_ip):
+                    updated_count += 1
+            else:
+                logger.debug(f"IP адрес для {device.name} актуален: {current_ip.address}")
+    
+    logger.info(f"Обновлено IP адресов: {updated_count}")
 
 
 def processing_hpna_device_list():
     start_time = time.time()
+    
+    logger.info("Начинаем синхронизацию устройств из HPNA...")
+    
     netbox_api = netbox_connection()
     hpna_api = hpna_connection()
+    
+    # Создаем default VRF если его нет
+    create_or_get_default_vrf(netbox_api)
+    
     hpna_device_list = hpna_api.list_device()
-    prefix_destruction_count = 0
+    logger.info(f"Получено {len(hpna_device_list)} устройств из HPNA")
 
-    # for device in hpna_device_list:
-    #     add_new_device_to_netbox(device, netbox_api, hpna_api)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+    # Параллельная обработка устройств
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        futures = []
         for device in hpna_device_list:
-            executor.submit(add_new_device_to_netbox, device, netbox_api, hpna_api)
+            future = executor.submit(add_new_device_to_netbox, device, netbox_api, hpna_api)
+            futures.append(future)
+        
+        # Ожидаем завершения всех задач
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Ошибка при обработке устройства: {e}")
 
-    devices_in_netbox = netbox_api.dcim.devices.all()
+    # Обновляем IP адреса для существующих устройств
+    update_existing_devices_ip()
 
+    # Собираем информацию о устройствах для удаления
+    devices_in_netbox = netbox_api.dcim.devices.filter(tag='raif_scripts')
     for device_netbox in devices_in_netbox:
-        netbox_device_tags = str(device_netbox.tags)
-        if 'raif_scripts' in netbox_device_tags:
-            set_ipam_device.add(str(device_netbox.name))
+        set_ipam_device.add(str(device_netbox.name))
 
     for device_hpna in hpna_device_list:
-        set_hpna_device.add((re.sub(r'\.(net\.pri|NET\.PRI|RBRU\.PRI|rbru\.pri)$', '', str(device_hpna.hostName))).upper())
+        hostname = (re.sub(r'\.(net\.pri|NET\.PRI|RBRU\.PRI|rbru\.pri)$', '', str(device_hpna.hostName))).upper()
+        set_hpna_device.add(hostname)
 
-    set_ipam_device.difference_update(set_hpna_device)
+    # Устройства для удаления
+    devices_to_remove = set_ipam_device - set_hpna_device
+    
+    if devices_to_remove:
+        logger.info(f"Найдено {len(devices_to_remove)} устройств для удаления")
+        
+        for device_name in devices_to_remove:
+            try:
+                device_to_delete = netbox_api.dcim.devices.get(name=device_name)
+                if device_to_delete:
+                    logger.info(f"Удаляем устройство: {device_name}")
+                    
+                    # Удаляем связанные объекты
+                    if device_to_delete.primary_ip4:
+                        device_to_delete.primary_ip4.delete()
+                    
+                    # Удаляем IP адреса устройства
+                    device_ips = netbox_api.ipam.ip_addresses.filter(cf_Device=device_to_delete.id)
+                    for ip in device_ips:
+                        ip.delete()
+                    
+                    # Удаляем префиксы
+                    device_prefixes = netbox_api.ipam.prefixes.filter(description=device_name)
+                    for prefix in device_prefixes:
+                        prefix.delete()
+                    
+                    # Удаляем VLAN группы и VLAN
+                    try:
+                        vlan_group = netbox_api.ipam.vlan_groups.get(name=device_name)
+                        if vlan_group:
+                            vlans = netbox_api.ipam.vlans.filter(group_id=vlan_group.id)
+                            for vlan in vlans:
+                                vlan.delete()
+                            vlan_group.delete()
+                    except Exception as e:
+                        logger.error(f"Ошибка при удалении VLAN группы для {device_name}: {e}")
+                    
+                    # Удаляем VRF
+                    device_vrfs = netbox_api.ipam.vrfs.filter(cf_device=device_to_delete.id)
+                    for vrf in device_vrfs:
+                        vrf.delete()
+                    
+                    # Удаляем устройство
+                    device_to_delete.delete()
+                    logger.info(f"✅ Удалено устройство: {device_name}")
+                    
+            except Exception as e:
+                logger.error(f"❌ Ошибка при удалении устройства {device_name}: {e}")
 
-    for device_for_remove in set_ipam_device:
-        devices_in_netbox_for_delete = netbox_api.dcim.devices.get(name=device_for_remove)
-        print(devices_in_netbox_for_delete)
-        prefix_destruction_count += 1
-
-        try:
-            ip_for_delete = devices_in_netbox_for_delete.primary_ip
-        except:
-            ip_for_delete = None
-
-        if ip_for_delete is not None:
-            ip_for_delete.delete()
-
-        delete_ip_address_filter = netbox_api.ipam.ip_addresses.filter(cf_Device=devices_in_netbox_for_delete.id)
-
-        for delete_ip_entry in delete_ip_address_filter:
-            delete_ip_entry.delete()
-
-        delete_prefix_filter = netbox_api.ipam.prefixes.filter(description=devices_in_netbox_for_delete.name)
-
-        for delete_prefix_entry in delete_prefix_filter:
-            delete_prefix_entry.delete()
-        try:
-            netbox_device_vlan_group = netbox_api.ipam.vlan_groups.get(name=devices_in_netbox_for_delete)
-            netbox_device_vlans_in_vlan_group = netbox_api.ipam.vlans.filter(group_id=netbox_device_vlan_group.id)
-            for delete in netbox_device_vlans_in_vlan_group:
-                delete.delete()
-        except:
-            print('Error while delete vlan groups')
-
-        delete_vlan_groups_filter = netbox_api.ipam.vlan_groups.filter(name=devices_in_netbox_for_delete.name)
-
-        for delete_vlan_group_entry in delete_vlan_groups_filter:
-            delete_vlan_group_entry.delete()
-
-        delete_vrfs_filter = netbox_api.ipam.vrfs.filter(cf_device=devices_in_netbox_for_delete.id)
-
-        for delete_vrf_entry in delete_vrfs_filter:
-            delete_vrf_entry.delete()
-
-        devices_in_netbox_for_delete.delete()
-
-    print("--- %s seconds ---" % (time.time() - start_time))
+    total_time = time.time() - start_time
+    logger.info(f"Синхронизация завершена за {total_time:.2f} секунд")
 
 
 if __name__ == "__main__":

@@ -1,614 +1,531 @@
-import concurrent.futures
 import time
-import pynetbox
-import requests
-from netmiko import ConnectHandler
-import urllib3
-from decouple import config
-from netmiko.exceptions import NetMikoTimeoutException, NetMikoAuthenticationException
-from ntc_templates.parse import parse_output
 import logging
-import traceback
+import concurrent.futures
 
+import urllib3
+import requests
+from decouple import config
+from ntc_templates.parse import parse_output
+from netmiko import ConnectHandler
+import pynautobot
+
+# Отключаем предупреждения InsecureRequestWarning
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Константы из окружения
+HPNA_LOGIN = config('HPNA_LOGIN')
+HPNA_PASSWORD = config('HPNA_PASSWORD')
+NAUTOBOT_URL = config('NAUTOBOT_URL')
+NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
+
+# Логгер
 logging.basicConfig(
-    level=logging.DEBUG,  # Временно включаем DEBUG
-    format="%(asctime)s [%(levelname)s] - %(message)s",
-    handlers=[
-        logging.FileHandler("vrf_script.log", encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
 )
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
-def create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device):
-    combined_values_set = set(rt_import_values) | set(rt_export_values)
-    for route_target_device in combined_values_set:
-        try:
-            netbox_rt = netbox_api.ipam.route_targets.get(name=str(route_target_device))
-            if not netbox_rt:
-                netbox_api.ipam.route_targets.create(name=route_target_device)
-        except Exception as e:
-            logger.error(f'Route target error {route_target_device} for {netbox_device.name}: {e}')
 
-def update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, evpn_var):
-    try:
-        update_list_import = []
-        for rt in rt_import_values:
-            rt_obj = netbox_api.ipam.route_targets.get(name=str(rt))
-            if rt_obj:
-                update_list_import.append(rt_obj.id)
-
-        update_list_export = []
-        for rt in rt_export_values:
-            rt_obj = netbox_api.ipam.route_targets.get(name=str(rt))
-            if rt_obj:
-                update_list_export.append(rt_obj.id)
-
-        # Получаем текущие route targets для сравнения
-        current_import = [rt.id for rt in netbox_vrf_for_update.import_targets] if netbox_vrf_for_update.import_targets else []
-        current_export = [rt.id for rt in netbox_vrf_for_update.export_targets] if netbox_vrf_for_update.export_targets else []
-
-        # Обновляем только если есть изменения
-        if set(current_import) != set(update_list_import) or set(current_export) != set(update_list_export):
-            netbox_vrf_for_update.update({'import_targets': update_list_import})
-            netbox_vrf_for_update.update({'export_targets': update_list_export})
-            logger.info(f"Route targets updated for VRF {netbox_vrf_for_update.name}")
-            
-        netbox_vrf_for_update.update({'custom_fields': {'EVPN': evpn_var}})
-        
-    except Exception as e:
-        logger.error(f"Route targets update error for VRF {netbox_vrf_for_update.name}: {e}")
-
-def netbox_connection():
-    netbox_api = pynetbox.api(config('NETBOX_URL'), token=config('NETBOX_TOKEN'), threading=True)
-    adapter = requests.adapters.HTTPAdapter(pool_connections=500, pool_maxsize=500)
-    netbox_api.http_session.mount('http://', adapter)
-    netbox_api.http_session.mount('https://', adapter)
-    netbox_api.http_session.verify = False
-    return netbox_api
-
-def netmiko_connect(netbox_device, device_type):
-    netmiko_device = {
+def connect_device(netbox_device, device_type):
+    """
+    Устанавливает SSH-подключение к устройству через Netmiko.
+    При неудаче возвращает None.
+    """
+    params = {
         'device_type': device_type,
-        'host': str(netbox_device.primary_ip)[:-3:],
-        'username': config('HPNA_LOGIN'),
-        'password': config('HPNA_PASSWORD'),
-        'timeout': 200, 'port': 22, "global_delay_factor": 2, 'conn_timeout': 200
+        'host': str(netbox_device.primary_ip4)[:-3],
+        'username': HPNA_LOGIN,
+        'password': HPNA_PASSWORD,
+        'timeout': 200,
+        'port': 22,
+        'global_delay_factor': 2,
+        'conn_timeout': 200,
     }
 
-    for attempt in range(2):
+    try:
+        return ConnectHandler(**params)
+    except Exception:
+        # Пробуем ещё раз
         try:
-            net_connect = ConnectHandler(**netmiko_device)
-            return net_connect
-        except Exception as e:
-            if attempt == 1:
-                logger.error(f"Connection failed to {netbox_device.name}: {e}")
-                return None
+            return ConnectHandler(**params)
+        except Exception:
+            logger.error('Connection error: %s', netbox_device.name)
+            return None
 
-def delete_vrf_with_dependencies(vrf_to_delete, netbox_api, device_name):
+
+def sync_vlans_for_ios(netbox_device, nb_api):
     """
-    Безопасное удаление VRF с проверкой и удалением зависимых объектов
-    Возвращает True если VRF удален успешно, False если есть критические зависимости
+    Синхронизирует VLAN с Cisco IOS в Nautobot:
+    - создаёт/обновляет записи VLAN
+    - создаёт связи device↔vlan
+    - удаляет устаревшие связи
     """
     try:
-        vrf_name = vrf_to_delete.name
-        vrf_id = vrf_to_delete.id
-        
-        # Проверяем IP-адреса в этом VRF
-        ip_addresses = list(netbox_api.ipam.ip_addresses.filter(vrf_id=vrf_id))
-        if ip_addresses:
-            logger.info(f"Found {len(ip_addresses)} IP addresses in VRF {vrf_name}")
-            
-            # Удаляем IP-адреса (если они не привязаны к интерфейсам)
-            for ip_addr in ip_addresses:
-                try:
-                    # Проверяем, привязан ли IP к интерфейсу
-                    if ip_addr.assigned_object:
-                        logger.warning(f"IP {ip_addr.address} is assigned to {ip_addr.assigned_object}, skipping deletion")
-                        continue
-                    
-                    # Удаляем неприсвоенный IP
-                    ip_addr.delete()
-                    logger.info(f"Deleted IP address: {ip_addr.address} from VRF {vrf_name}")
-                except Exception as ip_error:
-                    logger.error(f"Failed to delete IP {ip_addr.address}: {ip_error}")
-        
-        # Проверяем префиксы в этом VRF
-        prefixes = list(netbox_api.ipam.prefixes.filter(vrf_id=vrf_id))
-        if prefixes:
-            logger.info(f"Found {len(prefixes)} prefixes in VRF {vrf_name}")
-            
-            # Удаляем префиксы (если они не имеют дочерних префиксов)
-            for prefix in prefixes:
-                try:
-                    # Проверяем, есть ли дочерние префиксы
-                    child_prefixes = list(netbox_api.ipam.prefixes.filter(
-                        within_include=str(prefix.prefix),
-                        vrf_id=vrf_id
-                    ))
-                    
-                    # Если есть только сам префикс (length = 1), то дочерних нет
-                    if len(child_prefixes) > 1:
-                        logger.warning(f"Prefix {prefix.prefix} has child prefixes, skipping deletion")
-                        continue
-                    
-                    # Проверяем, есть ли IP-адреса в этом префиксе
-                    prefix_ips = list(netbox_api.ipam.ip_addresses.filter(
-                        parent=str(prefix.prefix),
-                        vrf_id=vrf_id
-                    ))
-                    
-                    if prefix_ips:
-                        logger.warning(f"Prefix {prefix.prefix} contains IP addresses, skipping deletion")
-                        continue
-                    
-                    # Удаляем пустой префикс
-                    prefix.delete()
-                    logger.info(f"Deleted prefix: {prefix.prefix} from VRF {vrf_name}")
-                except Exception as prefix_error:
-                    logger.error(f"Failed to delete prefix {prefix.prefix}: {prefix_error}")
-        
-        # Проверяем route targets
-        import_rts = list(vrf_to_delete.import_targets) if vrf_to_delete.import_targets else []
-        export_rts = list(vrf_to_delete.export_targets) if vrf_to_delete.export_targets else []
-        
-        # Очищаем route targets перед удалением VRF
-        if import_rts or export_rts:
-            try:
-                vrf_to_delete.update({'import_targets': []})
-                vrf_to_delete.update({'export_targets': []})
-                logger.info(f"Cleared route targets for VRF {vrf_name}")
-            except Exception as rt_error:
-                logger.error(f"Failed to clear route targets for VRF {vrf_name}: {rt_error}")
-        
-        # Повторно проверяем, остались ли зависимости
-        remaining_ips = list(netbox_api.ipam.ip_addresses.filter(vrf_id=vrf_id))
-        remaining_prefixes = list(netbox_api.ipam.prefixes.filter(vrf_id=vrf_id))
-        
-        if remaining_ips or remaining_prefixes:
-            logger.warning(f"VRF {vrf_name} still has dependencies:")
-            if remaining_ips:
-                logger.warning(f"  - {len(remaining_ips)} IP addresses")
-            if remaining_prefixes:
-                logger.warning(f"  - {len(remaining_prefixes)} prefixes")
-            return False
-        
-        # Пытаемся удалить VRF
-        vrf_to_delete.delete()
-        logger.info(f"Successfully deleted VRF: {vrf_name} from {device_name}")
-        return True
-        
-    except Exception as e:
-        # Проверяем, содержит ли ошибка информацию о зависимостях
-        if "409 Conflict" in str(e) and "dependent objects" in str(e):
-            logger.error(f"VRF {vrf_to_delete.name} cannot be deleted due to dependencies: {e}")
-            return False
-        else:
-            logger.error(f"Unexpected error deleting VRF {vrf_to_delete.name}: {e}")
-            return False
+        loc_id = netbox_device.location.id
+        connection = connect_device(netbox_device, 'cisco_ios')
+        if not connection:
+            return
 
-def synchronize_vrfs(device_vrfs, netbox_device, netbox_api):
-    """Синхронизация VRF между устройством и NetBox"""
-    
-    # Получаем VRF из NetBox для данного устройства
-    netbox_vrfs = list(netbox_api.ipam.vrfs.filter(cf_device=netbox_device.id))
-    netbox_vrf_names = {vrf.name for vrf in netbox_vrfs}
-    
-    # Очищаем имена VRF от лишних символов (запятые, пробелы)
-    device_vrf_names = set()
-    for vrf in device_vrfs:
-        vrf_name = vrf.get('name')
-        if vrf_name and vrf_name != 'default':
-            # Убираем запятые и пробелы в конце
-            clean_name = vrf_name.rstrip(', ')
-            device_vrf_names.add(clean_name)
-    
-    # ОТЛАДОЧНАЯ ИНФОРМАЦИЯ
-    logger.debug(f"Device {netbox_device.name}:")
-    logger.debug(f"  NetBox VRFs ({len(netbox_vrf_names)}): {sorted(netbox_vrf_names)}")
-    logger.debug(f"  Device VRFs ({len(device_vrf_names)}): {sorted(device_vrf_names)}")
-    logger.debug(f"  Raw device_vrfs count: {len(device_vrfs)}")
-    
-    # Определяем что нужно удалить, ИСКЛЮЧАЕМ GRT из удаления
-    vrfs_to_delete = netbox_vrf_names - device_vrf_names
-    # Убираем GRT из списка на удаление - он никогда не должен удаляться
-    vrfs_to_delete.discard('GRT')
-    
-    # Логируем план удаления
-    if vrfs_to_delete:
-        logger.info(f"VRFs to delete from {netbox_device.name}: {list(vrfs_to_delete)}")
-        for vrf_name in vrfs_to_delete:
-            # Дополнительная проверка на GRT (на всякий случай)
-            if vrf_name == 'GRT':
-                logger.warning(f"SKIPPING GRT deletion for {netbox_device.name} - GRT is protected")
+        logger.info('Start syncing %s', netbox_device.name)
+
+        output = connection.send_command_timing(
+            'show vlan', read_timeout=200
+        )
+        device_vlans = parse_output(
+            platform="cisco_ios",
+            command="show vlan",
+            data=output
+        )
+
+        # Теги устройства
+        tags = [t.name for t in (netbox_device.tags or [])]
+        has_pci_dci = 'scope_PCI-DCI' in tags
+        has_otv = 'scope_OTV' in tags
+        other_scope_tags = [t for t in tags if t.startswith('scope_') and t != 'scope_OTV' and t != 'scope_PCI-DCI']
+        has_other_scope = bool(other_scope_tags)
+
+        # Логика приоритета: PCI-DCI > OTV + локальный > одиночный scope
+        if has_pci_dci:
+            # ВСЕ VLAN идут в группу PCI-DCI
+            pci_vlan_list = device_vlans
+
+            # Получаем группу PCI-DCI
+            pci_group = nb_api.ipam.vlan_groups.get(name='PCI-DCI')
+            if not pci_group:
+                logger.error('%s: группа PCI-DCI не найдена', netbox_device.name)
+                connection.disconnect()
+                return
+        elif has_otv:
+            # Разделяем списки VLAN из устройства для OTV логики
+            otv_vlan_list = [
+                v for v in device_vlans if int(v['vlan_id']) >= 1000
+            ]
+            other_vlan_list = [
+                v for v in device_vlans if int(v['vlan_id']) < 1000
+            ]
+
+            # Получаем группы VLAN в Nautobot
+            otv_group = nb_api.ipam.vlan_groups.get(name='OTV')
+            if not otv_group:
+                logger.error('%s: группа OTV не найдена', netbox_device.name)
+                connection.disconnect()
+                return
+
+            other_group = None
+            if has_other_scope:
+                other_name = other_scope_tags[0].replace('scope_', '')
+                other_group = nb_api.ipam.vlan_groups.get(name=other_name)
+                if not other_group:
+                    logger.error(
+                        '%s: группа %s не найдена',
+                        netbox_device.name, other_name
+                    )
+                    connection.disconnect()
+                    return
+        else:
+            # Одиночный scope - все VLAN в одну группу
+            other_vlan_list = device_vlans
+
+            other_group = None
+            if has_other_scope:
+                other_name = other_scope_tags[0].replace('scope_', '')
+                other_group = nb_api.ipam.vlan_groups.get(name=other_name)
+                if not other_group:
+                    logger.error(
+                        '%s: группа %s не найдена',
+                        netbox_device.name, other_name
+                    )
+                    connection.disconnect()
+                    return
+
+        # Текущие связи device↔vlan в Nautobot
+        device_rels = nb_api.extras.relationship_associations.filter(
+            relationship='devices_vlans',
+            destination_id=netbox_device.id
+        )
+
+        ipam_vlan_ids = {
+            int(rel.display.split(' (')[1].split(')')[0])
+            for rel in device_rels
+        }
+        existing_rels_map = {
+            str(r.serialize()['source_id']): r.serialize()
+            for r in device_rels
+        }
+
+        def sync_vlans(vlan_list, vlan_group, switch_vlan_ids):
+            """
+            Создаёт/обновляет VLAN и связи, возвращает множество VID.
+            """
+            records = list(nb_api.ipam.vlans.filter(
+                vlan_group=vlan_group.id
+            ))
+
+            existing = {
+                int(r.serialize()['vid']): r.serialize() for r in records
+            }
+
+            to_create, loc_update, rela_update = [], [], []
+            for v in vlan_list:
+                vid = int(v['vlan_id'])
+                switch_vlan_ids.add(vid)
+                name = v.get('name') or 'unknown'
+                if vid in existing:
+                    # Добавляем местоположение для OTV
+                    if loc_id not in existing[vid]['locations']:
+                        loc_update.append({
+                            'vlan': existing[vid]['id'],
+                            'location': loc_id,
+                        })
+                    # Добавляем связь device <-> vlan
+                    if existing[vid]['id'] not in existing_rels_map:
+                        rela_update.append({
+                            'relationship':
+                                '02912579-6379-43a6-9607-d3f7531ea505',
+                            'source_type': 'ipam.vlan',
+                            'destination_type': 'dcim.device',
+                            'source_id': existing[vid]['id'],
+                            'destination_id': netbox_device.id,
+                        })
+                else:
+                    nb_api.ipam.vlans.create({
+                        'location': loc_id,
+                        'vlan_group': vlan_group.id,
+                        'vid': vid,
+                        'name': name,
+                        'status': 'Active',
+                    })
+            # Вызовы API в Nautobot
+            if to_create:
+                nb_api.ipam.vlans.create(to_create)
+            if loc_update:
+                nb_api.ipam.vlan_location_assignments.create(loc_update)
+            if rela_update:
+                nb_api.extras.relationship_associations.create(rela_update)
+
+            return switch_vlan_ids
+
+        # Сбор множеств VLAN по группам в зависимости от логики
+        if has_pci_dci:
+            # PCI-DCI: все VLAN в одну группу
+            pci_vlan_set = sync_vlans(pci_vlan_list, pci_group, set())
+            union_vlan_set = pci_vlan_set
+        elif has_otv:
+            # OTV: разделение по VID
+            otv_vlan_set = sync_vlans(otv_vlan_list, otv_group, set())
+
+            other_vlan_set = set()
+            if has_other_scope:
+                other_vlan_set = sync_vlans(other_vlan_list, other_group, set())
+
+            union_vlan_set = otv_vlan_set | other_vlan_set
+        else:
+            # Одиночный scope: все VLAN в одну группу
+            other_vlan_set = set()
+            if has_other_scope:
+                other_vlan_set = sync_vlans(other_vlan_list, other_group, set())
+
+            union_vlan_set = other_vlan_set
+
+        # Удаление старых связей
+        ipam_vlan_ids.difference_update(union_vlan_set)
+
+        for candidate in ipam_vlan_ids:
+            vid = int(candidate)
+
+            # Определяем группу для удаления связи
+            if has_pci_dci:
+                group_id = pci_group.id
+            elif has_otv:
+                if vid >= 1000:
+                    group_id = otv_group.id
+                elif has_other_scope:
+                    group_id = other_group.id
+                else:
+                    continue
+            elif has_other_scope:
+                group_id = other_group.id
+            else:
                 continue
-                
-            # ВРЕМЕННО ЗАКОММЕНТИРОВАНО - пока только логируем
-            logger.warning(f"WOULD DELETE VRF: {vrf_name} from {netbox_device.name}")
-            
-            # Раскомментировать когда будете готовы к реальному удалению:
-            # try:
-            #     vrf_to_delete = netbox_api.ipam.vrfs.get(name=vrf_name, cf_device=netbox_device.id)
-            #     if vrf_to_delete:
-            #         # Проверяем зависимые объекты перед удалением
-            #         if delete_vrf_with_dependencies(vrf_to_delete, netbox_api, netbox_device.name):
-            #             logger.info(f"DELETED VRF: {vrf_name} from {netbox_device.name}")
-            #         else:
-            #             logger.warning(f"VRF {vrf_name} has dependencies and was not deleted")
-            # except Exception as e:
-            #     logger.error(f"Failed to delete VRF {vrf_name}: {e}")
-    
-    return vrfs_to_delete
 
-def create_vrf_netbox_on_cisco_ios(netbox_device, netbox_api):
-    logger.info(f'START {netbox_device.name} (IOS)')
-    
-    try:
-        net_connect = netmiko_connect(netbox_device, 'cisco_ios')
-        if not net_connect:
-            return
+            vlan = nb_api.ipam.vlans.get(vid=vid, vlan_group=group_id)
+            if not vlan:
+                continue
 
-        output = net_connect.send_command('show run | section vrf')
-        
-        # ОТЛАДКА для IOS
-        logger.debug(f"IOS command output preview: {output[:500]}...")
-        
-        netmiko_vrfs = parse_output(platform='cisco_ios', command='show run vrf', data=output)
-        
-        logger.debug(f"IOS parsed VRFs count: {len(netmiko_vrfs) if netmiko_vrfs else 0}")
-        
-        if not netmiko_vrfs:
-            logger.warning(f"No VRFs found on {netbox_device.name}")
-            # Если на устройстве нет VRF, проверяем что удалить из NetBox
-            synchronize_vrfs([], netbox_device, netbox_api)
-            return
-
-        # Синхронизируем VRF (определяем что удалить)
-        synchronize_vrfs(netmiko_vrfs, netbox_device, netbox_api)
-
-        # Обрабатываем VRF с устройства
-        for netmiko_vrf in netmiko_vrfs:
-            try:
-                vrf_name = netmiko_vrf.get('name')
-                if not vrf_name or vrf_name == 'default':
-                    continue
-
-                logger.info(f"Processing VRF '{vrf_name}' on {netbox_device.name}")
-
-                rt_import_values = netmiko_vrf.get('rt_import', [])
-                rt_export_values = netmiko_vrf.get('rt_export', [])
-                rd_value = netmiko_vrf.get('rd', '')
-
-                create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device)
-
-                # Проверяем существующие VRF с тем же именем
-                existing_vrfs = list(netbox_api.ipam.vrfs.filter(name=vrf_name, cf_device=netbox_device.id))
-                
-                # Ищем VRF с нужным RD
-                matching_vrf = None
-                for existing_vrf in existing_vrfs:
-                    if existing_vrf.rd == rd_value:
-                        matching_vrf = existing_vrf
-                        break
-                
-                if not matching_vrf:
-                    if existing_vrfs:
-                        # Есть VRF с тем же именем но другим RD - обновляем RD
-                        old_vrf = existing_vrfs[0]
-                        logger.info(f"VRF {vrf_name} RD changed: '{old_vrf.rd}' -> '{rd_value}'")
-                        try:
-                            old_vrf.update({'rd': rd_value})
-                            matching_vrf = old_vrf
-                        except Exception as update_error:
-                            logger.error(f"Failed to update RD for VRF {vrf_name}: {update_error}")
-                            continue
-                    else:
-                        # VRF не существует - создаем новый
-                        try:
-                            matching_vrf = netbox_api.ipam.vrfs.create(
-                                name=vrf_name, rd=rd_value,
-                                description=f'discovered from {netbox_device.name}',
-                                custom_fields={'device': netbox_device.id}
-                            )
-                            logger.info(f"VRF {vrf_name} created")
-                        except Exception as create_error:
-                            logger.error(f"VRF creation failed for {vrf_name}: {create_error}")
-                            continue
-
-                netbox_vrf_for_update = matching_vrf
-                
-                if not netbox_vrf_for_update:
-                    logger.error(f"No VRF found for update: {vrf_name}")
-                    continue
-
-                update_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_vrf_for_update, False)
-
-            except Exception as vrf_error:
-                logger.error(f'VRF processing error for {netbox_device.name}: {vrf_error}')
-                logger.error(f'Traceback: {traceback.format_exc()}')
-
-    except Exception as e:
-        logger.error(f'Script error for {netbox_device.name}: {e}')
-        logger.error(f'Traceback: {traceback.format_exc()}')
-    finally:
-        try:
-            if 'net_connect' in locals():
-                net_connect.disconnect()
-        except:
-            pass
-    
-    logger.info(f'END {netbox_device.name}')
-
-def create_vrf_netbox_on_cisco_nxos(netbox_device, netbox_api):
-    logger.info(f'START {netbox_device.name} (NXOS)')
-    try:
-        net_connect = netmiko_connect(netbox_device, 'cisco_nxos')
-        if not net_connect:
-            return
-
-        output = net_connect.send_command('show run | section vrf')
-        
-        # ОТЛАДКА для NXOS  
-        logger.debug(f"NXOS command output preview: {output[:500]}...")
-        
-        netmiko_vrfs = parse_output(platform='cisco_nxos', command='show run vrf', data=output)
-        
-        logger.debug(f"NXOS parsed VRFs count: {len(netmiko_vrfs) if netmiko_vrfs else 0}")
-        
-        if not netmiko_vrfs:
-            logger.warning(f"No VRFs found on {netbox_device.name}")
-            synchronize_vrfs([], netbox_device, netbox_api)
-            return
-
-        # Синхронизируем VRF
-        synchronize_vrfs(netmiko_vrfs, netbox_device, netbox_api)
-
-        for netmiko_vrf in netmiko_vrfs:
-            try:
-                vrf_name = netmiko_vrf.get('name')
-                if not vrf_name or vrf_name == 'default':
-                    continue
-
-                logger.info(f"Processing VRF '{vrf_name}' on {netbox_device.name}")
-
-                rd_value = netmiko_vrf.get('rd', '')
-                evpn_var = True if 'evpn' in netmiko_vrf.get('evpn', '') else False
-                rt_import_values = netmiko_vrf.get('rt_import', [])
-                rt_export_values = netmiko_vrf.get('rt_export', [])
-
-                create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device)
-
-                # Применяем ту же логику что и для IOS
-                existing_vrfs = list(netbox_api.ipam.vrfs.filter(name=vrf_name, cf_device=netbox_device.id))
-                
-                matching_vrf = None
-                for existing_vrf in existing_vrfs:
-                    if existing_vrf.rd == rd_value:
-                        matching_vrf = existing_vrf
-                        break
-                
-                if not matching_vrf:
-                    if existing_vrfs:
-                        old_vrf = existing_vrfs[0]
-                        logger.info(f"VRF {vrf_name} RD changed: '{old_vrf.rd}' -> '{rd_value}'")
-                        try:
-                            old_vrf.update({'rd': rd_value})
-                            matching_vrf = old_vrf
-                        except Exception as update_error:
-                            logger.error(f"Failed to update RD for VRF {vrf_name}: {update_error}")
-                            continue
-                    else:
-                        try:
-                            matching_vrf = netbox_api.ipam.vrfs.create(
-                                name=vrf_name, rd=rd_value,
-                                description=f'discovered from {netbox_device.name}',
-                                custom_fields={'device': netbox_device.id}
-                            )
-                            logger.info(f"VRF {vrf_name} created")
-                        except Exception as create_error:
-                            logger.error(f"VRF creation failed for {vrf_name}: {create_error}")
-                            continue
-
-                update_route_targets(rt_import_values, rt_export_values, netbox_api, matching_vrf, evpn_var)
-
-            except Exception as vrf_error:
-                logger.error(f'NXOS VRF error for {netbox_device.name}: {vrf_error}')
-
-    except Exception as e:
-        logger.error(f'NXOS script error for {netbox_device.name}: {e}')
-    finally:
-        try:
-            if 'net_connect' in locals():
-                net_connect.disconnect()
-        except:
-            pass
-    
-    logger.info(f'END {netbox_device.name}')
-
-def create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api):
-    logger.info(f'START {netbox_device.name} (Huawei)')
-    try:
-        net_connect = netmiko_connect(netbox_device, 'huawei_vrp')
-        if not net_connect:
-            return
-
-        # Создание GRT
-        public_vrf = netbox_api.ipam.vrfs.get(name='GRT', cf_device=netbox_device.id)
-        if not public_vrf:
-            netbox_api.ipam.vrfs.create(
-                name='GRT', rd='', description=f'discovered from {netbox_device.name}',
-                custom_fields={'device': netbox_device.id}
+            rel = nb_api.extras.relationship_associations.get(
+                relationship='devices_vlans',
+                destination_id=netbox_device.id,
+                source_id=vlan.id
             )
+            if rel:
+                rel.delete()
 
-        output = net_connect.send_command('display ip vpn-instance verbose')
-        
-        # ОТЛАДКА: сохраняем первые 1000 символов вывода
-        logger.debug(f"Huawei command output preview: {output[:1000]}...")
-        
-        netmiko_vrfs = parse_output(platform="huawei_vrp", command="display ip vpn verbose instance", data=output)
-        
-        # ОТЛАДКА: проверяем результат парсинга
-        logger.debug(f"Parsed VRFs count: {len(netmiko_vrfs) if netmiko_vrfs else 0}")
-        if netmiko_vrfs:
-            logger.debug(f"First parsed VRF: {netmiko_vrfs[0]}")
+        logger.info('End syncing %s', netbox_device.name)
+
+    except Exception as exc:
+        logger.error('%s: %s', netbox_device.name, exc)
+
+
+def sync_vlans_for_nxos(netbox_device, nb_api):
+    """
+    Синхронизирует VLAN с Cisco NX-OS в Nautobot:
+    - создаёт/обновляет записи VLAN
+    - создаёт связи device↔vlan
+    - удаляет устаревшие связи
+    """
+    try:
+        loc_id = netbox_device.location.id
+        connection = connect_device(netbox_device, 'cisco_nxos')
+        if not connection:
+            return
+
+        logger.info('Start syncing %s', netbox_device.name)
+
+        output = connection.send_command_timing(
+            'show vlan brief', read_timeout=200
+        )
+        device_vlans = parse_output(
+            platform='cisco_nxos',
+            command='show vlan',
+            data=output
+        )
+
+        # Теги устройства
+        tags = [t.name for t in (netbox_device.tags or [])]
+        has_pci_dci = 'scope_PCI-DCI' in tags
+        has_otv = 'scope_OTV' in tags
+        other_scope_tags = [t for t in tags if t.startswith('scope_') and t != 'scope_OTV' and t != 'scope_PCI-DCI']
+        has_other_scope = bool(other_scope_tags)
+
+        # Логика приоритета: PCI-DCI > OTV + локальный > одиночный scope
+        if has_pci_dci:
+            # ВСЕ VLAN идут в группу PCI-DCI
+            pci_vlan_list = device_vlans
+
+            # Получаем группу PCI-DCI
+            pci_group = nb_api.ipam.vlan_groups.get(name='PCI-DCI')
+            if not pci_group:
+                logger.error('%s: группа PCI-DCI не найдена', netbox_device.name)
+                connection.disconnect()
+                return
+        elif has_otv:
+            # Разделяем списки VLAN из устройства для OTV логики
+            otv_vlan_list = [
+                v for v in device_vlans if int(v['vlan_id']) >= 1000
+            ]
+            other_vlan_list = [
+                v for v in device_vlans if int(v['vlan_id']) < 1000
+            ]
+
+            # Получаем группы VLAN в Nautobot
+            otv_group = nb_api.ipam.vlan_groups.get(name='OTV')
+            if not otv_group:
+                logger.error('%s: группа OTV не найдена', netbox_device.name)
+                connection.disconnect()
+                return
+
+            other_group = None
+            if has_other_scope:
+                other_name = other_scope_tags[0].replace('scope_', '')
+                other_group = nb_api.ipam.vlan_groups.get(name=other_name)
+                if not other_group:
+                    logger.error(
+                        '%s: группа %s не найдена',
+                        netbox_device.name, other_name
+                    )
+                    connection.disconnect()
+                    return
         else:
-            logger.warning(f"Parser returned empty result for {netbox_device.name}")
-        
-        if not netmiko_vrfs:
-            logger.warning(f"No VRFs found on {netbox_device.name}")
-            # Для Huawei не синхронизируем GRT, только пользовательские VRF
-            user_vrfs = []
-            synchronize_vrfs(user_vrfs, netbox_device, netbox_api)
-            return
+            # Одиночный scope - все VLAN в одну группу
+            other_vlan_list = device_vlans
 
-        # Исправляем имена VRF для синхронизации ПЕРЕД сравнением
-        for vrf in netmiko_vrfs:
-            if vrf.get('name') and vrf['name'].endswith(','):
-                vrf['name'] = vrf['name'][:-1]
+            other_group = None
+            if has_other_scope:
+                other_name = other_scope_tags[0].replace('scope_', '')
+                other_group = nb_api.ipam.vlan_groups.get(name=other_name)
+                if not other_group:
+                    logger.error(
+                        '%s: группа %s не найдена',
+                        netbox_device.name, other_name
+                    )
+                    connection.disconnect()
+                    return
 
-        # Синхронизируем VRF (исключаем GRT из синхронизации)
-        user_vrfs = [vrf for vrf in netmiko_vrfs if vrf.get('name') != 'GRT']
-        synchronize_vrfs(user_vrfs, netbox_device, netbox_api)
+        # Текущие связи device↔vlan в Nautobot
+        device_rels = nb_api.extras.relationship_associations.filter(
+            relationship='devices_vlans',
+            destination_id=netbox_device.id
+        )
 
-        for parsed_vrf_huawei in netmiko_vrfs:
-            try:
-                # Исправляем имя VRF - убираем запятые в конце
-                if parsed_vrf_huawei['name'].endswith(','):
-                    parsed_vrf_huawei['name'] = parsed_vrf_huawei['name'][:-1]
+        ipam_vlan_ids = {
+            int(rel.display.split(' (')[1].split(')')[0])
+            for rel in device_rels
+        }
+        existing_rels_map = {
+            str(r.serialize()['source_id']): r.serialize()
+            for r in device_rels
+        }
 
-                parsed_vrf_huawei['rt_import'] = parsed_vrf_huawei['rt_import'].split()
-                parsed_vrf_huawei['rt_export'] = parsed_vrf_huawei['rt_export'].split()
+        def sync_vlans(vlan_list, vlan_group, switch_vlan_ids):
+            """
+            Создаёт/обновляет VLAN и связи, возвращает множество VID.
+            """
+            records = list(nb_api.ipam.vlans.filter(
+                vlan_group=vlan_group.id
+            ))
+            existing = {
+                int(r.serialize()['vid']): r.serialize() for r in records
+            }
 
-                vrf_name = parsed_vrf_huawei.get('name')
-                if not vrf_name or vrf_name in ['default', 'GRT']:
+            to_create, loc_update, rela_update = [], [], []
+
+            for v in vlan_list:
+                vid = int(v['vlan_id'])
+                switch_vlan_ids.add(vid)
+                name = v.get('name') or 'unknown'
+
+                if vid in existing:
+                    # Добавляем местоположение для OTV
+                    if loc_id not in existing[vid]['locations']:
+                        loc_update.append({
+                            'vlan': existing[vid]['id'],
+                            'location': loc_id,
+                        })
+                    # Добавляем связь device <-> vlan
+                    if existing[vid]['id'] not in existing_rels_map:
+                        rela_update.append({
+                            'relationship':
+                                '02912579-6379-43a6-9607-d3f7531ea505',
+                            'source_type': 'ipam.vlan',
+                            'destination_type': 'dcim.device',
+                            'source_id': existing[vid]['id'],
+                            'destination_id': netbox_device.id,
+                        })
+                else:
+                    to_create.append({
+                        'location': loc_id,
+                        'vlan_group': vlan_group.id,
+                        'vid': vid,
+                        'name': name,
+                        'status': 'Active',
+                    })
+            # Вызовы API в Nautobot
+            if to_create:
+                nb_api.ipam.vlans.create(to_create)
+            if loc_update:
+                nb_api.ipam.vlan_location_assignments.create(loc_update)
+            if rela_update:
+                nb_api.extras.relationship_associations.create(rela_update)
+
+            return switch_vlan_ids
+
+        # Сбор множеств VLAN по группам в зависимости от логики
+        if has_pci_dci:
+            # PCI-DCI: все VLAN в одну группу
+            pci_vlan_set = sync_vlans(pci_vlan_list, pci_group, set())
+            union_vlan_set = pci_vlan_set
+        elif has_otv:
+            # OTV: разделение по VID
+            otv_vlan_set = sync_vlans(otv_vlan_list, otv_group, set())
+
+            other_vlan_set = set()
+            if has_other_scope:
+                other_vlan_set = sync_vlans(other_vlan_list, other_group, set())
+
+            union_vlan_set = otv_vlan_set | other_vlan_set
+        else:
+            # Одиночный scope: все VLAN в одну группу
+            other_vlan_set = set()
+            if has_other_scope:
+                other_vlan_set = sync_vlans(other_vlan_list, other_group, set())
+
+            union_vlan_set = other_vlan_set
+
+        # Удаление старых связей
+        ipam_vlan_ids.difference_update(union_vlan_set)
+
+        for candidate in ipam_vlan_ids:
+            vid = int(candidate)
+
+            # Определяем группу для удаления связи
+            if has_pci_dci:
+                group_id = pci_group.id
+            elif has_otv:
+                if vid >= 1000:
+                    group_id = otv_group.id
+                elif has_other_scope:
+                    group_id = other_group.id
+                else:
                     continue
+            elif has_other_scope:
+                group_id = other_group.id
+            else:
+                continue
 
-                logger.info(f"Processing VRF '{vrf_name}' on {netbox_device.name}")
+            vlan = nb_api.ipam.vlans.get(vid=vid, vlan_group=group_id)
+            if not vlan:
+                continue
 
-                rd_value = parsed_vrf_huawei.get('rd', '')
-                rt_import_values = parsed_vrf_huawei['rt_import']
-                rt_export_values = parsed_vrf_huawei['rt_export']
+            rel = nb_api.extras.relationship_associations.get(
+                relationship='devices_vlans',
+                destination_id=netbox_device.id,
+                source_id=vlan.id
+            )
+            if rel:
+                rel.delete()
 
-                create_route_targets(rt_import_values, rt_export_values, netbox_api, netbox_device)
+        logger.info('End syncing %s', netbox_device.name)
 
-                # Применяем ту же логику что и для IOS/NXOS
-                existing_vrfs = list(netbox_api.ipam.vrfs.filter(name=vrf_name, cf_device=netbox_device.id))
-                
-                matching_vrf = None
-                for existing_vrf in existing_vrfs:
-                    if existing_vrf.rd == rd_value:
-                        matching_vrf = existing_vrf
-                        break
-                
-                if not matching_vrf:
-                    if existing_vrfs:
-                        old_vrf = existing_vrfs[0]
-                        logger.info(f"VRF {vrf_name} RD changed: '{old_vrf.rd}' -> '{rd_value}'")
-                        try:
-                            old_vrf.update({'rd': rd_value})
-                            matching_vrf = old_vrf
-                        except Exception as update_error:
-                            logger.error(f"Failed to update RD for VRF {vrf_name}: {update_error}")
-                            continue
-                    else:
-                        try:
-                            matching_vrf = netbox_api.ipam.vrfs.create(
-                                name=vrf_name, rd=rd_value,
-                                description=f'discovered from {netbox_device.name}',
-                                custom_fields={'device': netbox_device.id}
-                            )
-                            logger.info(f"VRF {vrf_name} created")
-                        except Exception as create_error:
-                            logger.error(f"VRF creation failed for {vrf_name}: {create_error}")
-                            continue
+    except Exception as exc:
+        logger.error('%s: %s', netbox_device.name, exc)
 
-                update_route_targets(rt_import_values, rt_export_values, netbox_api, matching_vrf, False)
 
-            except Exception as vrf_error:
-                logger.error(f'Huawei VRF error for {netbox_device.name}: {vrf_error}')
+def get_nautobot_api():
+    """
+    Возвращает клиент pynautobot с увеличенным пулом соединений.
+    """
+    api = pynautobot.api(
+        NAUTOBOT_URL,
+        token=NAUTOBOT_TOKEN,
+        verify=False,
+    )
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=1000,
+        pool_maxsize=1000
+    )
+    api.http_session.mount('http://', adapter)
+    api.http_session.mount('https://', adapter)
+    api.http_session.verify = False
+    return api
 
-    except Exception as e:
-        logger.error(f'Huawei script error for {netbox_device.name}: {e}')
-    finally:
-        try:
-            if 'net_connect' in locals():
-                net_connect.disconnect()
-        except:
-            pass
-    
-    logger.info(f'END {netbox_device.name}')
 
-def add_vrf_to_netbox_for_one_device(device_name: str):
-    start_time = time.time()
-    logger.info(f"Starting VRF discovery for: {device_name}")
+def main():
+    start = time.time()
+    api = get_nautobot_api()
 
-    try:
-        netbox_api = netbox_connection()
-        netbox_device = netbox_api.dcim.devices.get(name=device_name.upper())
-        
-        if not netbox_device or not netbox_device.platform:
-            logger.error(f"Device {device_name} not found or no platform")
-            return
+    # Строим мапу тегов
+    all_tags = list(api.extras.tags.all())
+    tag_map = {t.id: t.name for t in all_tags}
 
-        platform_name = netbox_device.platform.name
-        
-        if platform_name in ['Cisco IOS', 'Ruijie RG']:
-            create_vrf_netbox_on_cisco_ios(netbox_device, netbox_api)
-        elif platform_name == 'Cisco NXOS':
-            create_vrf_netbox_on_cisco_nxos(netbox_device, netbox_api)
-        elif platform_name == 'Huawei Versatile Routing Platform':
-            create_vrf_netbox_on_huawei_vrp(netbox_device, netbox_api)
+    # Фильтруем нужные устройства
+    devices = list(api.dcim.devices.all())
+    targets = []
+    for dev in devices:
+        names = [tag_map.get(t.id) for t in (dev.tags or [])]
+        if 'raif_scripts' in names:
+            targets.append(dev)
 
-    except Exception as e:
-        logger.error(f"Error processing {device_name}: {e}")
-    
-    logger.info(f"Completed {device_name} in {time.time() - start_time:.2f}s")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        for dev in targets:
+            if dev.platform.name == 'Cisco NXOS':
+                #sync_vlans_for_nxos(dev,api)
+                executor.submit(sync_vlans_for_nxos, dev, api)
+            elif dev.platform.name == 'Cisco IOS' or dev.platform.name == 'Ruijie RG':
+                #sync_vlans_for_ios(dev,api)
+                executor.submit(sync_vlans_for_ios, dev, api)
 
-def add_vrf_to_netbox():
-    start_time = time.time()
-    logger.info("Starting VRF discovery and synchronization")
+    logger.info('Elapsed time: %.2f sec', time.time() - start)
 
-    try:
-        netbox_api = netbox_connection()
-        script_devices = []
-        netbox_all_devices = netbox_api.dcim.devices.all()
-        
-        for netbox_device in netbox_all_devices:
-            # if netbox_device.name == str('MS-MSK34-9120'):  # Убираем фильтр для всех устройств
-            netbox_device_tags = str(netbox_device.tags)
-            if 'raif_scripts' in netbox_device_tags:
-                script_devices.append(netbox_device)
 
-        logger.info(f"Processing {len(script_devices)} devices")
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            futures = []
-            for device in script_devices:
-                platform_name = device.platform.name if device.platform else "Unknown"
-                
-                future = None
-                if platform_name == 'Cisco IOS':
-                    future = executor.submit(create_vrf_netbox_on_cisco_ios, device, netbox_api)
-                elif platform_name == 'Cisco NXOS':
-                    future = executor.submit(create_vrf_netbox_on_cisco_nxos, device, netbox_api)
-                elif platform_name == 'Huawei Versatile Routing Platform':
-                    future = executor.submit(create_vrf_netbox_on_huawei_vrp, device, netbox_api)
-                
-                if future:
-                    futures.append((future, device.name))
-
-            for future, device_name in futures:
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Failed: {device_name} - {e}")
-
-    except Exception as e:
-        logger.error(f"Main error: {e}")
-
-    logger.info(f"VRF synchronization completed in {time.time() - start_time:.2f}s")
-
-if __name__ == "__main__":
-    add_vrf_to_netbox()
+if __name__ == '__main__':
+    main()

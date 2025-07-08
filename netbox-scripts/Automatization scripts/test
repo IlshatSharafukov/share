@@ -36,6 +36,12 @@ def get_all_nautobot_prefixes():
     r = requests.get(url, headers=HEADERS, verify=False); r.raise_for_status()
     return { prefix["prefix"]: prefix for prefix in r.json()["results"] }
 
+def get_all_vrf_assignments():
+    """Возвращает словарь prefix_id→vrf_id всех VRF assignments."""
+    url = f"{NAUTOBOT_URL}/api/ipam/vrf-prefix-assignments/?limit=0"
+    r = requests.get(url, headers=HEADERS, verify=False); r.raise_for_status()
+    return { assignment["prefix"]["id"]: assignment["vrf"]["id"] for assignment in r.json()["results"] }
+
 def create_prefix(payload):
     url = f"{NAUTOBOT_URL}/api/ipam/prefixes/"
     r = requests.post(url, headers=HEADERS, json=payload, verify=False)
@@ -97,7 +103,9 @@ if __name__ == "__main__":
     php_vrf_name_map = { v["vrfId"]: v["name"] for v in php_vrfs }
     nautobot_vrfs    = get_nautobot_vrfs()
     nautobot_prefixes = get_all_nautobot_prefixes()
+    vrf_assignments = get_all_vrf_assignments()
     print(f"Получено {len(nautobot_prefixes)} префиксов из Nautobot")
+    print(f"Получено {len(vrf_assignments)} VRF assignments из Nautobot")
 
     # Строим маппинг phpIPAM vrfId→Nautobot UUID
     vrf_map = {
@@ -134,9 +142,11 @@ if __name__ == "__main__":
             if needs_update(existing, payload):
                 to_update.append((existing["id"], payload, cidr))
             
-            # Проверяем VRF assignment
+            # Проверяем VRF assignment - только если VRF нужен и его еще нет
             if nb_vrf_id:
-                to_assign_vrf.append((existing["id"], nb_vrf_id, cidr))
+                current_vrf = vrf_assignments.get(existing["id"])
+                if current_vrf != nb_vrf_id:
+                    to_assign_vrf.append((existing["id"], nb_vrf_id, cidr, current_vrf))
         else:
             # Префикс не существует, нужно создать
             to_create.append((payload, nb_vrf_id, cidr))
@@ -164,9 +174,12 @@ if __name__ == "__main__":
             print(f"    - custom_fields: {payload.get('custom_fields')}")
     
     if to_assign_vrf:
-        print(f"\nVRF ДЛЯ НАЗНАЧЕНИЯ ({len(to_assign_vrf)}):")
-        for prefix_id, nb_vrf_id, cidr in to_assign_vrf:
-            print(f"  [ASSIGN VRF] {cidr} (id={prefix_id}) -> VRF {nb_vrf_id}")
+        print(f"\nVRF ДЛЯ НАЗНАЧЕНИЯ/ИЗМЕНЕНИЯ ({len(to_assign_vrf)}):")
+        for prefix_id, nb_vrf_id, cidr, current_vrf in to_assign_vrf:
+            if current_vrf:
+                print(f"  [CHANGE VRF] {cidr} (id={prefix_id}) {current_vrf} -> {nb_vrf_id}")
+            else:
+                print(f"  [ASSIGN VRF] {cidr} (id={prefix_id}) -> VRF {nb_vrf_id}")
     
     print(f"\n=== ИТОГО ===")
     print(f"Создать: {len(to_create)} префиксов")

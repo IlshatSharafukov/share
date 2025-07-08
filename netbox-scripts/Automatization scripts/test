@@ -143,60 +143,54 @@ if __name__ == "__main__":
 
     print(f"Анализ завершен: создать={len(to_create)}, обновить={len(to_update)}, назначить VRF={len(to_assign_vrf)}")
 
-    def create_prefix_task(data):
-        payload, nb_vrf_id, cidr = data
-        try:
-            new = create_prefix(payload)
-            prefix_id = new["id"]
-            print(f"[OK] Created {cidr} (id={prefix_id})")
-            
-            if nb_vrf_id:
-                if not get_vrf_prefix_assignment(prefix_id, nb_vrf_id):
-                    create_vrf_prefix_assignment(prefix_id, nb_vrf_id)
-                    print(f"[OK] Assigned {cidr} to VRF {nb_vrf_id}")
-            else:
-                print(f"[SKIP] No VRF for {cidr}")
-        except Exception as e:
-            print(f"[ERROR] Failed to create {cidr}: {e}")
-
-    def update_prefix_task(data):
-        prefix_id, payload, cidr = data
-        try:
-            update_prefix(prefix_id, payload)
-            print(f"[OK] Updated {cidr} (id={prefix_id})")
-        except Exception as e:
-            print(f"[ERROR] Failed to update {cidr}: {e}")
-
-    def assign_vrf_task(data):
-        prefix_id, nb_vrf_id, cidr = data
-        try:
-            if not get_vrf_prefix_assignment(prefix_id, nb_vrf_id):
-                create_vrf_prefix_assignment(prefix_id, nb_vrf_id)
-                print(f"[OK] Assigned {cidr} to VRF {nb_vrf_id}")
-        except Exception as e:
-            print(f"[ERROR] Failed to assign VRF for {cidr}: {e}")
-
-    # Выполняем операции параллельно
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        all_tasks = []
-        
-        # Создание префиксов
-        for task_data in to_create:
-            all_tasks.append(executor.submit(create_prefix_task, task_data))
-        
-        # Обновление префиксов
-        for task_data in to_update:
-            all_tasks.append(executor.submit(update_prefix_task, task_data))
-        
-        # Назначение VRF
-        for task_data in to_assign_vrf:
-            all_tasks.append(executor.submit(assign_vrf_task, task_data))
-
-        # Ждем завершения всех задач
-        for future in as_completed(all_tasks):
-            try:
-                future.result()
-            except Exception as e:
-                print(f"[ERROR] Task failed: {e}")
-
-    print("Синхронизация завершена!")
+    # Печатаем что будем делать (без выполнения)
+    print("\n=== ПЛАНИРУЕМЫЕ ОПЕРАЦИИ ===")
+    
+    if to_create:
+        print(f"\nПРЕФИКСЫ ДЛЯ СОЗДАНИЯ ({len(to_create)}):")
+        for payload, nb_vrf_id, cidr in to_create:
+            vrf_info = f" (VRF: {nb_vrf_id})" if nb_vrf_id else " (без VRF)"
+            print(f"  [CREATE] {cidr}{vrf_info}")
+            print(f"    - description: {payload.get('description')}")
+            print(f"    - is_pool: {payload.get('is_pool')}")
+            print(f"    - custom_fields: {payload.get('custom_fields')}")
+    
+    if to_update:
+        print(f"\nПРЕФИКСЫ ДЛЯ ОБНОВЛЕНИЯ ({len(to_update)}):")
+        for prefix_id, payload, cidr in to_update:
+            print(f"  [UPDATE] {cidr} (id={prefix_id})")
+            print(f"    - description: {payload.get('description')}")
+            print(f"    - is_pool: {payload.get('is_pool')}")
+            print(f"    - custom_fields: {payload.get('custom_fields')}")
+    
+    if to_assign_vrf:
+        print(f"\nVRF ДЛЯ НАЗНАЧЕНИЯ ({len(to_assign_vrf)}):")
+        for prefix_id, nb_vrf_id, cidr in to_assign_vrf:
+            print(f"  [ASSIGN VRF] {cidr} (id={prefix_id}) -> VRF {nb_vrf_id}")
+    
+    print(f"\n=== ИТОГО ===")
+    print(f"Создать: {len(to_create)} префиксов")
+    print(f"Обновить: {len(to_update)} префиксов") 
+    print(f"Назначить VRF: {len(to_assign_vrf)} префиксов")
+    print(f"Всего операций: {len(to_create) + len(to_update) + len(to_assign_vrf)}")
+    
+    print("\nВыполнение отключено. Для запуска реальных операций раскомментируйте код ниже.")
+    
+    # ЗАКОММЕНТИРОВАНО - раскомментируйте для выполнения реальных операций
+    # with ThreadPoolExecutor(max_workers=20) as executor:
+    #     all_tasks = []
+    #     
+    #     # Создание префиксов
+    #     for payload, nb_vrf_id, cidr in to_create:
+    #         # Код создания...
+    #         pass
+    #     
+    #     # Обновление префиксов  
+    #     for prefix_id, payload, cidr in to_update:
+    #         # Код обновления...
+    #         pass
+    #         
+    #     # Назначение VRF
+    #     for prefix_id, nb_vrf_id, cidr in to_assign_vrf:
+    #         # Код назначения VRF...
+    #         pass

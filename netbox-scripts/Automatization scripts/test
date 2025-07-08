@@ -27,9 +27,32 @@ def get_nautobot_api():
     return api
 
 
+def get_vrf_details(api, vrf):
+    """
+    Получает детальную информацию о VRF: устройства и префиксы
+    """
+    # Получаем привязки к устройствам
+    device_assignments = api.ipam.vrf_device_assignments.filter(vrf=vrf.id)
+    devices = []
+    for assignment in device_assignments:
+        device = api.dcim.devices.get(id=assignment.device.id)
+        devices.append(device.name)
+    
+    # Получаем префиксы, привязанные к VRF
+    prefixes = api.ipam.prefixes.filter(vrf=vrf.id)
+    prefix_list = [str(prefix.prefix) for prefix in prefixes]
+    
+    return {
+        'devices': devices,
+        'prefixes': prefix_list,
+        'device_count': len(devices),
+        'prefix_count': len(prefix_list)
+    }
+
+
 def find_duplicate_vrfs():
     """
-    Находит все VRF с дублированными именами в Nautobot
+    Находит все VRF с дублированными именами (3+ раза) в Nautobot
     """
     print("Подключаемся к Nautobot...")
     api = get_nautobot_api()
@@ -43,29 +66,69 @@ def find_duplicate_vrfs():
     vrf_names = [vrf.name for vrf in all_vrfs]
     name_counts = Counter(vrf_names)
     
-    # Находим дубли
-    duplicates = {name: count for name, count in name_counts.items() if count > 1}
+    # Находим дубли (3+ раза)
+    problem_duplicates = {name: count for name, count in name_counts.items() if count >= 3}
     
-    if not duplicates:
-        print("Дублированные VRF не найдены!")
+    # Считаем дубли которые встречаются ровно 2 раза (пропускаем)
+    two_duplicates = {name: count for name, count in name_counts.items() if count == 2}
+    
+    print(f"\nДублей с 2 вхождениями (пропускаем): {len(two_duplicates)}")
+    
+    if not problem_duplicates:
+        print("Проблемных дублированных VRF (3+ раза) не найдено!")
         return
     
-    print(f"\nНайдено {len(duplicates)} дублированных имен VRF:")
-    print("=" * 50)
+    print(f"\nНайдено {len(problem_duplicates)} проблемных дублированных имен VRF (3+ раза):")
+    print("=" * 80)
     
-    for vrf_name, count in duplicates.items():
-        print(f"\nVRF '{vrf_name}' встречается {count} раз:")
+    total_problem_vrfs = 0
+    
+    for vrf_name, count in problem_duplicates.items():
+        print(f"\n🔴 VRF '{vrf_name}' встречается {count} раз:")
         
         # Получаем все VRF с этим именем
         duplicate_vrfs = [vrf for vrf in all_vrfs if vrf.name == vrf_name]
+        total_problem_vrfs += len(duplicate_vrfs)
+        
+        vrfs_with_devices = 0
+        vrfs_with_prefixes = 0
         
         for i, vrf in enumerate(duplicate_vrfs, 1):
-            print(f"  {i}. ID: {vrf.id}, RD: {vrf.rd or 'None'}, "
-                  f"Description: {vrf.description or 'None'}")
+            print(f"\n  {i}. ID: {vrf.id}")
+            print(f"     RD: {vrf.rd or 'None'}")
+            print(f"     Description: {vrf.description or 'None'}")
+            
+            # Получаем детальную информацию
+            details = get_vrf_details(api, vrf)
+            
+            if details['device_count'] > 0:
+                vrfs_with_devices += 1
+                print(f"     ✅ Привязан к устройствам ({details['device_count']}): {', '.join(details['devices'])}")
+            else:
+                print(f"     ❌ Не привязан к устройствам")
+            
+            if details['prefix_count'] > 0:
+                vrfs_with_prefixes += 1
+                print(f"     ✅ Содержит префиксы ({details['prefix_count']}): {', '.join(details['prefixes'][:5])}")
+                if details['prefix_count'] > 5:
+                    print(f"        ... и еще {details['prefix_count'] - 5} префиксов")
+            else:
+                print(f"     ❌ Не содержит префиксы")
+        
+        print(f"\n  📊 Статистика по VRF '{vrf_name}':")
+        print(f"     - Всего дублей: {count}")
+        print(f"     - С привязкой к устройствам: {vrfs_with_devices}")
+        print(f"     - С префиксами: {vrfs_with_prefixes}")
+        print(f"     - Без привязок: {count - vrfs_with_devices}")
+        print(f"     - Без префиксов: {count - vrfs_with_prefixes}")
+        
+        print("-" * 80)
     
-    print("\n" + "=" * 50)
-    print(f"Итого дублированных VRF: {sum(duplicates.values())}")
-    print(f"Уникальных дублированных имен: {len(duplicates)}")
+    print(f"\n📈 ОБЩАЯ СТАТИСТИКА:")
+    print(f"Всего VRF в системе: {len(all_vrfs)}")
+    print(f"Дублей с 2 вхождениями (норма): {len(two_duplicates)} имен = {len(two_duplicates) * 2} VRF")
+    print(f"Проблемных дублей (3+ раза): {len(problem_duplicates)} имен = {total_problem_vrfs} VRF")
+    print(f"Нужно исправить: {total_problem_vrfs - len(problem_duplicates)} лишних VRF")
 
 
 if __name__ == "__main__":

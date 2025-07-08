@@ -1,0 +1,202 @@
+import os
+import requests
+import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Отключение InsecureRequestWarning
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# —————————————————————————————————————————————————————————
+#  Конфигурация
+# —————————————————————————————————————————————————————————
+NAUTOBOT_URL   = os.getenv("NAUTOBOT_URL",   "https://s-msk-p-netbox02")
+NAUTOBOT_TOKEN = os.getenv("NAUTOBOT_TOKEN", "e1fbfbcdc94dc589c4beea1b837bdce5b19a9763")
+IPAM_HOST      = "ipam.raiffeisen.ru"
+IPAM_TOKEN     = "p5msyTWUSaSuj-hvOcGb0fjt2nLL-fPt"
+IPAM_APP_ID    = "gts"
+
+HEADERS = {
+    "Authorization": f"Token {NAUTOBOT_TOKEN}",
+    "Content-Type":  "application/json",
+    "Accept":        "application/json",
+}
+
+# —————————————————————————————————————————————————————————
+#  Вспомогательные функции для Nautobot API
+# —————————————————————————————————————————————————————————
+def get_nautobot_vrfs():
+    """Возвращает словарь name→UUID всех VRF в Nautobot."""
+    url = f"{NAUTOBOT_URL}/api/ipam/vrfs/?limit=0"
+    r = requests.get(url, headers=HEADERS, verify=False); r.raise_for_status()
+    return { vrf["name"]: vrf["id"] for vrf in r.json()["results"] }
+
+def get_all_nautobot_prefixes():
+    """Возвращает словарь CIDR→prefix_data всех префиксов из Nautobot."""
+    url = f"{NAUTOBOT_URL}/api/ipam/prefixes/?limit=0"
+    r = requests.get(url, headers=HEADERS, verify=False); r.raise_for_status()
+    return { prefix["prefix"]: prefix for prefix in r.json()["results"] }
+
+def create_prefix(payload):
+    url = f"{NAUTOBOT_URL}/api/ipam/prefixes/"
+    r = requests.post(url, headers=HEADERS, json=payload, verify=False)
+    if not r.ok:
+        print(f"[ERROR] create Prefix '{payload['prefix']}' failed: {r.status_code}\n{r.text}")
+        r.raise_for_status()
+    return r.json()
+
+def update_prefix(prefix_id, payload):
+    url = f"{NAUTOBOT_URL}/api/ipam/prefixes/{prefix_id}/"
+    r = requests.patch(url, headers=HEADERS, json=payload, verify=False)
+    if not r.ok:
+        print(f"[ERROR] update Prefix id={prefix_id} failed: {r.status_code}\n{r.text}")
+        r.raise_for_status()
+    return r.json()
+
+def get_vrf_prefix_assignment(prefix_id, vrf_id):
+    """Проверяет, есть ли уже связь prefix↔vrf в through-таблице."""
+    url = f"{NAUTOBOT_URL}/api/ipam/vrf-prefix-assignments/"
+    params = {"prefix": prefix_id, "vrf": vrf_id}
+    r = requests.get(url, headers=HEADERS, params=params, verify=False)
+    if not r.ok:
+        print(f"[ERROR] fetch VRF-Prefix assignment failed: {r.status_code}\n{r.text}")
+        r.raise_for_status()
+    results = r.json().get("results", [])
+    return results[0] if results else None
+
+def create_vrf_prefix_assignment(prefix_id, vrf_id):
+    """Создаёт связь prefix↔vrf через through-таблицу."""
+    url = f"{NAUTOBOT_URL}/api/ipam/vrf-prefix-assignments/"
+    body = {"prefix": prefix_id, "vrf": vrf_id}
+    r = requests.post(url, headers=HEADERS, json=body, verify=False)
+    if not r.ok:
+        print(f"[ERROR] create VRF-Prefix assignment failed: {r.status_code}\n{r.text}")
+        r.raise_for_status()
+    return r.json()
+
+def needs_update(existing_prefix, new_payload):
+    """Проверяет, нужно ли обновлять префикс."""
+    return (
+        existing_prefix.get("description") != new_payload.get("description") or
+        existing_prefix.get("is_pool") != new_payload.get("is_pool") or
+        existing_prefix.get("custom_fields", {}) != new_payload.get("custom_fields", {})
+    )
+
+# —————————————————————————————————————————————————————————
+#  Основной код
+# —————————————————————————————————————————————————————————
+if __name__ == "__main__":
+    from ipam import IPAM
+
+    print("Загружаем данные из phpIPAM...")
+    ipam = IPAM(hostname=IPAM_HOST, app_id=IPAM_APP_ID, token=IPAM_TOKEN)
+    php_vrfs     = ipam.vrf.get().get("data", [])
+    php_prefixes = ipam.subnet.get().get("data", [])
+    print(f"Получено {len(php_prefixes)} префиксов из phpIPAM")
+
+    print("Загружаем данные из Nautobot...")
+    php_vrf_name_map = { v["vrfId"]: v["name"] for v in php_vrfs }
+    nautobot_vrfs    = get_nautobot_vrfs()
+    nautobot_prefixes = get_all_nautobot_prefixes()
+    print(f"Получено {len(nautobot_prefixes)} префиксов из Nautobot")
+
+    # Строим маппинг phpIPAM vrfId→Nautobot UUID
+    vrf_map = {
+        pid: nautobot_vrfs.get(name)
+        for pid, name in php_vrf_name_map.items()
+    }
+
+    # Анализируем что нужно создать/обновить
+    to_create = []
+    to_update = []
+    to_assign_vrf = []
+
+    for rec in php_prefixes:
+        cidr = f"{rec['subnet']}/{rec['mask']}"
+        php_vrf_id = rec.get("vrfId")
+        nb_vrf_id = vrf_map.get(php_vrf_id) if php_vrf_id and php_vrf_id != "0" else None
+
+        # Общий payload
+        payload = {
+            "prefix":      cidr,
+            "status": 'Active',
+            "description": rec.get("description") or "",
+            "is_pool":     rec.get("isPool") == "1",
+            "custom_fields": {
+                "location": rec.get("location") or "",
+                "vra":      rec.get("custom_vRA") == "1",
+                "k8s":      rec.get("custom_k8s") == "1",
+            },
+        }
+
+        existing = nautobot_prefixes.get(cidr)
+        if existing:
+            # Префикс существует, проверяем нужно ли обновить
+            if needs_update(existing, payload):
+                to_update.append((existing["id"], payload, cidr))
+            
+            # Проверяем VRF assignment
+            if nb_vrf_id:
+                to_assign_vrf.append((existing["id"], nb_vrf_id, cidr))
+        else:
+            # Префикс не существует, нужно создать
+            to_create.append((payload, nb_vrf_id, cidr))
+
+    print(f"Анализ завершен: создать={len(to_create)}, обновить={len(to_update)}, назначить VRF={len(to_assign_vrf)}")
+
+    def create_prefix_task(data):
+        payload, nb_vrf_id, cidr = data
+        try:
+            new = create_prefix(payload)
+            prefix_id = new["id"]
+            print(f"[OK] Created {cidr} (id={prefix_id})")
+            
+            if nb_vrf_id:
+                if not get_vrf_prefix_assignment(prefix_id, nb_vrf_id):
+                    create_vrf_prefix_assignment(prefix_id, nb_vrf_id)
+                    print(f"[OK] Assigned {cidr} to VRF {nb_vrf_id}")
+            else:
+                print(f"[SKIP] No VRF for {cidr}")
+        except Exception as e:
+            print(f"[ERROR] Failed to create {cidr}: {e}")
+
+    def update_prefix_task(data):
+        prefix_id, payload, cidr = data
+        try:
+            update_prefix(prefix_id, payload)
+            print(f"[OK] Updated {cidr} (id={prefix_id})")
+        except Exception as e:
+            print(f"[ERROR] Failed to update {cidr}: {e}")
+
+    def assign_vrf_task(data):
+        prefix_id, nb_vrf_id, cidr = data
+        try:
+            if not get_vrf_prefix_assignment(prefix_id, nb_vrf_id):
+                create_vrf_prefix_assignment(prefix_id, nb_vrf_id)
+                print(f"[OK] Assigned {cidr} to VRF {nb_vrf_id}")
+        except Exception as e:
+            print(f"[ERROR] Failed to assign VRF for {cidr}: {e}")
+
+    # Выполняем операции параллельно
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        all_tasks = []
+        
+        # Создание префиксов
+        for task_data in to_create:
+            all_tasks.append(executor.submit(create_prefix_task, task_data))
+        
+        # Обновление префиксов
+        for task_data in to_update:
+            all_tasks.append(executor.submit(update_prefix_task, task_data))
+        
+        # Назначение VRF
+        for task_data in to_assign_vrf:
+            all_tasks.append(executor.submit(assign_vrf_task, task_data))
+
+        # Ждем завершения всех задач
+        for future in as_completed(all_tasks):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"[ERROR] Task failed: {e}")
+
+    print("Синхронизация завершена!")

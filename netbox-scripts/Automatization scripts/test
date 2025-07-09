@@ -1,12 +1,12 @@
-- name: Deliver NetBox scripts
-  hosts: s-msk-p-scripter
+- name: Deliver Nautobot scripts
+  hosts: s-msk-p-scripter-x5
   become: True
   vars:
     ansible_password:                 "{{ ansible_password }}"
     ansible_become_pass:              "{{ ansible_password }}"
     ansible_user:                     "srv-gtsprm-g"
-    local_source_dir:                 "netbox_network_scanner/"
-    remote_target_dir:                "/usr/local/netbox-ci"
+    local_source_dir:                 "nautobot_network_scanner/"
+    remote_target_dir:                "/usr/local/nautobot-ci"
   tasks:
     - name: Transfer Scripts
       block:
@@ -43,8 +43,8 @@
                 content: |
                   HPNA_LOGIN='{{ HPNA_LOGIN }}'
                   HPNA_PASSWORD='{{ HPNA_PASSWORD }}'
-                  NETBOX_URL='{{ NETBOX_URL }}'
-                  NETBOX_TOKEN='{{ NETBOX_TOKEN }}'
+                  NAUTOBOT_URL='{{ NAUTOBOT_URL }}'
+                  NAUTOBOT_TOKEN='{{ NAUTOBOT_TOKEN }}'
                   HPNA_WEB_LOGIN='{{ HPNA_WEB_LOGIN }}'
                   HPNA_WEB_PASSWORD='{{ HPNA_WEB_PASSWORD }}'
                 dest: "{{ remote_target_dir }}/.env"
@@ -58,12 +58,12 @@
             job: "{{ item.job }}"
             state: present
           with_items:
-            - { name: "Update Device", user: "root", minute: "0", hour: "0", job: "python3 /usr/local/netbox-ci/get_device.py > /var/log/script_logs/get_device.log 2>&1" }
-            - { name: "Update VRF", user: "root", minute: "30", hour: "0", job: "python3 /usr/local/netbox-ci/get_vrf.py > /var/log/script_logs/get_vrf.log 2>&1" }
-            - { name: "Update VLAN", user: "root", minute: "15", hour: "*/1", job: "python3 /usr/local/netbox-ci/get_vlan.py > /var/log/script_logs/get_vlan.log 2>&1" }
-            - { name: "Update VNI", user: "root", minute: "30", hour: "1", job: "python3 /usr/local/netbox-ci/get_vni_fabric.py > /var/log/script_logs/get_vni_fabric.log 2>&1" }
-            - { name: "Update Inventory", user: "root", minute: "0", hour: "2", job: "python3 /usr/local/netbox-ci/get_inventory.py > /var/log/script_logs/get_inventory.log 2>&1" }
-            - { name: "Update Prefix", user: "root", minute: "30", hour: "2", job: "python3 /usr/local/netbox-ci/get_prefix.py > /var/log/script_logs/get_prefix.log 2>&1" }
-            - { name: "Update ARP", user: "root", minute: "45", hour: "*/2", job: "python3 /usr/local/netbox-ci/get_arp.py > /var/log/script_logs/get_arp.log 2>&1" }
-            - { name: "Update Interface on Netbox", user: "root", minute: "30", hour: "3", job: "python3 /usr/local/netbox-ci/get_interface.py > /var/log/script_logs/get_interface_to_netbox.log 2>&1" }
-            - { name: "Update Vlans on interfaces", user: "root", minute: "0", hour: "4", job: "python3 /usr/local/netbox-ci/get_vlans_on_interface.py > /var/log/script_logs/get_vlans_on_interface.log 2>&1" }
+            - { name: "Update Device Nautobot", user: "root", minute: "0", hour: "0", job: "python3 /usr/local/nautobot-ci/get_device.py > /var/log/script_logs/nautobot_get_device.log 2>&1" }
+            - { name: "Update VRF Nautobot", user: "root", minute: "30", hour: "0", job: "python3 /usr/local/nautobot-ci/get_vrf.py > /var/log/script_logs/nautobot_get_vrf.log 2>&1" }
+            - { name: "Update VLAN Nautobot", user: "root", minute: "15", hour: "*/1", job: "python3 /usr/local/nautobot-ci/get_vlan.py > /var/log/script_logs/nautobot_get_vlan.log 2>&1" }
+            - { name: "Update VNI Nautobot", user: "root", minute: "30", hour: "1", job: "python3 /usr/local/nautobot-ci/get_vni_fabric.py > /var/log/script_logs/nautobot_get_vni_fabric.log 2>&1" }
+            - { name: "Update Inventory Nautobot", user: "root", minute: "0", hour: "2", job: "python3 /usr/local/nautobot-ci/get_inventory.py > /var/log/script_logs/nautobot_get_inventory.log 2>&1" }
+            - { name: "Update Prefix Nautobot", user: "root", minute: "30", hour: "2", job: "python3 /usr/local/nautobot-ci/get_prefix.py > /var/log/script_logs/nautobot_get_prefix.log 2>&1" }
+            - { name: "Update ARP Nautobot", user: "root", minute: "45", hour: "*/2", job: "python3 /usr/local/nautobot-ci/get_arp.py > /var/log/script_logs/nautobot_get_arp.log 2>&1" }
+            - { name: "Update Interface on Nautobot", user: "root", minute: "30", hour: "3", job: "python3 /usr/local/nautobot-ci/get_interface.py > /var/log/script_logs/nautobot_get_interface.log 2>&1" }
+            - { name: "Update Vlans on interfaces Nautobot", user: "root", minute: "0", hour: "4", job: "python3 /usr/local/nautobot-ci/get_vlans_on_interface.py > /var/log/script_logs/nautobot_get_vlans_on_interface.log 2>&1" }

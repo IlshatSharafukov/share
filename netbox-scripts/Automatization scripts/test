@@ -1,248 +1,69 @@
-variables:
-  ANSIBLE_CONFIG: ./ansible.cfg
-
-stages:
-  - deliver_scripts
-  - update_scripts
-
-# NetBox jobs (существующие)
-Deliver Scripts NetBox:
-  stage: deliver_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook deliver_scripts_netbox.yaml -e ansible_password=$ANSIBLE_PASSWORD -e HPNA_LOGIN=$HPNA_LOGIN -e HPNA_PASSWORD=$HPNA_PASSWORD -e NETBOX_URL=$NETBOX_URL -e NETBOX_TOKEN=$NETBOX_TOKEN -e HPNA_WEB_LOGIN=$HPNA_WEB_LOGIN -e HPNA_WEB_PASSWORD=$HPNA_WEB_PASSWORD"
-  only:
-    refs:
-      - main
-
-# Nautobot jobs (новые)
-Deliver Scripts Nautobot:
-  stage: deliver_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook deliver_scripts_nautobot.yaml -e ansible_password=$ANSIBLE_PASSWORD -e NAUTOBOT_URL=$NAUTOBOT_URL -e NAUTOBOT_TOKEN=$NAUTOBOT_TOKEN -e HPNA_LOGIN=$HPNA_LOGIN -e HPNA_PASSWORD=$HPNA_PASSWORD -e HPNA_WEB_LOGIN=$HPNA_WEB_LOGIN -e HPNA_WEB_PASSWORD=$HPNA_WEB_PASSWORD"
-  only:
-    refs:
-      - main
-
-# NetBox update jobs
-Update Vlans NetBox:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_vlan.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update Prefix NetBox:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_prefix.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update ARP NetBox:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_arp.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update Interface on netbox:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update Inventory NetBox:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update vlans on interface NetBox:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_vlans_on_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update VNI NetBox:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_vni_fabric.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update VRF NetBox:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_vrf.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update Device NetBox:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_device.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-# Nautobot update jobs (новые)
-Update Vlans Nautobot:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_vlan.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update Prefix Nautobot:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_prefix.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update ARP Nautobot:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_arp.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update Interface on nautobot:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update Inventory Nautobot:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update vlans on interface Nautobot:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_vlans_on_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update VNI Nautobot:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_vni_fabric.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update VRF Nautobot:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_vrf.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
-
-Update Device Nautobot:
-  stage: update_scripts
-  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
-  environment:
-    name: main
-  script:
-    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_device.py -e ansible_password=$ANSIBLE_PASSWORD"
-  only:
-    refs:
-      - main
-  when: manual
+- name: Deliver NetBox scripts
+  hosts: s-msk-p-scripter
+  become: True
+  vars:
+    ansible_password:                 "{{ ansible_password }}"
+    ansible_become_pass:              "{{ ansible_password }}"
+    ansible_user:                     "srv-gtsprm-g"
+    local_source_dir:                 "netbox_network_scanner/"
+    remote_target_dir:                "/usr/local/netbox-ci"
+  tasks:
+    - name: Transfer Scripts
+      block:
+        - name: Archive the Scripts directory
+          archive:
+            path: "{{ local_source_dir }}/"
+            dest: "{{ remote_target_dir }}.tar.gz"
+            format: gz
+          delegate_to: localhost
+          become: false
+        - name: Copy scripts folder
+          block:
+            - name: Remove old libs folder
+              file:
+                path: "{{ remote_target_dir }}"
+                state: absent
+            - name: Ensure the destination directory exists
+              file:
+                path: "{{ remote_target_dir }}"
+                state: directory
+                mode: '0755'
+              become: yes
+            - name: Unpack the archive on the remote machine
+              unarchive:
+                src: "{{ remote_target_dir }}.tar.gz"
+                dest: "{{ remote_target_dir }}"
+            - name: Change Group of Scripts Folder Recursively
+              file:
+                path: "{{ remote_target_dir }}"
+                group: "root"
+                recurse: yes
+            - name: Create .env file
+              copy:
+                content: |
+                  HPNA_LOGIN='{{ HPNA_LOGIN }}'
+                  HPNA_PASSWORD='{{ HPNA_PASSWORD }}'
+                  NETBOX_URL='{{ NETBOX_URL }}'
+                  NETBOX_TOKEN='{{ NETBOX_TOKEN }}'
+                  HPNA_WEB_LOGIN='{{ HPNA_WEB_LOGIN }}'
+                  HPNA_WEB_PASSWORD='{{ HPNA_WEB_PASSWORD }}'
+                dest: "{{ remote_target_dir }}/.env"
+                mode: '0755'
+        - name: Ensure multiple cron jobs are present
+          cron:
+            name: "{{ item.name }}"
+            user: "{{ item.user }}"
+            minute: "{{ item.minute }}"
+            hour: "{{ item.hour }}"
+            job: "{{ item.job }}"
+            state: present
+          with_items:
+            - { name: "Update Device", user: "root", minute: "0", hour: "0", job: "python3 /usr/local/netbox-ci/get_device.py > /var/log/script_logs/get_device.log 2>&1" }
+            - { name: "Update VRF", user: "root", minute: "30", hour: "0", job: "python3 /usr/local/netbox-ci/get_vrf.py > /var/log/script_logs/get_vrf.log 2>&1" }
+            - { name: "Update VLAN", user: "root", minute: "15", hour: "*/1", job: "python3 /usr/local/netbox-ci/get_vlan.py > /var/log/script_logs/get_vlan.log 2>&1" }
+            - { name: "Update VNI", user: "root", minute: "30", hour: "1", job: "python3 /usr/local/netbox-ci/get_vni_fabric.py > /var/log/script_logs/get_vni_fabric.log 2>&1" }
+            - { name: "Update Inventory", user: "root", minute: "0", hour: "2", job: "python3 /usr/local/netbox-ci/get_inventory.py > /var/log/script_logs/get_inventory.log 2>&1" }
+            - { name: "Update Prefix", user: "root", minute: "30", hour: "2", job: "python3 /usr/local/netbox-ci/get_prefix.py > /var/log/script_logs/get_prefix.log 2>&1" }
+            - { name: "Update ARP", user: "root", minute: "45", hour: "*/2", job: "python3 /usr/local/netbox-ci/get_arp.py > /var/log/script_logs/get_arp.log 2>&1" }
+            - { name: "Update Interface on Netbox", user: "root", minute: "30", hour: "3", job: "python3 /usr/local/netbox-ci/get_interface.py > /var/log/script_logs/get_interface_to_netbox.log 2>&1" }
+            - { name: "Update Vlans on interfaces", user: "root", minute: "0", hour: "4", job: "python3 /usr/local/netbox-ci/get_vlans_on_interface.py > /var/log/script_logs/get_vlans_on_interface.log 2>&1" }

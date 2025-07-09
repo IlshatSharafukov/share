@@ -1,503 +1,248 @@
-import concurrent.futures
-import time
-import pynautobot
-import requests
-from netmiko import ConnectHandler
-import urllib3
-from decouple import config
-from netmiko.exceptions import NetMikoTimeoutException, NetMikoAuthenticationException
-from ntc_templates.parse import parse_output
-import logging
+variables:
+  ANSIBLE_CONFIG: ./ansible.cfg
 
-# Отключаем предупреждения InsecureRequestWarning
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+stages:
+  - deliver_scripts
+  - update_scripts
 
-# Константы из окружения
-HPNA_LOGIN = config('HPNA_LOGIN')
-HPNA_PASSWORD = config('HPNA_PASSWORD')
-NAUTOBOT_URL = config('NAUTOBOT_URL')
-NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
+# NetBox jobs (существующие)
+Deliver Scripts NetBox:
+  stage: deliver_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook deliver_scripts_netbox.yaml -e ansible_password=$ANSIBLE_PASSWORD -e HPNA_LOGIN=$HPNA_LOGIN -e HPNA_PASSWORD=$HPNA_PASSWORD -e NETBOX_URL=$NETBOX_URL -e NETBOX_TOKEN=$NETBOX_TOKEN -e HPNA_WEB_LOGIN=$HPNA_WEB_LOGIN -e HPNA_WEB_PASSWORD=$HPNA_WEB_PASSWORD"
+  only:
+    refs:
+      - main
 
-# Логгер
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Nautobot jobs (новые)
+Deliver Scripts Nautobot:
+  stage: deliver_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook deliver_scripts_nautobot.yaml -e ansible_password=$ANSIBLE_PASSWORD -e NAUTOBOT_URL=$NAUTOBOT_URL -e NAUTOBOT_TOKEN=$NAUTOBOT_TOKEN -e HPNA_LOGIN=$HPNA_LOGIN -e HPNA_PASSWORD=$HPNA_PASSWORD -e HPNA_WEB_LOGIN=$HPNA_WEB_LOGIN -e HPNA_WEB_PASSWORD=$HPNA_WEB_PASSWORD"
+  only:
+    refs:
+      - main
 
-def connect_device(netbox_device, device_type):
-    params = {
-        'device_type': device_type,
-        'host': str(netbox_device.primary_ip4)[:-3:],
-        'username': config('HPNA_LOGIN'),
-        'password': config('HPNA_PASSWORD'),
-        'timeout': 200,
-        'port': 22,
-        "global_delay_factor": 2,
-        'conn_timeout': 200
-    }
+# NetBox update jobs
+Update Vlans NetBox:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_vlan.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-    try:
-        return ConnectHandler(**params)
-    except Exception:
-        # Пробуем ещё раз
-        try:
-            return ConnectHandler(**params)
-        except Exception:
-            logger.error('Connection error: %s', netbox_device.name)
-            return None
+Update Prefix NetBox:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_prefix.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-def get_nautobot_api():
-    """
-    Возвращает клиент pynautobot с увеличенным пулом соединений.
-    """
-    api = pynautobot.api(
-        NAUTOBOT_URL,
-        token=NAUTOBOT_TOKEN,
-        verify=False,
-    )
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=1000,
-        pool_maxsize=1000
-    )
-    api.http_session.mount('http://', adapter)
-    api.http_session.mount('https://', adapter)
-    api.http_session.verify = False
-    return api
+Update ARP NetBox:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_arp.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
+Update Interface on netbox:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-def update_route_targets(rt_import_values, rt_export_values, nb_api, netbox_vrf_for_update, evpn_var):
-    update_list_import = [nb_api.ipam.route_targets.get(name=str(rt)).id for rt in rt_import_values]
-    netbox_vrf_for_update.update({'import_targets': update_list_import})
+Update Inventory NetBox:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-    update_list_export = [nb_api.ipam.route_targets.get(name=str(rt)).id for rt in rt_export_values]
-    netbox_vrf_for_update.update({'export_targets': update_list_export})
+Update vlans on interface NetBox:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_vlans_on_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-    netbox_vrf_for_update.update({'custom_fields': {'evpn': evpn_var}})
+Update VNI NetBox:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_vni_fabric.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-def create_vrf_netbox_on_cisco_ios(netbox_device, nb_api):
-    try:
-        connection = connect_device(netbox_device, 'cisco_nxos')
-        if not connection:
-            return
-        logger.info('Start create %s', netbox_device.name)
-        output = connection.send_command('show run | section vrf', read_timeout=200)
-        connection.disconnect()
-        device_vrfs = parse_output(
-            platform='cisco_ios',
-            command='show run vrf',
-            data=output
-        )
+Update VRF NetBox:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_vrf.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-        nb_vrfs = nb_api.ipam.vrfs.all()
-        nb_vrfs_assign = nb_api.ipam.vrfs.filter(
-            device=netbox_device.id
-        )
-        nb_rt = nb_api.ipam.route_targets.all()
+Update Device NetBox:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_netbox.yaml -e SCRIPT_NAME=get_device.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-        existing_vrf_dict = {}
-        for r in nb_vrfs:
-            existing_vrf_dict.update({f'{r.name}': r})
+# Nautobot update jobs (новые)
+Update Vlans Nautobot:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_vlan.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-        netbox_all_vrfs_rd = [
-            str(nb_vrf.rd) for nb_vrf in nb_vrfs
-        ]
-        netbox_all_vrfs_name = [
-            str(nb_vrf.name) for nb_vrf in nb_vrfs
-        ]
-        vrf_assign = [
-            str(nb_vrf_assign.name) for nb_vrf_assign in nb_vrfs_assign
-        ]
-        device_vrfs_names = [
-            str(device_vrf_name.get('name')) for device_vrf_name in device_vrfs
-        ]
-        nb_rt_names = [
-            str(nb_rt_name.name) for nb_rt_name in nb_rt
-        ]
-        set_nb_rt_names = set(nb_rt_names)
+Update Prefix Nautobot:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_prefix.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-        for netmiko_vrfs_show_run in device_vrfs:
-            try:
-                vrf_name = netmiko_vrfs_show_run.get('name')
-                if vrf_name in ['default', 'PEER-KEEPALIVE', 'VPC_KEEPALIVE']:
-                    continue
-                if netmiko_vrfs_show_run['rd'] != '':
-                    device_rd = f"*:{netmiko_vrfs_show_run['rd'].split(':')[1]}"
-                else:
-                    device_rd = None
-                try:
-                    is_vrf_exists = False
-                    vrf_check = None
-                    vrf_id = None
-                    if vrf_name in netbox_all_vrfs_name:
-                        if device_rd in netbox_all_vrfs_rd or not device_rd:
-                            try:
-                                vrf_check = nb_api.ipam.vrfs.get(
-                                    name=vrf_name,
-                                    rd=device_rd,
-                                )
-                            except:
-                                vrf_check = nb_api.ipam.vrfs.filter(
-                                    name=vrf_name,
-                                    rd=device_rd,
-                                )
-                                for vrf in vrf_check:
-                                    if not vrf.rd:
-                                        vrf_id = vrf.id
-                                if not vrf_id:
-                                    vrf_check = None
-                            if vrf_check:
-                                is_vrf_exists = True
-                        else:
-                            vrf_check = nb_api.ipam.vrfs.filter(
-                                name=vrf_name,
-                                rd=device_rd,
-                            )
-                            if vrf_check:
-                                is_vrf_exists = True
-                                nb_vrfs = nb_api.ipam.vrfs.all()
-                                existing_vrf_dict = {}
-                                for r in nb_vrfs:
-                                    existing_vrf_dict.update({f'{r.name}': r})
-                                nb_vrfs_assign = nb_api.ipam.vrfs.filter(
-                                    device=netbox_device.id
-                                )
-                                vrf_assign = [
-                                    str(nb_vrf_assign.name) for nb_vrf_assign in nb_vrfs_assign
-                                ]
-                    if not is_vrf_exists:
-                        if not vrf_check:
-                            nb_api.ipam.vrfs.create(
-                                name=vrf_name,
-                                rd=device_rd,
-                                description=f'discovered from device',
-                            )
-                            nb_vrfs = nb_api.ipam.vrfs.all()
-                            existing_vrf_dict = {}
-                            for r in nb_vrfs:
-                                existing_vrf_dict.update({f'{r.name}': r})
-                            nb_vrfs_assign = nb_api.ipam.vrfs.filter(
-                                device=netbox_device.id
-                            )
-                            vrf_assign = [
-                                str(nb_vrf_assign.name) for nb_vrf_assign in nb_vrfs_assign
-                            ]
-                except pynautobot.core.query.RequestError as e:
-                    print(f"Ошибка при создании/обновлении VRF {vrf_name} на устройстве {netbox_device.name}: {e}")
+Update ARP Nautobot:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_arp.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-                evpn_var = False
+Update Interface on nautobot:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-                rt_import_values = netmiko_vrfs_show_run.get('rt_import', [])
-                try:
-                    rt_import_exist = [
-                        nb_import_targets.name for nb_import_targets in existing_vrf_dict.get(vrf_name).import_targets
-                    ]
-                except:
-                    rt_import_exist = []
-                set_rt_import_values = set(rt_import_values)
-                set_rt_import_exist = set(rt_import_exist)
-                set_rt_import_values.difference_update(set_rt_import_exist)
+Update Inventory Nautobot:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-                rt_export_values = netmiko_vrfs_show_run.get('rt_export', [])
-                try:
-                    rt_export_exist = [
-                        nb_export_targets.name for nb_export_targets in existing_vrf_dict.get(vrf_name).export_targets
-                    ]
-                except:
-                    rt_export_exist = []
-                set_rt_export_values = set(rt_export_values)
-                set_rt_export_exist = set(rt_export_exist)
-                set_rt_export_values.difference_update(set_rt_export_exist)
+Update vlans on interface Nautobot:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_vlans_on_interface.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-                if not isinstance(rt_import_values, list) or not isinstance(rt_export_values, list):
-                    raise ValueError(f"Неверный формат import/export для VRF {vrf_name}, {netbox_device}")
+Update VNI Nautobot:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_vni_fabric.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-                combined_values_set = set(rt_import_values) | set(rt_export_values)
-                combined_values_set.difference_update(set_nb_rt_names)
+Update VRF Nautobot:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_vrf.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual
 
-                if combined_values_set:
-                    combined_values_list = list(combined_values_set)
-                    for rt_create_candidate in combined_values_list:
-                        try:
-                            nb_api.ipam.route_targets.create(name=rt_create_candidate)
-                        except Exception as e:
-                            print(f'Ошибка при работе с Route Target {rt_create_candidate}: {e}, {netbox_device}')
-
-                if vrf_id:
-                    netbox_vrf_for_update = nb_api.ipam.vrfs.get(
-                        id=vrf_id
-                    )
-                else:
-                    netbox_vrf_for_update = nb_api.ipam.vrfs.get(
-                        name=vrf_name,
-                        rd=device_rd
-                    )
-
-                if vrf_name not in vrf_assign:
-                    nb_api.ipam.vrf_device_assignments.create(
-                        vrf=netbox_vrf_for_update.id,
-                        device=netbox_device.id
-                    )
-
-                if set_rt_export_values or set_rt_import_values:
-                    update_route_targets(rt_import_values, rt_export_values, nb_api, netbox_vrf_for_update, evpn_var)
-            except Exception as error:
-                logger.error(f'SCRIPT {netbox_device} - {error} - {netmiko_vrfs_show_run}')
-
-        set_vrf_assign = set(vrf_assign)
-        set_device_vrfs_names = set(device_vrfs_names)
-        set_vrf_assign.difference_update(set_device_vrfs_names)
-
-        if set_vrf_assign:
-            for candidate in set_vrf_assign:
-                assign_vrf_for_del = nb_api.ipam.vrf_device_assignments.get(device=netbox_device.name, name=candidate)
-                if assign_vrf_for_del:
-                    assign_vrf_for_del.delete()
-
-        logger.info('End create %s', netbox_device.name)
-    except Exception as exc:
-        logger.error('%s: %s', netbox_device.name, exc)
-
-
-def create_vrf_netbox_on_cisco_nxos(netbox_device, nb_api):
-    try:
-        connection = connect_device(netbox_device, 'cisco_nxos')
-        if not connection:
-            return
-        logger.info('Start create %s', netbox_device.name)
-        output = connection.send_command('show run | section vrf', read_timeout=200)
-        connection.disconnect()
-        device_vrfs = parse_output(
-            platform='cisco_nxos',
-            command='show run vrf',
-            data=output
-        )
-
-        nb_vrfs = nb_api.ipam.vrfs.all()
-        nb_vrfs_assign = nb_api.ipam.vrfs.filter(
-            device=netbox_device.id
-        )
-        nb_rt = nb_api.ipam.route_targets.all()
-
-        existing_vrf_dict = {}
-        for r in nb_vrfs:
-            existing_vrf_dict.update({f'{r.name}': r})
-
-
-        netbox_all_vrfs_rd = [
-            str(nb_vrf.rd) for nb_vrf in nb_vrfs
-        ]
-        netbox_all_vrfs_name = [
-            str(nb_vrf.name) for nb_vrf in nb_vrfs
-        ]
-        vrf_assign = [
-            str(nb_vrf_assign.name) for nb_vrf_assign in nb_vrfs_assign
-        ]
-        device_vrfs_names = [
-            str(device_vrf_name.get('name')) for device_vrf_name in device_vrfs
-        ]
-        nb_rt_names = [
-            str(nb_rt_name.name) for nb_rt_name in nb_rt
-        ]
-        set_nb_rt_names = set(nb_rt_names)
-
-        for netmiko_vrfs_show_run in device_vrfs:
-            try:
-                vrf_name = netmiko_vrfs_show_run.get('name')
-                if vrf_name in ['default', 'PEER-KEEPALIVE', 'VPC_KEEPALIVE']:
-                    continue
-                if netmiko_vrfs_show_run['rd'] != '':
-                    device_rd = f"*:{netmiko_vrfs_show_run['rd'].split(':')[1]}"
-                else:
-                    device_rd = None
-                try:
-                    is_vrf_exists = False
-                    vrf_check = None
-                    vrf_id = None
-                    if vrf_name in netbox_all_vrfs_name:
-                        if device_rd in netbox_all_vrfs_rd or not device_rd:
-                            try:
-                                vrf_check = nb_api.ipam.vrfs.get(
-                                    name=vrf_name,
-                                    rd=device_rd,
-                                )
-                            except:
-                                vrf_check = nb_api.ipam.vrfs.filter(
-                                    name=vrf_name,
-                                    rd=device_rd,
-                                )
-                                for vrf in vrf_check:
-                                    if not vrf.rd:
-                                        vrf_id = vrf.id
-                                    if not vrf_id:
-                                        vrf_check = None
-                            if vrf_check:
-                                is_vrf_exists = True
-                    else:
-                        vrf_check = nb_api.ipam.vrfs.filter(
-                            name=vrf_name,
-                            rd=device_rd,
-                        )
-                        if vrf_check:
-                            is_vrf_exists = True
-                            nb_vrfs = nb_api.ipam.vrfs.all()
-                            existing_vrf_dict = {}
-                            for r in nb_vrfs:
-                                existing_vrf_dict.update({f'{r.name}': r})
-                            nb_vrfs_assign = nb_api.ipam.vrfs.filter(
-                                device=netbox_device.id
-                            )
-                            vrf_assign = [
-                                str(nb_vrf_assign.name) for nb_vrf_assign in nb_vrfs_assign
-                            ]
-                    if not is_vrf_exists:
-                        if not vrf_check:
-                            nb_api.ipam.vrfs.create(
-                                name=vrf_name,
-                                rd=device_rd,
-                                description=f'discovered from device',
-                            )
-                            nb_vrfs = nb_api.ipam.vrfs.all()
-                            existing_vrf_dict = {}
-                            for r in nb_vrfs:
-                                existing_vrf_dict.update({f'{r.name}': r})
-                            nb_vrfs_assign = nb_api.ipam.vrfs.filter(
-                                device=netbox_device.id
-                            )
-                            vrf_assign = [
-                                str(nb_vrf_assign.name) for nb_vrf_assign in nb_vrfs_assign
-                            ]
-                except pynautobot.core.query.RequestError as e:
-                    print(f"Ошибка при создании/обновлении VRF {vrf_name} на устройстве {netbox_device.name}: {e}")
-
-                evpn_var = True if 'evpn' in netmiko_vrfs_show_run['evpn'] else False
-                evpn_var_exist = False
-                if existing_vrf_dict.get(vrf_name).custom_fields.get('evpn') != evpn_var:
-                    evpn_var_exist = True
-
-                rt_import_values = netmiko_vrfs_show_run.get('rt_import', [])
-                try:
-                    rt_import_exist = [
-                        nb_import_targets.name for nb_import_targets in existing_vrf_dict.get(vrf_name).import_targets
-                    ]
-                except:
-                    rt_import_exist = []
-                set_rt_import_values = set(rt_import_values)
-                set_rt_import_exist = set(rt_import_exist)
-                set_rt_import_values.difference_update(set_rt_import_exist)
-
-                rt_export_values = netmiko_vrfs_show_run.get('rt_export', [])
-                try:
-                    rt_export_exist = [
-                        nb_export_targets.name for nb_export_targets in existing_vrf_dict.get(vrf_name).export_targets
-                    ]
-                except:
-                    rt_export_exist = []
-                set_rt_export_values = set(rt_export_values)
-                set_rt_export_exist = set(rt_export_exist)
-                set_rt_export_values.difference_update(set_rt_export_exist)
-
-                if not isinstance(rt_import_values, list) or not isinstance(rt_export_values, list):
-                    raise ValueError(f"Неверный формат import/export для VRF {vrf_name}, {netbox_device}")
-
-                combined_values_set = set(rt_import_values) | set(rt_export_values)
-                combined_values_set.difference_update(set_nb_rt_names)
-                if combined_values_set:
-                    combined_values_list = list(combined_values_set)
-                    for rt_create_candidate in combined_values_list:
-                        try:
-                            nb_api.ipam.route_targets.create(name=rt_create_candidate)
-                        except Exception as e:
-                            print(f'Ошибка при работе с Route Target {rt_create_candidate}: {e}, {netbox_device}')
-
-                if vrf_id:
-                    netbox_vrf_for_update = nb_api.ipam.vrfs.get(
-                        id=vrf_id
-                    )
-                else:
-                    netbox_vrf_for_update = nb_api.ipam.vrfs.get(
-                        name=vrf_name,
-                        rd=device_rd
-                    )
-
-
-                if vrf_name not in vrf_assign:
-                    nb_api.ipam.vrf_device_assignments.create(
-                        vrf=netbox_vrf_for_update.id,
-                        device=netbox_device.id
-                    )
-
-                if set_rt_export_values or set_rt_import_values or evpn_var_exist:
-                    update_route_targets(rt_import_values, rt_export_values, nb_api, netbox_vrf_for_update, evpn_var)
-            except Exception as error:
-                logger.error(f'SCRIPT {netbox_device} - {error} - {netmiko_vrfs_show_run}')
-
-        set_vrf_assign = set(vrf_assign)
-        set_device_vrfs_names = set(device_vrfs_names)
-        set_vrf_assign.difference_update(set_device_vrfs_names)
-
-        if set_vrf_assign:
-            for candidate in set_vrf_assign:
-                assign_vrf_for_del = nb_api.ipam.vrf_device_assignments.get(device=netbox_device.name, name=candidate)
-                if assign_vrf_for_del:
-                    assign_vrf_for_del.delete()
-
-        logger.info('End create %s', netbox_device.name)
-    except Exception as exc:
-        logger.error('%s: %s', netbox_device.name, exc)
-
-
-def add_vrf_to_netbox_for_one_device(device_name: str):
-    start_time = time.time()
-
-    api = get_nautobot_api()
-    device = api.dcim.devices.get(name=device_name.upper())
-
-    if device.platform.name == 'Cisco IOS':
-        create_vrf_netbox_on_cisco_ios(
-            device,
-            api
-        )
-
-    elif device.platform.name == 'Cisco NXOS':
-        create_vrf_netbox_on_cisco_nxos(
-            device,
-            api
-        )
-
-    print("--- %s seconds ---" % (time.time() - start_time))
-
-
-def main():
-    start = time.time()
-    api = get_nautobot_api()
-
-    # Строим мапу тегов
-    all_tags = list(api.extras.tags.all())
-    tag_map = {t.id: t.name for t in all_tags}
-
-    # Фильтруем нужные устройства
-    devices = list(api.dcim.devices.all())
-    targets = []
-    for dev in devices:
-        names = [tag_map.get(t.id) for t in (dev.tags or [])]
-        if 'raif_scripts' in names:
-            if 'scope_BRANCH' in names:
-                continue
-            else:
-                targets.append(dev)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-        for dev in targets:
-            if dev.platform.name == 'Cisco IOS':
-                executor.submit(create_vrf_netbox_on_cisco_ios, dev, api)
-            elif dev.platform.name == 'Cisco NXOS':
-                executor.submit(create_vrf_netbox_on_cisco_nxos, dev, api)
-
-
-#
-    logger.info('Elapsed time: %.2f sec', time.time() - start)
-
-
-if __name__ == "__main__":
-    main()
+Update Device Nautobot:
+  stage: update_scripts
+  image: artifactory.raiffeisen.ru/ext-devops-community-docker/ansible:8.1.0
+  environment:
+    name: main
+  script:
+    - "ansible-playbook -v run_scripts_nautobot.yaml -e SCRIPT_NAME=get_device.py -e ansible_password=$ANSIBLE_PASSWORD"
+  only:
+    refs:
+      - main
+  when: manual

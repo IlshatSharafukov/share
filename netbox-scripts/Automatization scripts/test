@@ -39,8 +39,11 @@ def get_vrf_details(api, vrf):
         devices.append(device.name)
     
     # Получаем префиксы, привязанные к VRF
-    prefixes = api.ipam.prefixes.filter(vrf=vrf.id)
-    prefix_list = [str(prefix.prefix) for prefix in prefixes]
+    prefix_assignments = api.ipam.prefix_vrf_assignments.filter(vrf=vrf.id)
+    prefix_list = []
+    for assignment in prefix_assignments:
+        prefix = api.ipam.prefixes.get(id=assignment.prefix.id)
+        prefix_list.append(str(prefix.prefix))
     
     return {
         'devices': devices,
@@ -52,7 +55,7 @@ def get_vrf_details(api, vrf):
 
 def find_duplicate_vrfs():
     """
-    Находит все VRF с дублированными именами (3+ раза) в Nautobot
+    Находит все VRF с дублированными именами (3+ раза) в Nautobot и удаляет те, что без привязок
     """
     print("Подключаемся к Nautobot...")
     api = get_nautobot_api()
@@ -82,6 +85,7 @@ def find_duplicate_vrfs():
     print("=" * 80)
     
     total_problem_vrfs = 0
+    deleted_vrfs = 0
     
     for vrf_name, count in problem_duplicates.items():
         print(f"\n🔴 VRF '{vrf_name}' встречается {count} раз:")
@@ -92,6 +96,7 @@ def find_duplicate_vrfs():
         
         vrfs_with_devices = 0
         vrfs_with_prefixes = 0
+        vrfs_to_delete = []
         
         for i, vrf in enumerate(duplicate_vrfs, 1):
             print(f"\n  {i}. ID: {vrf.id}")
@@ -114,13 +119,29 @@ def find_duplicate_vrfs():
                     print(f"        ... и еще {details['prefix_count'] - 5} префиксов")
             else:
                 print(f"     ❌ Не содержит префиксы")
+            
+            # Если нет привязок к устройствам и префиксам - помечаем на удаление
+            if details['device_count'] == 0 and details['prefix_count'] == 0:
+                vrfs_to_delete.append(vrf)
+                print(f"     🗑️  ПОМЕЧЕН НА УДАЛЕНИЕ (нет привязок)")
         
+        # Удаляем VRF без привязок
+        for vrf in vrfs_to_delete:
+            try:
+                print(f"     🗑️  Удаляем VRF ID: {vrf.id}")
+                vrf.delete()
+                deleted_vrfs += 1
+                print(f"     ✅ VRF ID: {vrf.id} успешно удален")
+            except Exception as e:
+                print(f"     ❌ Ошибка при удалении VRF ID: {vrf.id}: {e}")
+        
+        remaining_count = count - len(vrfs_to_delete)
         print(f"\n  📊 Статистика по VRF '{vrf_name}':")
-        print(f"     - Всего дублей: {count}")
+        print(f"     - Всего дублей было: {count}")
+        print(f"     - Удалено без привязок: {len(vrfs_to_delete)}")
+        print(f"     - Осталось: {remaining_count}")
         print(f"     - С привязкой к устройствам: {vrfs_with_devices}")
         print(f"     - С префиксами: {vrfs_with_prefixes}")
-        print(f"     - Без привязок: {count - vrfs_with_devices}")
-        print(f"     - Без префиксов: {count - vrfs_with_prefixes}")
         
         print("-" * 80)
     
@@ -128,7 +149,13 @@ def find_duplicate_vrfs():
     print(f"Всего VRF в системе: {len(all_vrfs)}")
     print(f"Дублей с 2 вхождениями (норма): {len(two_duplicates)} имен = {len(two_duplicates) * 2} VRF")
     print(f"Проблемных дублей (3+ раза): {len(problem_duplicates)} имен = {total_problem_vrfs} VRF")
-    print(f"Нужно исправить: {total_problem_vrfs - len(problem_duplicates)} лишних VRF")
+    print(f"🗑️  Удалено VRF без привязок: {deleted_vrfs}")
+    print(f"⚠️  Осталось проблемных VRF: {total_problem_vrfs - deleted_vrfs}")
+    
+    if deleted_vrfs > 0:
+        print(f"\n✅ Очистка завершена! Удалено {deleted_vrfs} VRF без привязок.")
+    else:
+        print(f"\n⚠️  Все найденные дублированные VRF имеют привязки - ручная очистка требуется.")
 
 
 if __name__ == "__main__":

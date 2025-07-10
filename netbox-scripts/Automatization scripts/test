@@ -1,69 +1,438 @@
-- name: Deliver Nautobot scripts
-  hosts: s-msk-p-scripter-x5
-  become: True
-  vars:
-    ansible_password:                 "{{ ansible_password }}"
-    ansible_become_pass:              "{{ ansible_password }}"
-    ansible_user:                     "srv-gtsprm-g"
-    local_source_dir:                 "nautobot_network_scanner/"
-    remote_target_dir:                "/usr/local/nautobot-ci"
-  tasks:
-    - name: Transfer Nautobot Scripts
-      block:
-        - name: Archive the Nautobot Scripts directory
-          archive:
-            path: "{{ local_source_dir }}/"
-            dest: "{{ remote_target_dir }}.tar.gz"
-            format: gz
-          delegate_to: localhost
-          become: false
-        - name: Copy Nautobot scripts folder
-          block:
-            - name: Remove old Nautobot libs folder
-              file:
-                path: "{{ remote_target_dir }}"
-                state: absent
-            - name: Ensure the Nautobot destination directory exists
-              file:
-                path: "{{ remote_target_dir }}"
-                state: directory
-                mode: '0755'
-              become: yes
-            - name: Unpack the Nautobot archive on the remote machine
-              unarchive:
-                src: "{{ remote_target_dir }}.tar.gz"
-                dest: "{{ remote_target_dir }}"
-            - name: Change Group of Nautobot Scripts Folder Recursively
-              file:
-                path: "{{ remote_target_dir }}"
-                group: "root"
-                recurse: yes
-            - name: Create Nautobot .env file
-              copy:
-                content: |
-                  HPNA_LOGIN='{{ HPNA_LOGIN }}'
-                  HPNA_PASSWORD='{{ HPNA_PASSWORD }}'
-                  NAUTOBOT_URL='{{ NAUTOBOT_URL }}'
-                  NAUTOBOT_TOKEN='{{ NAUTOBOT_TOKEN }}'
-                  HPNA_WEB_LOGIN='{{ HPNA_WEB_LOGIN }}'
-                  HPNA_WEB_PASSWORD='{{ HPNA_WEB_PASSWORD }}'
-                dest: "{{ remote_target_dir }}/.env"
-                mode: '0755'
-        - name: Ensure Nautobot cron jobs are present
-          cron:
-            name: "{{ item.name }}"
-            user: "{{ item.user }}"
-            minute: "{{ item.minute }}"
-            hour: "{{ item.hour }}"
-            job: "{{ item.job }}"
-            state: present
-          with_items:
-            - { name: "Nautobot Update Device", user: "root", minute: "5", hour: "0", job: "python3 /usr/local/nautobot-ci/get_device.py > /var/log/script_logs/nautobot_get_device.log 2>&1" }
-            - { name: "Nautobot Update VRF", user: "root", minute: "35", hour: "0", job: "python3 /usr/local/nautobot-ci/get_vrf.py > /var/log/script_logs/nautobot_get_vrf.log 2>&1" }
-            - { name: "Nautobot Update VLAN", user: "root", minute: "20", hour: "*/1", job: "python3 /usr/local/nautobot-ci/get_vlan.py > /var/log/script_logs/nautobot_get_vlan.log 2>&1" }
-            - { name: "Nautobot Update VNI", user: "root", minute: "35", hour: "1", job: "python3 /usr/local/nautobot-ci/get_vni_fabric.py > /var/log/script_logs/nautobot_get_vni_fabric.log 2>&1" }
-            - { name: "Nautobot Update Inventory", user: "root", minute: "5", hour: "2", job: "python3 /usr/local/nautobot-ci/get_inventory.py > /var/log/script_logs/nautobot_get_inventory.log 2>&1" }
-            - { name: "Nautobot Update Prefix", user: "root", minute: "35", hour: "2", job: "python3 /usr/local/nautobot-ci/get_prefix.py > /var/log/script_logs/nautobot_get_prefix.log 2>&1" }
-            - { name: "Nautobot Update ARP", user: "root", minute: "50", hour: "*/2", job: "python3 /usr/local/nautobot-ci/get_arp.py > /var/log/script_logs/nautobot_get_arp.log 2>&1" }
-            - { name: "Nautobot Update Interface", user: "root", minute: "35", hour: "3", job: "python3 /usr/local/nautobot-ci/get_interface.py > /var/log/script_logs/nautobot_get_interface.log 2>&1" }
-            - { name: "Nautobot Update Vlans on interfaces", user: "root", minute: "5", hour: "4", job: "python3 /usr/local/nautobot-ci/get_vlans_on_interface.py > /var/log/script_logs/nautobot_get_vlans_on_interface.log 2>&1" }
+import requests
+from decouple import config
+import pynautobot
+import urllib3
+import re
+import time
+import concurrent.futures
+from ntc_templates.parse import parse_output
+from netmiko import ConnectHandler
+import logging
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+logger = logging.getLogger()
+
+DEVICE_AUTH_USERNAME = config('DEVICE_AUTH_USERNAME')
+DEVICE_AUTH_PASSWORD = config('DEVICE_AUTH_PASSWORD')
+NAUTOBOT_URL = config('NAUTOBOT_URL')
+NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
+
+
+def multiple_replace(target_str, replace_values):
+    for i, j in replace_values.items():
+        target_str = target_str.replace(i, j)
+    return target_str
+
+
+def get_nautobot_api():
+    """
+    Возвращает клиент pynautobot с увеличенным пулом соединений.
+    """
+    api = pynautobot.api(
+        NAUTOBOT_URL,
+        token=NAUTOBOT_TOKEN,
+        verify=False,
+    )
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=1000,
+        pool_maxsize=1000
+    )
+    api.http_session.mount('http://', adapter)
+    api.http_session.mount('https://', adapter)
+    api.http_session.verify = False
+    return api
+
+
+def netmiko_connect(netbox_device, device_type):
+    netmiko_device = {
+        'device_type': device_type,
+        'host': str(netbox_device.primary_ip4)[:-3:],
+        'username': config('DEVICE_AUTH_USERNAME'),
+        'password': config('DEVICE_AUTH_PASSWORD'),
+        'timeout': 200,
+        'port': 22,
+        "global_delay_factor": 2,
+        'conn_timeout': 200
+    }
+
+    try:
+        net_connect = ConnectHandler(**netmiko_device)
+    except Exception as error:
+        try:
+            net_connect = ConnectHandler(**netmiko_device)
+        except:
+            logger.error(f"Failed to connect {netbox_device} unknown error, check connect parameters")
+            return
+
+    return net_connect
+
+
+def add_vl_to_interface_to_netbox_cisco_ios(netbox_device, netbox_api):
+    net_connect = netmiko_connect(netbox_device, 'cisco_ios')
+    output = net_connect.send_command('show interface switchport', read_timeout=200)
+    net_connect.disconnect()
+    if len(output) == 0:
+        return
+
+    try:
+        replace_values = {"Gi": "GigabitEthernet", "Te": "TenGigabitEthernet", "Po": "Port-channel",
+                          "Fa": "FastEthernet", "Hu": "HundredGigE",
+                          "Twe": "TwentyFiveGigE"}
+
+        output_filter = multiple_replace(output, replace_values)
+
+        netmiko_interfaces_vlan = parse_output(platform='cisco_ios', command='show interface switchport',
+                                               data=output_filter)
+
+        interface_netbox = tuple(netbox_api.dcim.interfaces.filter(device_id=netbox_device.id))
+
+        netm_interface = set([interface['interface'] for interface in netmiko_interfaces_vlan])
+        nautob_interface = set(interface.name for interface in interface_netbox)
+        nautob_interface.difference_update(netm_interface)
+
+        change_interface = []
+
+        for interface in nautob_interface:
+            if any(substring in interface for substring in ('Vlan', 'loopback', 'mgmt')):
+                continue
+            else:
+                interface_nb = netbox_api.dcim.interfaces.get(device=netbox_device.id, name=interface)
+                change_interface.append({
+                    'id': interface_nb.id,
+                    'tagged_vlans': [],
+                    'untagged_vlan': None,
+                    'mode': None
+                })
+
+        if change_interface:
+            netbox_api.dcim.interfaces.update(change_interface)
+
+        device_rels = netbox_api.extras.relationship_associations.filter(
+            relationship='devices_vlans',
+            destination_id=netbox_device.id
+        )
+
+        vlans_dict = {}
+
+        for relationship in device_rels:
+            vid = int(relationship.display.split(' (')[1].split(')')[0])
+            vlans_dict[vid] = relationship.source_id
+
+        update_interface = []
+
+        for interfaces_vlan in netmiko_interfaces_vlan:
+            for interface_netbox_filter in interface_netbox:
+                if interfaces_vlan['interface'] == str(interface_netbox_filter):
+                    if interfaces_vlan['admin_mode'] == 'static access':
+                        untagged_vlan = vlans_dict.get(int(interfaces_vlan['access_vlan']))
+                        update_interface.append({
+                            'id': interface_netbox_filter.id,
+                            "name": interfaces_vlan['interface'],
+                            "mode": 'access',
+                            "untagged_vlan": untagged_vlan
+                        })
+                        continue
+
+                    elif interfaces_vlan['admin_mode'] == 'trunk' and len(interfaces_vlan['trunking_vlans']) != 0:
+                        if interfaces_vlan['trunking_vlans'][0] == 'ALL':
+                            tag_vlan_id = []
+                            for vid, vid_id in vlans_dict.items():
+                                tag_vlan_id.append(vid_id)
+
+                            update_interface.append({
+                                'id': interface_netbox_filter.id,
+                                "name": interfaces_vlan['interface'],
+                                "mode": 'tagged',
+                                "tagged_vlans": tag_vlan_id
+                            })
+
+                    elif interfaces_vlan['admin_mode'] == 'trunk' and len(interfaces_vlan['trunking_vlans']) != 0:
+                        vlans = ','.join(interfaces_vlan['trunking_vlans'])
+                        vlan = re.split(r',', vlans)
+                        del_vlan = []
+                        for vlan_split in vlan:
+                            if '-' in str(vlan_split):
+                                start, end = map(int, vlan_split.split('-'))
+                                for i in range(start, end + 1):
+                                    vlan.append(str(i))
+                                del_vlan.append(vlan_split)
+                        for del_vl in del_vlan:
+                            vlan.remove(del_vl)
+
+                        tag_vlan_id = []
+
+                        for tagged_vlan in vlan:
+                            test = vlans_dict.get(int(tagged_vlan), None)
+                            if test is not None:
+                                tag_vlan_id.append(test)
+
+                        update_interface.append({
+                            'id': interface_netbox_filter.id,
+                            "name": interfaces_vlan['interface'],
+                            "mode": 'tagged',
+                            "tagged_vlans": tag_vlan_id
+                        })
+
+        if update_interface:
+            netbox_api.dcim.interfaces.update(update_interface)
+
+    except Exception as error:
+        logger.error(f'UNKNOWN {netbox_device}. Check your script logic. {error}')
+
+    logger.info(f'END SCRIPT {netbox_device}')
+
+
+def add_vl_to_interface_to_netbox_cisco_nxos(netbox_device, netbox_api):
+    logger.info('Start syncing %s', netbox_device.name)
+
+    net_connect = netmiko_connect(netbox_device, 'cisco_nxos')
+    output = net_connect.send_command('show interface switchport', read_timeout=200)
+    net_connect.disconnect()
+    if len(output) == 0:
+        return
+
+    try:
+
+        netmiko_interfaces_vlan = parse_output(platform='cisco_nxos', command='show interface switchport', data=output)
+
+        interface_netbox = tuple(netbox_api.dcim.interfaces.filter(device_id=netbox_device.id))
+        netm_interface = set([interface['interface'] for interface in netmiko_interfaces_vlan])
+        nautob_interface = set(interface.name for interface in interface_netbox)
+        nautob_interface.difference_update(netm_interface)
+
+        change_interface = []
+
+        for interface in nautob_interface:
+            if any(substring in interface for substring in ('Vlan', 'loopback', 'mgmt', 'nve')):
+                continue
+            else:
+                interface_nb = netbox_api.dcim.interfaces.get(device=netbox_device.id, name=interface)
+                change_interface.append({
+                    'id': interface_nb.id,
+                    'tagged_vlans': [],
+                    'untagged_vlan': None,
+                    'mode': None
+                })
+
+        if change_interface:
+            netbox_api.dcim.interfaces.update(change_interface)
+
+        device_rels = netbox_api.extras.relationship_associations.filter(
+            relationship='devices_vlans',
+            destination_id=netbox_device.id
+        )
+
+        vlans_dict = {}
+        for relationship in device_rels:
+            vid = int(relationship.display.split(' (')[1].split(')')[0])
+            vlans_dict[vid] = relationship.source_id
+        update_interface = []
+        # for vlan in interface_netbox[0].tagged_vlans:
+        #     print(vlan.id)
+        for interfaces_vlan in netmiko_interfaces_vlan:
+            for interface_netbox_filter in interface_netbox:
+                if interfaces_vlan['interface'] == str(interface_netbox_filter):
+                    if interfaces_vlan['mode'] == 'access':
+                        untagged_vlan = vlans_dict.get(int(interfaces_vlan['access_vlan']))
+                        update_interface.append({
+                            'id': interface_netbox_filter.id,
+                            "name": interfaces_vlan['interface'],
+                            "mode": 'access',
+                            "untagged_vlan": untagged_vlan
+                        })
+                        continue
+
+                    elif interfaces_vlan['mode'] == 'trunk' and interfaces_vlan['trunking_vlans'][0] == '1-4094':
+                        tag_vlan_id = []
+                        for vid, vid_id in vlans_dict.items():
+                            tag_vlan_id.append(vid_id)
+
+                        update_interface.append({
+                            'id': interface_netbox_filter.id,
+                            "name": interfaces_vlan['interface'],
+                            "mode": 'tagged',
+                            "tagged_vlans": tag_vlan_id
+                        })
+
+                    elif interfaces_vlan['mode'] == 'trunk':
+                        vlans = ','.join(interfaces_vlan['trunking_vlans'])
+                        vlan = re.split(r',', vlans)
+                        del_vlan = []
+                        for vlan_split in vlan:
+                            if '-' in str(vlan_split):
+                                start, end = map(int, vlan_split.split('-'))
+                                for i in range(start, end + 1):
+                                    vlan.append(str(i))
+                                del_vlan.append(vlan_split)
+                        for del_vl in del_vlan:
+                            vlan.remove(del_vl)
+                        tag_vlan_id = []
+
+                        if vlan[0] != 'none':
+                            for tagged_vlan in vlan:
+                                test = vlans_dict.get(int(tagged_vlan), None)
+                                if test is not None:
+                                    tag_vlan_id.append(test)
+
+                        update_interface.append({
+                            'id': interface_netbox_filter.id,
+                            "name": interfaces_vlan['interface'],
+                            "mode": 'tagged',
+                            "tagged_vlans": tag_vlan_id
+                        })
+
+        #print(update_interface)
+        #if update_interface:
+            #netbox_api.dcim.interfaces.update(update_interface)
+
+        if update_interface:
+            netbox_api.dcim.interfaces.update(update_interface)
+
+    except Exception as error:
+        logger.error(f'UNKNOWN {netbox_device}. Check your script logic. {error}')
+
+    logger.info(f'END SCRIPT {netbox_device}')
+
+
+def add_vl_to_interface_to_netbox_ruijie(netbox_device, netbox_api):
+    net_connect = netmiko_connect(netbox_device, 'cisco_ios')
+    output = net_connect.send_command('show interface switchport', read_timeout=200)
+    net_connect.disconnect()
+    if len(output) == 0:
+        return
+
+    try:
+        netmiko_interfaces_vlan = parse_output(platform='qsw', command='show interfaces switchport', data=output)
+
+        interface_netbox = tuple(netbox_api.dcim.interfaces.filter(device_id=netbox_device.id))
+
+        netm_interface = set([interface['interface'] for interface in netmiko_interfaces_vlan])
+        nautob_interface = set(interface.name for interface in interface_netbox)
+        nautob_interface.difference_update(netm_interface)
+
+        change_interface = []
+
+        for interface in nautob_interface:
+            if any(substring in interface for substring in ('Vlan', 'loopback', 'mgmt')):
+                continue
+            else:
+                interface_nb = netbox_api.dcim.interfaces.get(device=netbox_device.id, name=interface)
+                change_interface.append({
+                    'id': interface_nb.id,
+                    'tagged_vlans': [],
+                    'untagged_vlan': None,
+                    'mode': None
+                })
+
+        if change_interface:
+            netbox_api.dcim.interfaces.update(change_interface)
+
+        device_rels = netbox_api.extras.relationship_associations.filter(
+            relationship='devices_vlans',
+            destination_id=netbox_device.id
+        )
+
+        vlans_dict = {}
+        for relationship in device_rels:
+            vid = int(relationship.display.split(' (')[1].split(')')[0])
+            vlans_dict[vid] = relationship.source_id
+
+        update_interface = []
+
+        for interfaces_vlan in netmiko_interfaces_vlan:
+            for interface_netbox_filter in interface_netbox:
+                if interfaces_vlan['interface'] == str(interface_netbox_filter):
+                    if interfaces_vlan['admin_mode'] == 'ACCESS':
+                        if interfaces_vlan['access_vlan'] == '1':
+                            continue
+                        else:
+                            untagged_vlan = vlans_dict.get(int(interfaces_vlan['access_vlan']))
+                            update_interface.append({
+                                'id': interface_netbox_filter.id,
+                                "name": interfaces_vlan['interface'],
+                                "mode": 'access',
+                                "untagged_vlan": untagged_vlan
+                            })
+                            continue
+                    elif interfaces_vlan['admin_mode'] == 'TRUNK' and interfaces_vlan['trunking_vlans'][0] == 'ALL':
+                        tag_vlan_id = []
+                        for vid, vid_id in vlans_dict.items():
+                            tag_vlan_id.append(vid_id)
+
+                        update_interface.append({
+                            'id': interface_netbox_filter.id,
+                            "name": interfaces_vlan['interface'],
+                            "mode": 'tagged',
+                            "tagged_vlans": tag_vlan_id
+                        })
+                    elif interfaces_vlan['admin_mode'] == 'TRUNK':
+                        vlans = ','.join(interfaces_vlan['trunking_vlans'])
+                        vlan = re.split(r',', vlans)
+                        del_vlan = []
+                        for vlan_split in vlan:
+                            if '-' in str(vlan_split):
+                                start, end = map(int, vlan_split.split('-'))
+                                for i in range(start, end + 1):
+                                    vlan.append(str(i))
+                                del_vlan.append(vlan_split)
+                        for del_vl in del_vlan:
+                            vlan.remove(del_vl)
+                        tag_vlan_id = []
+                        for tagged_vlan in vlan:
+                            test = vlans_dict.get(int(tagged_vlan), None)
+                            if test is not None:
+                                tag_vlan_id.append(test)
+
+                        update_interface.append({
+                            'id': interface_netbox_filter.id,
+                            "name": interfaces_vlan['interface'],
+                            "mode": 'tagged',
+                            "tagged_vlans": tag_vlan_id
+                        })
+
+        if update_interface:
+            netbox_api.dcim.interfaces.update(update_interface)
+    except Exception as error:
+        logger.error(f'UNKNOWN {netbox_device}. Check your script logic. {error}')
+
+    logger.info(f'END SCRIPT {netbox_device}')
+
+
+def add_interface_vlans_to_netbox():
+    start = time.time()
+    api = get_nautobot_api()
+
+    # Строим мапу тегов
+    all_tags = list(api.extras.tags.all())
+    tag_map = {t.id: t.name for t in all_tags}
+
+    # Фильтруем нужные устройства
+    devices = list(api.dcim.devices.all())
+    targets = []
+    for dev in devices:
+        names = [tag_map.get(t.id) for t in (dev.tags or [])]
+        if 'raif_scripts' in names:
+            if 'scope_BRANCH' in names:
+                continue
+            else:
+                targets.append(dev)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        for dev in targets:
+            #if dev.name == 'MX-MSKD8-7704':
+                if dev.platform.name == 'Cisco NXOS':
+                    executor.submit(add_vl_to_interface_to_netbox_cisco_nxos, dev, api)
+                elif dev.platform.name == 'Cisco IOS':
+                    executor.submit(add_vl_to_interface_to_netbox_cisco_ios, dev, api)
+                elif dev.platform.name == 'Ruijie RG':
+                    executor.submit(add_vl_to_interface_to_netbox_ruijie, dev, api)
+
+    logger.info('Elapsed time: %.2f sec', time.time() - start)
+
+
+if __name__ == "__main__":
+    add_interface_vlans_to_netbox()

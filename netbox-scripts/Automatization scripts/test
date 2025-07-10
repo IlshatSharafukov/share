@@ -85,12 +85,13 @@ def get_or_create_vrf(nb_api, vrf_name, device_rd):
         existing_vrf = nb_api.ipam.vrfs.get(name=vrf_name, rd=device_rd)
         if existing_vrf:
             return existing_vrf
-    except pynautobot.core.query.MultipleObjectsReturned:
-        # Если найдено несколько - берем первый
-        existing_vrfs = nb_api.ipam.vrfs.filter(name=vrf_name, rd=device_rd)
-        if existing_vrfs:
-            return existing_vrfs[0]
-    except:
+    except Exception as e:
+        # Если get() вернул ошибку (например, множественные результаты), используем filter()
+        if 'more than one result' in str(e).lower():
+            existing_vrfs = nb_api.ipam.vrfs.filter(name=vrf_name, rd=device_rd)
+            if existing_vrfs:
+                logger.warning(f'Found multiple VRF with name={vrf_name}, rd={device_rd}. Using first one.')
+                return existing_vrfs[0]
         # VRF не найден, продолжаем к созданию
         pass
 

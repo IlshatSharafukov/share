@@ -1,15 +1,51 @@
+import concurrent.futures
+import time
 import pynautobot
 import requests
-from collections import Counter
-from decouple import config
+from netmiko import ConnectHandler
 import urllib3
+from decouple import config
+from netmiko.exceptions import NetMikoTimeoutException, NetMikoAuthenticationException
+from ntc_templates.parse import parse_output
+import logging
+
+# Отключаем предупреждения InsecureRequestWarning
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-
 # Константы из окружения
+DEVICE_AUTH_USERNAME = config('DEVICE_AUTH_USERNAME')
+DEVICE_AUTH_PASSWORD = config('DEVICE_AUTH_PASSWORD')
 NAUTOBOT_URL = config('NAUTOBOT_URL')
 NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
 
+# Логгер
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+def connect_device(netbox_device, device_type):
+    params = {
+        'device_type': device_type,
+        'host': str(netbox_device.primary_ip4)[:-3:],
+        'username': config('DEVICE_AUTH_USERNAME'),
+        'password': config('DEVICE_AUTH_PASSWORD'),
+        'timeout': 200,
+        'port': 22,
+        "global_delay_factor": 2,
+        'conn_timeout': 200
+    }
+
+    try:
+        return ConnectHandler(**params)
+    except Exception:
+        # Пробуем ещё раз
+        try:
+            return ConnectHandler(**params)
+        except Exception:
+            logger.error('Connection error: %s', netbox_device.name)
+            return None
 
 def get_nautobot_api():
     """
@@ -30,136 +66,317 @@ def get_nautobot_api():
     return api
 
 
-def get_vrf_details(api, vrf):
-    """
-    Получает детальную информацию о VRF: устройства и префиксы
-    """
-    # Получаем привязки к устройствам
-    device_assignments = api.ipam.vrf_device_assignments.filter(vrf=vrf.id)
-    devices = []
-    for assignment in device_assignments:
-        device = api.dcim.devices.get(id=assignment.device.id)
-        devices.append(device.name)
+def update_route_targets(rt_import_values, rt_export_values, nb_api, netbox_vrf_for_update, evpn_var):
+    update_list_import = [nb_api.ipam.route_targets.get(name=str(rt)).id for rt in rt_import_values]
+    netbox_vrf_for_update.update({'import_targets': update_list_import})
 
-    # Получаем префиксы, привязанные к VRF
-    prefix_assignments = api.ipam.vrf_prefix_assignments.filter(vrf=vrf.id)
-    prefix_list = []
-    for assignment in prefix_assignments:
-        prefix = api.ipam.prefixes.get(id=assignment.prefix.id)
-        prefix_list.append(str(prefix.prefix))
+    update_list_export = [nb_api.ipam.route_targets.get(name=str(rt)).id for rt in rt_export_values]
+    netbox_vrf_for_update.update({'export_targets': update_list_export})
 
-    return {
-        'devices': devices,
-        'prefixes': prefix_list,
-        'device_count': len(devices),
-        'prefix_count': len(prefix_list)
-    }
+    netbox_vrf_for_update.update({'custom_fields': {'evpn': evpn_var}})
 
-
-def find_duplicate_vrfs():
+def get_or_create_vrf(nb_api, vrf_name, device_rd):
     """
-    Находит все VRF с дублированными именами (3+ раза) в Nautobot и удаляет те, что без привязок
+    Ищет VRF по name + RD в глобальной базе. Если не найден - создает.
+    Возвращает объект VRF.
     """
-    print("Подключаемся к Nautobot...")
+    try:
+        # Ищем VRF в глобальной базе по name + RD
+        existing_vrf = nb_api.ipam.vrfs.get(name=vrf_name, rd=device_rd)
+        if existing_vrf:
+            return existing_vrf
+    except pynautobot.core.query.MultipleObjectsReturned:
+        # Если найдено несколько - берем первый
+        existing_vrfs = nb_api.ipam.vrfs.filter(name=vrf_name, rd=device_rd)
+        if existing_vrfs:
+            return existing_vrfs[0]
+    except:
+        # VRF не найден, продолжаем к созданию
+        pass
+
+    # VRF не существует - создаем новый
+    try:
+        new_vrf = nb_api.ipam.vrfs.create(
+            name=vrf_name,
+            rd=device_rd,
+            description=f'discovered from device',
+        )
+        logger.info(f'Created new VRF: {vrf_name} with RD: {device_rd}')
+        return new_vrf
+    except Exception as e:
+        logger.error(f"Ошибка при создании VRF {vrf_name}: {e}")
+        return None
+
+def ensure_vrf_device_assignment(nb_api, vrf_obj, device_obj):
+    """
+    Проверяет существование привязки VRF к устройству. Если нет - создает.
+    """
+    try:
+        # Проверяем существование привязки
+        existing_assignment = nb_api.ipam.vrf_device_assignments.get(
+            vrf=vrf_obj.id,
+            device=device_obj.id
+        )
+        if existing_assignment:
+            return True
+    except:
+        # Привязка не найдена
+        pass
+
+    # Создаем привязку
+    try:
+        nb_api.ipam.vrf_device_assignments.create(
+            vrf=vrf_obj.id,
+            device=device_obj.id
+        )
+        logger.info(f'Created VRF assignment: {vrf_obj.name} -> {device_obj.name}')
+        return True
+    except Exception as e:
+        logger.error(f'Ошибка при создании привязки VRF {vrf_obj.name} к {device_obj.name}: {e}')
+        return False
+
+def create_vrf_netbox_on_cisco_ios(netbox_device, nb_api):
+    try:
+        connection = connect_device(netbox_device, 'cisco_ios')  # Исправлено: было cisco_nxos
+        if not connection:
+            return
+        logger.info('Start create %s', netbox_device.name)
+        output = connection.send_command('show run | section vrf', read_timeout=200)
+        connection.disconnect()
+        device_vrfs = parse_output(
+            platform='cisco_ios',
+            command='show run vrf',
+            data=output
+        )
+
+        # Получаем все VRF назначения для текущего устройства
+        nb_vrfs_assign = nb_api.ipam.vrf_device_assignments.filter(
+            device=netbox_device.id
+        )
+        nb_rt = nb_api.ipam.route_targets.all()
+
+        vrf_assign = [str(assignment.vrf.name) for assignment in nb_vrfs_assign]
+        device_vrfs_names = [str(device_vrf_name.get('name')) for device_vrf_name in device_vrfs]
+        nb_rt_names = [str(nb_rt_name.name) for nb_rt_name in nb_rt]
+        set_nb_rt_names = set(nb_rt_names)
+
+        for netmiko_vrfs_show_run in device_vrfs:
+            try:
+                vrf_name = netmiko_vrfs_show_run.get('name')
+                if vrf_name in ['default', 'PEER-KEEPALIVE', 'VPC_KEEPALIVE']:
+                    continue
+                    
+                if netmiko_vrfs_show_run['rd'] != '':
+                    device_rd = f"*:{netmiko_vrfs_show_run['rd'].split(':')[1]}"
+                else:
+                    device_rd = None
+
+                # Этап 1: Получить или создать VRF
+                vrf_obj = get_or_create_vrf(nb_api, vrf_name, device_rd)
+                if not vrf_obj:
+                    continue
+
+                # Этап 2: Обеспечить привязку к устройству
+                ensure_vrf_device_assignment(nb_api, vrf_obj, netbox_device)
+
+                evpn_var = False
+
+                rt_import_values = netmiko_vrfs_show_run.get('rt_import', [])
+                rt_export_values = netmiko_vrfs_show_run.get('rt_export', [])
+
+                if not isinstance(rt_import_values, list) or not isinstance(rt_export_values, list):
+                    raise ValueError(f"Неверный формат import/export для VRF {vrf_name}, {netbox_device}")
+
+                # Создаем недостающие route targets
+                combined_values_set = set(rt_import_values) | set(rt_export_values)
+                combined_values_set.difference_update(set_nb_rt_names)
+
+                if combined_values_set:
+                    for rt_create_candidate in combined_values_set:
+                        try:
+                            nb_api.ipam.route_targets.create(name=rt_create_candidate)
+                        except Exception as e:
+                            logger.error(f'Ошибка при работе с Route Target {rt_create_candidate}: {e}, {netbox_device}')
+
+                # Проверяем, нужно ли обновлять route targets
+                try:
+                    current_import = [rt.name for rt in vrf_obj.import_targets] if vrf_obj.import_targets else []
+                    current_export = [rt.name for rt in vrf_obj.export_targets] if vrf_obj.export_targets else []
+                    
+                    import_changed = set(rt_import_values) != set(current_import)
+                    export_changed = set(rt_export_values) != set(current_export)
+                    
+                    if import_changed or export_changed:
+                        update_route_targets(rt_import_values, rt_export_values, nb_api, vrf_obj, evpn_var)
+                except Exception as e:
+                    logger.error(f'Ошибка при обновлении route targets для VRF {vrf_name}: {e}')
+
+            except Exception as error:
+                logger.error(f'SCRIPT {netbox_device} - {error} - {netmiko_vrfs_show_run}')
+
+        # Удаляем устаревшие привязки VRF
+        current_assignments = nb_api.ipam.vrf_device_assignments.filter(device=netbox_device.id)
+        assigned_vrf_names = [assignment.vrf.name for assignment in current_assignments]
+        
+        for assignment in current_assignments:
+            if assignment.vrf.name not in device_vrfs_names:
+                try:
+                    assignment.delete()
+                    logger.info(f'Deleted obsolete VRF assignment: {assignment.vrf.name} from {netbox_device.name}')
+                except Exception as e:
+                    logger.error(f'Ошибка при удалении устаревшей привязки {assignment.vrf.name}: {e}')
+
+        logger.info('End create %s', netbox_device.name)
+    except Exception as exc:
+        logger.error('%s: %s', netbox_device.name, exc)
+
+
+def create_vrf_netbox_on_cisco_nxos(netbox_device, nb_api):
+    try:
+        connection = connect_device(netbox_device, 'cisco_nxos')
+        if not connection:
+            return
+        logger.info('Start create %s', netbox_device.name)
+        output = connection.send_command('show run | section vrf', read_timeout=200)
+        connection.disconnect()
+        device_vrfs = parse_output(
+            platform='cisco_nxos',
+            command='show run vrf',
+            data=output
+        )
+
+        # Получаем все VRF назначения для текущего устройства
+        nb_vrfs_assign = nb_api.ipam.vrf_device_assignments.filter(
+            device=netbox_device.id
+        )
+        nb_rt = nb_api.ipam.route_targets.all()
+
+        vrf_assign = [str(assignment.vrf.name) for assignment in nb_vrfs_assign]
+        device_vrfs_names = [str(device_vrf_name.get('name')) for device_vrf_name in device_vrfs]
+        nb_rt_names = [str(nb_rt_name.name) for nb_rt_name in nb_rt]
+        set_nb_rt_names = set(nb_rt_names)
+
+        for netmiko_vrfs_show_run in device_vrfs:
+            try:
+                vrf_name = netmiko_vrfs_show_run.get('name')
+                if vrf_name in ['default', 'PEER-KEEPALIVE', 'VPC_KEEPALIVE']:
+                    continue
+                    
+                if netmiko_vrfs_show_run['rd'] != '':
+                    device_rd = f"*:{netmiko_vrfs_show_run['rd'].split(':')[1]}"
+                else:
+                    device_rd = None
+
+                # Этап 1: Получить или создать VRF
+                vrf_obj = get_or_create_vrf(nb_api, vrf_name, device_rd)
+                if not vrf_obj:
+                    continue
+
+                # Этап 2: Обеспечить привязку к устройству
+                ensure_vrf_device_assignment(nb_api, vrf_obj, netbox_device)
+
+                evpn_var = True if 'evpn' in netmiko_vrfs_show_run.get('evpn', '') else False
+
+                rt_import_values = netmiko_vrfs_show_run.get('rt_import', [])
+                rt_export_values = netmiko_vrfs_show_run.get('rt_export', [])
+
+                if not isinstance(rt_import_values, list) or not isinstance(rt_export_values, list):
+                    raise ValueError(f"Неверный формат import/export для VRF {vrf_name}, {netbox_device}")
+
+                # Создаем недостающие route targets
+                combined_values_set = set(rt_import_values) | set(rt_export_values)
+                combined_values_set.difference_update(set_nb_rt_names)
+
+                if combined_values_set:
+                    for rt_create_candidate in combined_values_set:
+                        try:
+                            nb_api.ipam.route_targets.create(name=rt_create_candidate)
+                        except Exception as e:
+                            logger.error(f'Ошибка при работе с Route Target {rt_create_candidate}: {e}, {netbox_device}')
+
+                # Проверяем, нужно ли обновлять route targets или evpn
+                try:
+                    current_import = [rt.name for rt in vrf_obj.import_targets] if vrf_obj.import_targets else []
+                    current_export = [rt.name for rt in vrf_obj.export_targets] if vrf_obj.export_targets else []
+                    current_evpn = vrf_obj.custom_fields.get('evpn', False) if vrf_obj.custom_fields else False
+                    
+                    import_changed = set(rt_import_values) != set(current_import)
+                    export_changed = set(rt_export_values) != set(current_export)
+                    evpn_changed = evpn_var != current_evpn
+                    
+                    if import_changed or export_changed or evpn_changed:
+                        update_route_targets(rt_import_values, rt_export_values, nb_api, vrf_obj, evpn_var)
+                except Exception as e:
+                    logger.error(f'Ошибка при обновлении route targets для VRF {vrf_name}: {e}')
+
+            except Exception as error:
+                logger.error(f'SCRIPT {netbox_device} - {error} - {netmiko_vrfs_show_run}')
+
+        # Удаляем устаревшие привязки VRF
+        current_assignments = nb_api.ipam.vrf_device_assignments.filter(device=netbox_device.id)
+        
+        for assignment in current_assignments:
+            if assignment.vrf.name not in device_vrfs_names:
+                try:
+                    assignment.delete()
+                    logger.info(f'Deleted obsolete VRF assignment: {assignment.vrf.name} from {netbox_device.name}')
+                except Exception as e:
+                    logger.error(f'Ошибка при удалении устаревшей привязки {assignment.vrf.name}: {e}')
+
+        logger.info('End create %s', netbox_device.name)
+    except Exception as exc:
+        logger.error('%s: %s', netbox_device.name, exc)
+
+
+def add_vrf_to_netbox_for_one_device(device_name: str):
+    start_time = time.time()
+
+    api = get_nautobot_api()
+    device = api.dcim.devices.get(name=device_name.upper())
+
+    if device.platform.name == 'Cisco IOS':
+        create_vrf_netbox_on_cisco_ios(
+            device,
+            api
+        )
+
+    elif device.platform.name == 'Cisco NXOS':
+        create_vrf_netbox_on_cisco_nxos(
+            device,
+            api
+        )
+
+    print("--- %s seconds ---" % (time.time() - start_time))
+
+
+def main():
+    start = time.time()
     api = get_nautobot_api()
 
-    print("Получаем все VRF...")
-    all_vrfs = api.ipam.vrfs.all()
+    # Строим мапу тегов
+    all_tags = list(api.extras.tags.all())
+    tag_map = {t.id: t.name for t in all_tags}
 
-    print(f"Всего найдено VRF: {len(all_vrfs)}")
-
-    # Считаем количество VRF по именам
-    vrf_names = [vrf.name for vrf in all_vrfs]
-    name_counts = Counter(vrf_names)
-
-    # Находим дубли (3+ раза)
-    problem_duplicates = {name: count for name, count in name_counts.items() if count >= 3}
-
-    # Считаем дубли которые встречаются ровно 2 раза (пропускаем)
-    two_duplicates = {name: count for name, count in name_counts.items() if count == 2}
-
-    print(f"\nДублей с 2 вхождениями (пропускаем): {len(two_duplicates)}")
-
-    if not problem_duplicates:
-        print("Проблемных дублированных VRF (3+ раза) не найдено!")
-        return
-
-    print(f"\nНайдено {len(problem_duplicates)} проблемных дублированных имен VRF (3+ раза):")
-    print("=" * 80)
-
-    total_problem_vrfs = 0
-    deleted_vrfs = 0
-
-    for vrf_name, count in problem_duplicates.items():
-        print(f"\n🔴 VRF '{vrf_name}' встречается {count} раз:")
-
-        # Получаем все VRF с этим именем
-        duplicate_vrfs = [vrf for vrf in all_vrfs if vrf.name == vrf_name]
-        total_problem_vrfs += len(duplicate_vrfs)
-
-        vrfs_with_devices = 0
-        vrfs_with_prefixes = 0
-        vrfs_to_delete = []
-
-        for i, vrf in enumerate(duplicate_vrfs, 1):
-            print(f"\n  {i}. ID: {vrf.id}")
-            print(f"     RD: {vrf.rd or 'None'}")
-            print(f"     Description: {vrf.description or 'None'}")
-
-            # Получаем детальную информацию
-            details = get_vrf_details(api, vrf)
-
-            if details['device_count'] > 0:
-                vrfs_with_devices += 1
-                print(f"     ✅ Привязан к устройствам ({details['device_count']}): {', '.join(details['devices'])}")
+    # Фильтруем нужные устройства
+    devices = list(api.dcim.devices.all())
+    targets = []
+    for dev in devices:
+        names = [tag_map.get(t.id) for t in (dev.tags or [])]
+        if 'raif_scripts' in names:
+            if 'scope_BRANCH' in names:
+                continue
             else:
-                print(f"     ❌ Не привязан к устройствам")
+                targets.append(dev)
 
-            if details['prefix_count'] > 0:
-                vrfs_with_prefixes += 1
-                print(f"     ✅ Содержит префиксы ({details['prefix_count']}): {', '.join(details['prefixes'][:5])}")
-                if details['prefix_count'] > 5:
-                    print(f"        ... и еще {details['prefix_count'] - 5} префиксов")
-            else:
-                print(f"     ❌ Не содержит префиксы")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        for dev in targets:
+            if dev.platform.name == 'Cisco IOS':
+                executor.submit(create_vrf_netbox_on_cisco_ios, dev, api)
+            elif dev.platform.name == 'Cisco NXOS':
+                executor.submit(create_vrf_netbox_on_cisco_nxos, dev, api)
 
-            # Если нет привязок к устройствам и префиксам - помечаем на удаление
-            if details['device_count'] == 0 and details['prefix_count'] == 0:
-                vrfs_to_delete.append(vrf)
-                print(f"     🗑️  ПОМЕЧЕН НА УДАЛЕНИЕ (нет привязок)")
-
-        # Удаляем VRF без привязок
-        for vrf in vrfs_to_delete:
-            try:
-                print(f"     🗑️  Удаляем VRF ID: {vrf.id}")
-                vrf.delete()
-                deleted_vrfs += 1
-                print(f"     ✅ VRF ID: {vrf.id} успешно удален")
-            except Exception as e:
-                print(f"     ❌ Ошибка при удалении VRF ID: {vrf.id}: {e}")
-
-        remaining_count = count - len(vrfs_to_delete)
-        print(f"\n  📊 Статистика по VRF '{vrf_name}':")
-        print(f"     - Всего дублей было: {count}")
-        print(f"     - Удалено без привязок: {len(vrfs_to_delete)}")
-        print(f"     - Осталось: {remaining_count}")
-        print(f"     - С привязкой к устройствам: {vrfs_with_devices}")
-        print(f"     - С префиксами: {vrfs_with_prefixes}")
-
-        print("-" * 80)
-
-    print(f"\n📈 ОБЩАЯ СТАТИСТИКА:")
-    print(f"Всего VRF в системе: {len(all_vrfs)}")
-    print(f"Дублей с 2 вхождениями (норма): {len(two_duplicates)} имен = {len(two_duplicates) * 2} VRF")
-    print(f"Проблемных дублей (3+ раза): {len(problem_duplicates)} имен = {total_problem_vrfs} VRF")
-    print(f"🗑️  Удалено VRF без привязок: {deleted_vrfs}")
-    print(f"⚠️  Осталось проблемных VRF: {total_problem_vrfs - deleted_vrfs}")
-
-    if deleted_vrfs > 0:
-        print(f"\n✅ Очистка завершена! Удалено {deleted_vrfs} VRF без привязок.")
-    else:
-        print(f"\n⚠️  Все найденные дублированные VRF имеют привязки - ручная очистка требуется.")
+    logger.info('Elapsed time: %.2f sec', time.time() - start)
 
 
 if __name__ == "__main__":
-    find_duplicate_vrfs()
+    main()

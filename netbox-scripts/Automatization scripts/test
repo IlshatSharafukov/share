@@ -1,383 +1,511 @@
-import concurrent.futures
-import time
-import pynautobot
-import requests
-from netmiko import ConnectHandler
-import urllib3
-from decouple import config
-from netmiko.exceptions import NetMikoTimeoutException, NetMikoAuthenticationException
-from ntc_templates.parse import parse_output
+import json
+import asyncio
 import logging
+from typing import Union, Dict, List, Any, Optional
 
-# Отключаем предупреждения InsecureRequestWarning
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from ttp import ttp
 
-# Константы из окружения
-DEVICE_AUTH_USERNAME = config('DEVICE_AUTH_USERNAME')
-DEVICE_AUTH_PASSWORD = config('DEVICE_AUTH_PASSWORD')
-NAUTOBOT_URL = config('NAUTOBOT_URL')
-NAUTOBOT_TOKEN = config('NAUTOBOT_TOKEN')
+from tools import (NA,
+                   settings,
+                   AsyncNetworkDevice,
+                   AsyncAPIClient,
+                   hpna_get_device_list,
+                   INTERFACE_TEMPLATE_PATH,
+                   load_template,
+                   DataNormalizer,
+                   NautobotCreatePrefixModel,
+                   Interface,
+                   PrefixInfo,
+                   VRF)
 
-# Логгер
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s'
-)
 logger = logging.getLogger(__name__)
 
-def connect_device(netbox_device, device_type):
-    params = {
-        'device_type': device_type,
-        'host': str(netbox_device.primary_ip4)[:-3:],
-        'username': config('DEVICE_AUTH_USERNAME'),
-        'password': config('DEVICE_AUTH_PASSWORD'),
-        'timeout': 200,
-        'port': 22,
-        "global_delay_factor": 2,
-        'conn_timeout': 200
-    }
+PREFIXES_TO_SKIP = (
+    "192.168.127.0/24",     # dmvpn prefix
+    "192.168.129.0/24",     # dmvpn prefix
+    "192.168.162.0/24",     # dmvpn prefix
+    "192.168.121.0/24",     # dmvpn prefix
+    "192.168.173.0/24",     # dmvpn prefix
+    "192.168.122.0/24",     # dmvpn prefix
+    "192.168.0.0/31",       # p2p prefix in Branches
+    "192.168.0.2/31",       # p2p prefix in Branches
+    "192.168.0.4/31",       # p2p prefix in Branches
+    "192.168.0.6/31",       # p2p prefix in Branches
+    "1.1.1.0/30"            # p2p prefix in Branches
+    "172.28.7.0/31"         # p2p prefix in Branches
+)
 
-    try:
-        return ConnectHandler(**params)
-    except Exception:
-        # Пробуем ещё раз
+VRFS_TO_SKIP = (
+    "PEER-KEEPALIVE",   # Cisco NXOS VPC vrf
+    "VPC_KEEPALIVE",    # Cisco NXOS VPC vrf
+    "management",       # Cisco NXOS standard mgmt vrf
+    "Mgmt-vrf",         # Cisco Catalyst standard mgmt vrf
+    "Mgmt-intf",        # Cisco IOS standard mgmt vrf
+    "mgmtVrf",          # Cisco IOS standard mgmt vrf
+)
+
+
+async def send_cli_worker(device: dict,
+                          cli_command: Union[str, list],
+                          semaphore: asyncio.Semaphore):
+    """
+    Worker function for sending cli commands to network devices
+
+    Args:
+        device (dict): Dictionary that contains network device parameters
+        cli_command (Union[str, list]): single show command or a list of show commands
+        semaphore (asyncio.Semaphore): Semaphore to limit the number
+            of concurrent connections
+
+    Returns:
+        coroutine or None
+    """
+
+    max_retries = 2
+    backoff_seconds = 3
+    failed = False
+
+    for attempt in range(1, max_retries + 1):
         try:
-            return ConnectHandler(**params)
-        except Exception:
-            logger.error('Connection error: %s', netbox_device.name)
-            return None
+            async with AsyncNetworkDevice(
+                    host=device["host"],
+                    auth_username=device["auth_username"],
+                    auth_password=device["auth_password"],
+                    platform=device["platform"],
+                    auth_strict_key=device["auth_strict_key"],
+                    ssh_config_file=device.get("ssh_config_file"),
+                    ttp_template=device.get("ttp_template"),
+                    semaphore=semaphore,
+            ) as dev:
+                return await dev.send_show_parse(cli_command)
 
-def get_nautobot_api():
+        except Exception as e:
+            logger.warning(f"{device['host']} [Attempt {attempt}/{max_retries}] failed: {e}")
+
+            if attempt < max_retries:
+                # Wait before the next retry
+                await asyncio.sleep(backoff_seconds)
+            else:
+                # If this was the last attempt, log it as an error
+                logger.error(
+                    f"{device['host']} - all {max_retries} connection attempts failed."
+                )
+                failed = True
+
+    if failed:
+        logger.warning(f"{device['host']} - falling back to HPNA.")
+
+        na = NA(settings.HPNA_HOSTNAME,
+                settings.HPNA_USERNAME,
+                settings.HPNA_PASSWORD)
+
+        logger.info(f"{device['host']} - getting config from HPNA.")
+
+        device_config = na.show_device_config(ip=device["host"]).get("result")
+        if device_config:
+            logger.info(f"{device['host']} - got config from HPNA.")
+
+            ttp_template_path = INTERFACE_TEMPLATE_PATH.get(device["platform"])
+            logger.info(f"{device['host']} - Template: {ttp_template_path}")
+
+            ttp_template = load_template(ttp_template_path)
+            parser = ttp(template=ttp_template)
+            parser.add_input(device_config)
+            parser.parse()
+            result = parser.result()
+            return result[0][0][0]
+
+    return None
+
+
+async def get_device_interface_data():
     """
-    Возвращает клиент pynautobot с увеличенным пулом соединений.
+    Gets a list of network devices from the HPNA and runs show run across the
+    devices in the list
     """
-    api = pynautobot.api(
-        NAUTOBOT_URL,
-        token=NAUTOBOT_TOKEN,
-        verify=False,
-    )
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=1000,
-        pool_maxsize=1000
-    )
-    api.http_session.mount('http://', adapter)
-    api.http_session.mount('https://', adapter)
-    api.http_session.verify = False
-    return api
+    device_list = hpna_get_device_list(hostname=settings.HPNA_HOSTNAME,
+                                       hpna_username=settings.HPNA_USERNAME,
+                                       hpna_password=settings.HPNA_PASSWORD)
+    total_devices = len(device_list)
+    no_result = 0
+    logger.info(f"Found {len(device_list)} network devices")
+
+    semaphore = asyncio.Semaphore(20)
+    running_config_tasks = list()
+    for device in device_list:
+        cli = "show running-config"
+        if device["platform"] == "huawei_vrp":
+            cli = "display current"
+
+        running_config_tasks.append(send_cli_worker(device, cli, semaphore))
+
+    results = await asyncio.gather(*running_config_tasks, return_exceptions=True)
+    for result in results:
+        if not result:
+            no_result += 1
+            continue
+
+    logger.info(f"Total network devices: {total_devices}"),
+    logger.info(f"Devices failed to parse: {no_result}")
+    logger.info(f"Total devices parsed: {total_devices - no_result}")
+
+    return results
 
 
-def update_route_targets(rt_import_values, rt_export_values, nb_api, netbox_vrf_for_update, evpn_var):
-    update_list_import = [nb_api.ipam.route_targets.get(name=str(rt)).id for rt in rt_import_values]
-    netbox_vrf_for_update.update({'import_targets': update_list_import})
-
-    update_list_export = [nb_api.ipam.route_targets.get(name=str(rt)).id for rt in rt_export_values]
-    netbox_vrf_for_update.update({'export_targets': update_list_export})
-
-    netbox_vrf_for_update.update({'custom_fields': {'evpn': evpn_var}})
-
-def get_or_create_vrf(nb_api, vrf_name, device_rd):
+async def get_nautobot_graphql_data(hostname: str,
+                                    token: str,
+                                    endpoint: str) -> Optional[Any]:
     """
-    Ищет VRF по name + RD в глобальной базе. Если не найден - создает.
-    Возвращает объект VRF.
-    """
-    try:
-        # Ищем VRF в глобальной базе по name + RD
-        existing_vrf = nb_api.ipam.vrfs.get(name=vrf_name, rd=device_rd)
-        if existing_vrf:
-            return existing_vrf
-    except Exception as e:
-        # Если get() вернул ошибку (например, множественные результаты), используем filter()
-        if 'more than one result' in str(e).lower():
-            existing_vrfs = nb_api.ipam.vrfs.filter(name=vrf_name, rd=device_rd)
-            if existing_vrfs:
-                logger.warning(f'Found multiple VRF with name={vrf_name}, rd={device_rd}. Using first one.')
-                return existing_vrfs[0]
-        # VRF не найден, продолжаем к созданию
-        pass
+    Gets data from Nautobot GraphQL API endpoint
 
-    # VRF не существует - создаем новый
-    try:
-        new_vrf = nb_api.ipam.vrfs.create(
-            name=vrf_name,
-            rd=device_rd,
-            description=f'discovered from device',
-        )
-        logger.info(f'Created new VRF: {vrf_name} with RD: {device_rd}')
-        return new_vrf
-    except Exception as e:
-        logger.error(f"Ошибка при создании VRF {vrf_name}: {e}")
+    Args:
+        hostname (str): Nautobot hostname
+        token (str): Nautobot token
+        endpoint (str): Nautobot endpoint
+
+    Returns:
+        JSON response or None
+    """
+    async with AsyncAPIClient(base_address=hostname, token=token, timeout=90) as api:
+        try:
+            response = await api.post(path=endpoint)
+            return response.json()
+        except Exception as e:
+            logger.exception(
+                f"Request failed to obtain GraphQL data from Nautobot",
+                exc_info=e,
+                stack_info=True,
+                stacklevel=5
+            )
+
         return None
 
-def ensure_vrf_device_assignment(nb_api, vrf_obj, device_obj):
-    """
-    Проверяет существование привязки VRF к устройству. Если нет - создает.
-    """
-    try:
-        # Проверяем существование привязки
-        existing_assignment = nb_api.ipam.vrf_device_assignments.get(
-            vrf=vrf_obj.id,
-            device=device_obj.id
-        )
-        if existing_assignment:
-            return True
-    except:
-        # Привязка не найдена
-        pass
 
-    # Создаем привязку
+def get_vrf_id(prefix: Interface,
+               vrf_data: Dict[str, List[Any]],
+               hostname: str) -> Optional[VRF]:
+    """
+    Return the VRF ID for the given prefix and device hostname,
+    or None if no matching VRF is found or it's skipped.
+
+    Args:
+        prefix (Interface): Prefix data fetched from the device interface
+        vrf_data (dict): Dictionary that contains list vrf data grouped by device name
+        hostname (str): device hostname
+
+    Returns:
+        UUID of the vrf or None
+    """
+    logger.debug(f"Looking up VRF for prefix '{prefix.vrf}' on host '{hostname}'")
+    vrfs = vrf_data.get(hostname, []) or []
+    for vrf in vrfs:
+        # skip any VRF names that are in the stop-list
+        if vrf.name in VRFS_TO_SKIP:
+            continue
+        if prefix.vrf == vrf.name:
+            return vrf
+    return None
+
+
+async def create_and_map_vrf2prefix(prefix: Interface,
+                                    existing_prefixes: Dict[str, PrefixInfo],
+                                    vrf_data: Dict[str, List[VRF]],
+                                    hostname: str,
+                                    nautobot_api: AsyncAPIClient
+                                    ) -> Optional[PrefixInfo]:
+    """
+    Creates a prefix and a vrf to prefix assignment
+
+    Args:
+        prefix (Interface): Prefix data fetched from the device interface
+        existing_prefixes (Dict[str, PrefixInfo]): Dictionary that contains existing in Nautobot prefixes
+        vrf_data (dict): Dictionary that contains list vrf data grouped by device name
+        hostname (str): device hostname
+        nautobot_api (AsyncAPIClient): Nautobot API client
+        lock (asyncio.Lock): Lock to prevent race conditions
+
+    Returns:
+        None
+    """
+
+    # Checking if prefix is on the skip list
+    if prefix.prefix in PREFIXES_TO_SKIP or "/32" in prefix.prefix:
+        return
+
+    if prefix.prefix in existing_prefixes:
+        return
+
+    # create a prefix model to use in a POST request
+    create_prefix = NautobotCreatePrefixModel(prefix=prefix.prefix)
+    logger.info(f"Prefix {prefix.prefix} not found in Nautobot")
+
     try:
-        nb_api.ipam.vrf_device_assignments.create(
-            vrf=vrf_obj.id,
-            device=device_obj.id
+        logger.info(f"Attempting to create a prefix {prefix.prefix}")
+        response = await nautobot_api.post(
+            path="ipam/prefixes/",
+            json=create_prefix.as_dict()
         )
-        logger.info(f'Created VRF assignment: {vrf_obj.name} -> {device_obj.name}')
-        return True
+        response.raise_for_status()
+        prefix_id = response.json()["id"]
+        logger.info(f"Created prefix {prefix.prefix} --> prefix id: {prefix_id}")
+        created_prefix = PrefixInfo(id=prefix_id,
+                                    prefix=prefix.prefix,
+                                    vrfs=[],
+                                    vrf_assignments=[])
     except Exception as e:
-        logger.error(f'Ошибка при создании привязки VRF {vrf_obj.name} к {device_obj.name}: {e}')
-        return False
+        logger.exception(
+            f"Failed to create prefix {prefix.prefix}",
+            exc_info=e,
+            stack_info=True,
+            stacklevel=5
+        )
+        return
 
-def create_vrf_netbox_on_cisco_ios(netbox_device, nb_api):
+    vrf_id = get_vrf_id(prefix, vrf_data, hostname)
+    if not vrf_id:
+        return
+
     try:
-        connection = connect_device(netbox_device, 'cisco_ios')  # Исправлено: было cisco_nxos
-        if not connection:
-            return
-        logger.info('Start create %s', netbox_device.name)
-        output = connection.send_command('show run | section vrf', read_timeout=200)
-        connection.disconnect()
-        device_vrfs = parse_output(
-            platform='cisco_ios',
-            command='show run vrf',
-            data=output
+        vrf_prefix_map = {"prefix": prefix_id, "vrf": vrf_id.id}
+        response = await nautobot_api.post(
+                    path="ipam/vrf-prefix-assignments/",
+                    json=vrf_prefix_map
+                )
+        response.raise_for_status()
+        logger.info(f"Prefix {prefix.prefix}(id={prefix_id}) mapped to VRF {prefix.vrf}(id={vrf_id.id})")
+        created_prefix.vrfs.append(
+            VRF(id=vrf_id.id, name=vrf_id.name)
         )
-
-        # Получаем все VRF назначения для текущего устройства
-        nb_vrfs_assign = nb_api.ipam.vrf_device_assignments.filter(
-            device=netbox_device.id
+        created_prefix.vrf_assignments.append(
+            {"id": response.json()["id"]}
         )
-        nb_rt = nb_api.ipam.route_targets.all()
+        return created_prefix
 
-        vrf_assign = [str(assignment.vrf.name) for assignment in nb_vrfs_assign]
-        device_vrfs_names = [str(device_vrf_name.get('name')) for device_vrf_name in device_vrfs]
-        nb_rt_names = [str(nb_rt_name.name) for nb_rt_name in nb_rt]
-        set_nb_rt_names = set(nb_rt_names)
-
-        for netmiko_vrfs_show_run in device_vrfs:
-            try:
-                vrf_name = netmiko_vrfs_show_run.get('name')
-                if vrf_name in ['default', 'PEER-KEEPALIVE', 'VPC_KEEPALIVE']:
-                    continue
-                    
-                if netmiko_vrfs_show_run['rd'] != '':
-                    device_rd = f"*:{netmiko_vrfs_show_run['rd'].split(':')[1]}"
-                else:
-                    device_rd = None
-
-                # Этап 1: Получить или создать VRF
-                vrf_obj = get_or_create_vrf(nb_api, vrf_name, device_rd)
-                if not vrf_obj:
-                    continue
-
-                # Этап 2: Обеспечить привязку к устройству
-                ensure_vrf_device_assignment(nb_api, vrf_obj, netbox_device)
-
-                evpn_var = False
-
-                rt_import_values = netmiko_vrfs_show_run.get('rt_import', [])
-                rt_export_values = netmiko_vrfs_show_run.get('rt_export', [])
-
-                if not isinstance(rt_import_values, list) or not isinstance(rt_export_values, list):
-                    raise ValueError(f"Неверный формат import/export для VRF {vrf_name}, {netbox_device}")
-
-                # Создаем недостающие route targets
-                combined_values_set = set(rt_import_values) | set(rt_export_values)
-                combined_values_set.difference_update(set_nb_rt_names)
-
-                if combined_values_set:
-                    for rt_create_candidate in combined_values_set:
-                        try:
-                            nb_api.ipam.route_targets.create(name=rt_create_candidate)
-                        except Exception as e:
-                            logger.error(f'Ошибка при работе с Route Target {rt_create_candidate}: {e}, {netbox_device}')
-
-                # Проверяем, нужно ли обновлять route targets
-                try:
-                    current_import = [rt.name for rt in vrf_obj.import_targets] if vrf_obj.import_targets else []
-                    current_export = [rt.name for rt in vrf_obj.export_targets] if vrf_obj.export_targets else []
-                    
-                    import_changed = set(rt_import_values) != set(current_import)
-                    export_changed = set(rt_export_values) != set(current_export)
-                    
-                    if import_changed or export_changed:
-                        update_route_targets(rt_import_values, rt_export_values, nb_api, vrf_obj, evpn_var)
-                except Exception as e:
-                    logger.error(f'Ошибка при обновлении route targets для VRF {vrf_name}: {e}')
-
-            except Exception as error:
-                logger.error(f'SCRIPT {netbox_device} - {error} - {netmiko_vrfs_show_run}')
-
-        # Удаляем устаревшие привязки VRF
-        current_assignments = nb_api.ipam.vrf_device_assignments.filter(device=netbox_device.id)
-        assigned_vrf_names = [assignment.vrf.name for assignment in current_assignments]
-        
-        for assignment in current_assignments:
-            if assignment.vrf.name not in device_vrfs_names:
-                try:
-                    assignment.delete()
-                    logger.info(f'Deleted obsolete VRF assignment: {assignment.vrf.name} from {netbox_device.name}')
-                except Exception as e:
-                    logger.error(f'Ошибка при удалении устаревшей привязки {assignment.vrf.name}: {e}')
-
-        logger.info('End create %s', netbox_device.name)
-    except Exception as exc:
-        logger.error('%s: %s', netbox_device.name, exc)
+    except Exception as e:
+        logger.exception(
+            f"Failed to create vrf prefix assignment for {prefix.prefix}(id={prefix_id}) and vrf {prefix.vrf}(id={vrf_id.id})",
+            exc_info=e,
+            stack_info=True,
+            stacklevel=5
+        )
+        return created_prefix
 
 
-def create_vrf_netbox_on_cisco_nxos(netbox_device, nb_api):
+async def collect_data() -> tuple:
+    """
+    Collects data from devices and nautobot
+
+    Returns:
+        A tuple with the following items:
+            - existing prefixes from nautobot
+            - devices interface data
+            - vrf to device assignments data
+            - prefix to vrf mappings
+    """
+    # getting interface data from network devices
+    device_interface_data_task = get_device_interface_data()
+    # endpoint of the saved graphql query to get vrfs attached to the device
+    get_device_vrfs_endpoint = "extras/graphql-queries/30800416-82e6-491b-8d10-0c89578fca55/run/"
+
+    logger.info("Getting vrf to device assignments from Nautobot GraphQL")
+    # retrieving vrf data from nautobot
+    device_vrfs_task = get_nautobot_graphql_data(
+        hostname=settings.NAUTOBOT_HOSTNAME,
+        token=settings.NAUTOBOT_TOKEN,
+        endpoint=get_device_vrfs_endpoint)
+
+    # endpoint of the saved graphql query to get prefixes details
+    get_prefixes_endpoint = "extras/graphql-queries/21f468d2-e225-44b1-9010-6071b6b2d4c3/run/"
+
+    logger.info("Getting prefixes details from Nautobot GraphQL")
+    # retrieving prefixes data from nautobot
+    prefixes_task = get_nautobot_graphql_data(
+        hostname=settings.NAUTOBOT_HOSTNAME,
+        token=settings.NAUTOBOT_TOKEN,
+        endpoint=get_prefixes_endpoint)
+
+    device_interface_data, device_vrfs, prefixes = await asyncio.gather(
+        device_interface_data_task,
+        device_vrfs_task,
+        prefixes_task,
+        return_exceptions=True
+    )
+
+    # normalizing retrieved data
+    normalized_data = DataNormalizer(
+        prefix_data=prefixes,
+        device_vrf_info=device_vrfs,
+        interface_data=device_interface_data,
+    )
+
+    return (
+        normalized_data.prefix_data,
+        normalized_data.interface_data.devices,
+        normalized_data.device_vrf_info,
+        normalized_data.prefix2vrf_mappings
+    )
+
+
+async def remove_stale_vrf_assignment(prefix: str, vrf_list: list[str],
+                                      prefixes: dict,
+                                      nautobot_api: AsyncAPIClient):
+
+    nautobot_prefix = prefixes.get(prefix)
+    if not nautobot_prefix or not nautobot_prefix.vrfs:
+        return
+
+    device_prefix_vrfs = set(vrf_list)
+    nautobot_prefix_vrfs = {vrf.name for vrf in nautobot_prefix.vrfs}
+
+    vrf_diff = nautobot_prefix_vrfs - device_prefix_vrfs
+    if not vrf_diff:
+        return
+
+    vrf_name = vrf_diff.pop()
+    logger.info(f"Prefix {prefix}(id={nautobot_prefix.id}) VRF DIFF: {vrf_name}")
+
+    graphql_query_str = f"""
+        query GetPrefixes {{
+            prefixes(id: "{nautobot_prefix.id}") {{
+                id
+                prefix
+                vrf_assignments(vrf: "{vrf_name}") {{
+                    id
+                }}
+            }}
+        }}
+    """
+
     try:
-        connection = connect_device(netbox_device, 'cisco_nxos')
-        if not connection:
+        gql_response = await nautobot_api.graphql_query_run(query=graphql_query_str)
+        logger.debug(json.dumps(gql_response.json(), indent=4))
+        vrf_assignment_id = gql_response.json()["data"]["prefixes"][0]["vrf_assignments"][0]["id"]
+    except (IndexError, KeyError) as e:
+        logger.exception("Failed to get vrf assignment id", exc_info=e)
+        return
+    except Exception as e:
+        logger.exception("Failed to query GraphQL", exc_info=e)
+        return
+
+    try:
+        logger.info(f"Deleting VRF assignment {vrf_name}(id={vrf_assignment_id}) for prefix "
+                    f"{nautobot_prefix.prefix}(id={nautobot_prefix.id})")
+        await nautobot_api.delete(
+            path="ipam/vrf-prefix-assignments/",
+            json=[{"id": vrf_assignment_id}],
+        )
+        logger.info(f"VRF assignment {vrf_name}(id={vrf_assignment_id}) for prefix "
+                    f"{nautobot_prefix.prefix}(id={nautobot_prefix.id}) removed")
+    except Exception as e:
+        logger.exception(f"Failed to delete vrf assignment {vrf_name}(id={vrf_assignment_id})", exc_info=e)
+
+
+async def process_prefix_vrf_mapping(prefix: Interface,device_hostname: str,
+                                     prefixes: dict, vrf_data: dict,
+                                     nautobot_api: AsyncAPIClient,
+                                     lock: asyncio.Lock,
+                                     semaphore: asyncio.Semaphore):
+
+    async with semaphore:
+        created_prefix = await create_and_map_vrf2prefix(
+            prefix=prefix,
+            existing_prefixes=prefixes,
+            vrf_data=vrf_data,
+            hostname=device_hostname,
+            nautobot_api=nautobot_api
+        )
+
+        if created_prefix:
+            async with lock:
+                prefixes[prefix.prefix] = created_prefix
             return
-        logger.info('Start create %s', netbox_device.name)
-        output = connection.send_command('show run | section vrf', read_timeout=200)
-        connection.disconnect()
-        device_vrfs = parse_output(
-            platform='cisco_nxos',
-            command='show run vrf',
-            data=output
-        )
 
-        # Получаем все VRF назначения для текущего устройства
-        nb_vrfs_assign = nb_api.ipam.vrf_device_assignments.filter(
-            device=netbox_device.id
-        )
-        nb_rt = nb_api.ipam.route_targets.all()
+        if not prefix.vrf or prefix.vrf in VRFS_TO_SKIP or prefix.prefix in PREFIXES_TO_SKIP:
+            return
 
-        vrf_assign = [str(assignment.vrf.name) for assignment in nb_vrfs_assign]
-        device_vrfs_names = [str(device_vrf_name.get('name')) for device_vrf_name in device_vrfs]
-        nb_rt_names = [str(nb_rt_name.name) for nb_rt_name in nb_rt]
-        set_nb_rt_names = set(nb_rt_names)
+        nautobot_prefix = prefixes.get(prefix.prefix)
+        if not nautobot_prefix:
+            return
 
-        for netmiko_vrfs_show_run in device_vrfs:
+        vrf_match = any(vrf.name == prefix.vrf for vrf in nautobot_prefix.vrfs or [])
+        if vrf_match:
+            return
+
+        logger.warning(f"Prefix {prefix.prefix} vrf {prefix.vrf} does not match any current prefix vrfs: {nautobot_prefix.vrfs}")
+
+        vrf_id = get_vrf_id(prefix=prefix, vrf_data=vrf_data, hostname=device_hostname)
+        if not vrf_id:
+            logger.warning(f"Prefix {prefix.prefix} does not have vrfs in Nautobot. VRF({prefix.vrf}) --> DEVICE({device_hostname}) assignment must be created.")
+            return
+
+        if not nautobot_prefix.vrf_assignments or len(nautobot_prefix.vrf_assignments) > 1:
             try:
-                vrf_name = netmiko_vrfs_show_run.get('name')
-                if vrf_name in ['default', 'PEER-KEEPALIVE', 'VPC_KEEPALIVE']:
-                    continue
-                    
-                if netmiko_vrfs_show_run['rd'] != '':
-                    device_rd = f"*:{netmiko_vrfs_show_run['rd'].split(':')[1]}"
-                else:
-                    device_rd = None
+                logger.warning(f"Assigning VRF {prefix.vrf}(id={vrf_id.id}) to prefix {prefix.prefix}(id={nautobot_prefix.id})")
+                assignment_response = await nautobot_api.post(
+                    path="ipam/vrf-prefix-assignments/",
+                    json={"prefix": nautobot_prefix.id, "vrf": vrf_id.id}
+                )
+                async with lock:
+                    prefixes[prefix.prefix].vrf_assignments.append({"id": assignment_response.json().get("id")})
+                return
+            except Exception as e:
+                logger.exception(f"Failed to assign VRF {prefix.vrf} (id={vrf_id.id}) to prefix {prefix.prefix}", exc_info=e)
+                return
 
-                # Этап 1: Получить или создать VRF
-                vrf_obj = get_or_create_vrf(nb_api, vrf_name, device_rd)
-                if not vrf_obj:
-                    continue
+        if len(nautobot_prefix.vrf_assignments) == 1:
+            await nautobot_api.delete(
+                path="ipam/vrf-prefix-assignments/",
+                json=[{"id": nautobot_prefix.vrf_assignments[0]["id"]}]
+            )
 
-                # Этап 2: Обеспечить привязку к устройству
-                ensure_vrf_device_assignment(nb_api, vrf_obj, netbox_device)
-
-                evpn_var = True if 'evpn' in netmiko_vrfs_show_run.get('evpn', '') else False
-
-                rt_import_values = netmiko_vrfs_show_run.get('rt_import', [])
-                rt_export_values = netmiko_vrfs_show_run.get('rt_export', [])
-
-                if not isinstance(rt_import_values, list) or not isinstance(rt_export_values, list):
-                    raise ValueError(f"Неверный формат import/export для VRF {vrf_name}, {netbox_device}")
-
-                # Создаем недостающие route targets
-                combined_values_set = set(rt_import_values) | set(rt_export_values)
-                combined_values_set.difference_update(set_nb_rt_names)
-
-                if combined_values_set:
-                    for rt_create_candidate in combined_values_set:
-                        try:
-                            nb_api.ipam.route_targets.create(name=rt_create_candidate)
-                        except Exception as e:
-                            logger.error(f'Ошибка при работе с Route Target {rt_create_candidate}: {e}, {netbox_device}')
-
-                # Проверяем, нужно ли обновлять route targets или evpn
-                try:
-                    current_import = [rt.name for rt in vrf_obj.import_targets] if vrf_obj.import_targets else []
-                    current_export = [rt.name for rt in vrf_obj.export_targets] if vrf_obj.export_targets else []
-                    current_evpn = vrf_obj.custom_fields.get('evpn', False) if vrf_obj.custom_fields else False
-                    
-                    import_changed = set(rt_import_values) != set(current_import)
-                    export_changed = set(rt_export_values) != set(current_export)
-                    evpn_changed = evpn_var != current_evpn
-                    
-                    if import_changed or export_changed or evpn_changed:
-                        update_route_targets(rt_import_values, rt_export_values, nb_api, vrf_obj, evpn_var)
-                except Exception as e:
-                    logger.error(f'Ошибка при обновлении route targets для VRF {vrf_name}: {e}')
-
-            except Exception as error:
-                logger.error(f'SCRIPT {netbox_device} - {error} - {netmiko_vrfs_show_run}')
-
-        # Удаляем устаревшие привязки VRF
-        current_assignments = nb_api.ipam.vrf_device_assignments.filter(device=netbox_device.id)
-        
-        for assignment in current_assignments:
-            if assignment.vrf.name not in device_vrfs_names:
-                try:
-                    assignment.delete()
-                    logger.info(f'Deleted obsolete VRF assignment: {assignment.vrf.name} from {netbox_device.name}')
-                except Exception as e:
-                    logger.error(f'Ошибка при удалении устаревшей привязки {assignment.vrf.name}: {e}')
-
-        logger.info('End create %s', netbox_device.name)
-    except Exception as exc:
-        logger.error('%s: %s', netbox_device.name, exc)
+            try:
+                assignment_response = await nautobot_api.post(
+                    path="ipam/vrf-prefix-assignments/",
+                    json={"prefix": nautobot_prefix.id, "vrf": vrf_id.id}
+                )
+                async with lock:
+                    prefixes[prefix.prefix].vrf_assignments = [{"id": assignment_response.json().get("id")}]
+            except Exception as e:
+                logger.exception(f"Failed to re-assign VRF {prefix.vrf} to prefix {prefix.prefix}", exc_info=e)
 
 
-def add_vrf_to_netbox_for_one_device(device_name: str):
-    start_time = time.time()
+async def main():
 
-    api = get_nautobot_api()
-    device = api.dcim.devices.get(name=device_name.upper())
+    # gathering data from devices and nautobot
+    prefixes, interface_data, vrf_data, prefix2vrf_mappings = await collect_data()
 
-    if device.platform.name == 'Cisco IOS':
-        create_vrf_netbox_on_cisco_ios(
-            device,
-            api
-        )
+    async with AsyncAPIClient(base_address=settings.NAUTOBOT_HOSTNAME, token=settings.NAUTOBOT_TOKEN) as nautobot_api:
 
-    elif device.platform.name == 'Cisco NXOS':
-        create_vrf_netbox_on_cisco_nxos(
-            device,
-            api
-        )
+        # lock to avoid race condition in process_prefix_vrf_mapping
+        lock = asyncio.Lock()
+        # Limit to N concurrent prefix tasks
+        semaphore = asyncio.Semaphore(50)
 
-    print("--- %s seconds ---" % (time.time() - start_time))
+        # creating prefixes and mapping them to vrfs
+        prefix_tasks = [
+            process_prefix_vrf_mapping(
+                prefix=prefix,
+                device_hostname=device.hostname,
+                prefixes=prefixes,
+                vrf_data=vrf_data,
+                nautobot_api=nautobot_api,
+                lock=lock,
+                semaphore=semaphore
+            )
+            for device in interface_data
+            for prefix in device.interfaces
+        ]
 
+        await asyncio.gather(*prefix_tasks)
 
-def main():
-    start = time.time()
-    api = get_nautobot_api()
+        # removing stale vrf to prefix mappings
+        remove_vrf_mapping_tasks = [
+            remove_stale_vrf_assignment(prefix, vrf_list, prefixes, nautobot_api)
+            for prefix, vrf_list in prefix2vrf_mappings.items()
+        ]
 
-    # Строим мапу тегов
-    all_tags = list(api.extras.tags.all())
-    tag_map = {t.id: t.name for t in all_tags}
-
-    # Фильтруем нужные устройства
-    devices = list(api.dcim.devices.all())
-    targets = []
-    for dev in devices:
-        names = [tag_map.get(t.id) for t in (dev.tags or [])]
-        if 'raif_scripts' in names:
-            if 'scope_BRANCH' in names:
-                continue
-            else:
-                targets.append(dev)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-        for dev in targets:
-            if dev.platform.name == 'Cisco IOS':
-                executor.submit(create_vrf_netbox_on_cisco_ios, dev, api)
-            elif dev.platform.name == 'Cisco NXOS':
-                executor.submit(create_vrf_netbox_on_cisco_nxos, dev, api)
-
-    logger.info('Elapsed time: %.2f sec', time.time() - start)
-
+        await asyncio.gather(*remove_vrf_mapping_tasks)
 
 if __name__ == "__main__":
-    main()
+
+    asyncio.run(main())
